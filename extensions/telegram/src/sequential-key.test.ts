@@ -104,3 +104,21 @@ describe("getTelegramSequentialKey", () => {
     expect(getTelegramSequentialKey(input)).toBe(expected);
   });
 });
+
+describe("getTelegramSequentialKey control-lane commands", () => {
+  const keyFor = (text: string) =>
+    getTelegramSequentialKey({
+      message: mockMessage({ chat: mockChat({ id: 123 }), text }),
+    });
+
+  it.each(["/cancel", "/STOP", " /progress ", "/cancel@my_bot"])(
+    "routes %j to the control lane",
+    (text) => {
+      expect(keyFor(text)).toBe("telegram:123:control");
+    },
+  );
+
+  it.each(["/cancelled", "/progressive", "please /cancel"])("keeps %j on the chat lane", (text) => {
+    expect(keyFor(text)).toBe("telegram:123");
+  });
+});

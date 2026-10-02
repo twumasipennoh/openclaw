@@ -85,6 +85,11 @@ describe("exec approval reply helpers", () => {
     },
   ] as const;
 
+  it("returns null metadata for a null or non-object payload", () => {
+    expect(getExecApprovalReplyMetadata(null)).toBeNull();
+    expect(getExecApprovalReplyMetadata(undefined)).toBeNull();
+  });
+
   it("returns the approver DM notice text", () => {
     expect(getExecApprovalApproverDmNoticeText()).toBe(
       "Approval required. I sent approval DMs to the approvers for this account.",

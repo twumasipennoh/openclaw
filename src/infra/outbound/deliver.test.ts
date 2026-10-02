@@ -39,6 +39,8 @@ const queueMocks = vi.hoisted(() => ({
   enqueueDelivery: vi.fn(async () => "mock-queue-id"),
   ackDelivery: vi.fn(async () => {}),
   failDelivery: vi.fn(async () => {}),
+  computeBackoffMs: vi.fn((_attempt: number) => 0),
+  isPermanentDeliveryError: vi.fn((message: string) => message.includes("chat not found")),
 }));
 const logMocks = vi.hoisted(() => ({
   warn: vi.fn(),
@@ -73,6 +75,8 @@ vi.mock("./delivery-queue.js", () => ({
   enqueueDelivery: queueMocks.enqueueDelivery,
   ackDelivery: queueMocks.ackDelivery,
   failDelivery: queueMocks.failDelivery,
+  computeBackoffMs: queueMocks.computeBackoffMs,
+  isPermanentDeliveryError: queueMocks.isPermanentDeliveryError,
 }));
 vi.mock("../../logging/subsystem.js", () => ({
   createSubsystemLogger: () => {
@@ -1029,6 +1033,56 @@ describe("deliverOutboundPayloads", () => {
       }),
       expect.objectContaining({ channelId: "matrix" }),
     );
+  });
+
+  describe("inline retry", () => {
+    const send = (deps: { whatsapp: ReturnType<typeof vi.fn> }, skipRetry?: boolean) =>
+      deliverOutboundPayloads({
+        cfg: {},
+        channel: "whatsapp",
+        to: "+1555",
+        payloads: [{ text: "hi" }],
+        deps,
+        skipRetry,
+      });
+
+    it("retries a transient failure once and acks on success", async () => {
+      const sendWhatsApp = vi
+        .fn()
+        .mockRejectedValueOnce(new Error("network blip"))
+        .mockResolvedValue({ messageId: "w1", toJid: "jid" });
+
+      await send({ whatsapp: sendWhatsApp });
+
+      expect(sendWhatsApp).toHaveBeenCalledTimes(2);
+      expect(queueMocks.ackDelivery).toHaveBeenCalledWith("mock-queue-id");
+      expect(queueMocks.failDelivery).not.toHaveBeenCalled();
+    });
+
+    it("gives up after two attempts and fails the queue entry", async () => {
+      const sendWhatsApp = vi.fn().mockRejectedValue(new Error("still down"));
+
+      await expect(send({ whatsapp: sendWhatsApp })).rejects.toThrow("still down");
+
+      expect(sendWhatsApp).toHaveBeenCalledTimes(2);
+      expect(queueMocks.failDelivery).toHaveBeenCalledWith("mock-queue-id", "still down");
+    });
+
+    it("does not retry permanent errors", async () => {
+      const sendWhatsApp = vi.fn().mockRejectedValue(new Error("chat not found"));
+
+      await expect(send({ whatsapp: sendWhatsApp })).rejects.toThrow("chat not found");
+
+      expect(sendWhatsApp).toHaveBeenCalledTimes(1);
+    });
+
+    it("does not retry when skipRetry is set", async () => {
+      const sendWhatsApp = vi.fn().mockRejectedValue(new Error("network blip"));
+
+      await expect(send({ whatsapp: sendWhatsApp }, true)).rejects.toThrow("network blip");
+
+      expect(sendWhatsApp).toHaveBeenCalledTimes(1);
+    });
   });
 
   it("emits message_sent failure when delivery errors", async () => {

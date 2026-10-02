@@ -14,7 +14,7 @@ export type PluginCommandInboundMedia = {
   structured: string;
 };
 
-const INBOUND_MEDIA_DIR = path.join(os.homedir(), ".openclaw", "media", "inbound");
+const inboundMediaDir = () => path.join(os.homedir(), ".openclaw", "media", "inbound");
 
 /**
  * Downloads media from a plugin-command message (and the message it replies to)
@@ -44,10 +44,11 @@ export async function collectPluginCommandInboundMedia(params: {
         return;
       }
       const buf = Buffer.from(await resp.arrayBuffer());
-      await fs.mkdir(INBOUND_MEDIA_DIR, { recursive: true });
+      const dir = inboundMediaDir();
+      await fs.mkdir(dir, { recursive: true });
       const ext = file.file_path.match(/\.[A-Za-z0-9]+$/)?.[0] ?? "";
       const name = `${Date.now()}-${fileId.slice(-8)}${ext}`;
-      const filePath = path.join(INBOUND_MEDIA_DIR, name);
+      const filePath = path.join(dir, name);
       await fs.writeFile(filePath, buf);
       attachments.push({ path: filePath, mime, originalName: originalName || name, fromReply });
     } catch {
@@ -129,13 +130,13 @@ export async function collectPluginCommandInboundMedia(params: {
     const fromUser = reply.from ? reply.from.username || reply.from.first_name || null : null;
     const hasMedia = Boolean(
       reply.photo ||
-        reply.video ||
-        reply.video_note ||
-        reply.animation ||
-        reply.document ||
-        reply.voice ||
-        reply.audio ||
-        reply.sticker,
+      reply.video ||
+      reply.video_note ||
+      reply.animation ||
+      reply.document ||
+      reply.voice ||
+      reply.audio ||
+      reply.sticker,
     );
     const structured = formatStructuredShares(reply);
     if (text || fromUser || hasMedia || structured) {
@@ -174,9 +175,7 @@ export function formatStructuredShares(src: TelegramMessage | undefined): string
   if (src.venue) {
     const v = src.venue;
     const coord = v.location ? ` (lat ${v.location.latitude}, lon ${v.location.longitude})` : "";
-    lines.push(
-      `[Venue: "${v.title || "(untitled)"}" — ${v.address || "(no address)"}${coord}]`,
-    );
+    lines.push(`[Venue: "${v.title || "(untitled)"}" — ${v.address || "(no address)"}${coord}]`);
   }
   if (src.poll) {
     const p = src.poll;
