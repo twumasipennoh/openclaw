@@ -12,7 +12,7 @@ import { createSubsystemLogger } from "../logging/subsystem.js";
 import { resolveUserPath } from "../utils.js";
 import { buildPluginApi } from "./api-builder.js";
 import { inspectBundleMcpRuntimeSupport } from "./bundle-mcp.js";
-import { clearPluginCommands } from "./command-registry-state.js";
+import { clearPluginCommands, clearPluginCommandsForPlugin } from "./command-registry-state.js";
 import {
   applyTestPluginDefaults,
   createPluginActivationSource,
@@ -1012,7 +1012,15 @@ export function loadOpenClawPlugins(options: PluginLoadOptions = {}): PluginRegi
   // Clear previously registered plugin state before reloading.
   // Skip for non-activating (snapshot) loads to avoid wiping commands from other plugins.
   if (shouldActivate) {
-    clearPluginCommands();
+    // Scoped reloads only clear their own plugins' commands; a global clear here
+    // wiped /claude and friends from the registry until the next restart.
+    if (onlyPluginIds && onlyPluginIds.length > 0) {
+      for (const pluginId of onlyPluginIds) {
+        clearPluginCommandsForPlugin(pluginId);
+      }
+    } else {
+      clearPluginCommands();
+    }
     clearPluginInteractiveHandlers();
     clearMemoryPluginState();
   }
