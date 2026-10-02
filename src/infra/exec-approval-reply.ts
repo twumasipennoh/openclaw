@@ -251,8 +251,12 @@ function buildFence(text: string, language?: string): string {
 }
 
 export function getExecApprovalReplyMetadata(
-  payload: ReplyPayload,
+  payload: ReplyPayload | null | undefined,
 ): ExecApprovalReplyMetadata | null {
+  // Plugins may return a null payload (e.g. claude-cli after sending chunks itself).
+  if (!payload || typeof payload !== "object") {
+    return null;
+  }
   const channelData = payload.channelData;
   if (!channelData || typeof channelData !== "object" || Array.isArray(channelData)) {
     return null;
