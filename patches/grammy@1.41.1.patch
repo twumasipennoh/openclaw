@@ -1,0 +1,22 @@
+diff --git a/out/context.js b/out/context.js
+index efab95699e863c0fcb0d42eee047ed83f9d4812f..868919fa30c917c6ce00200a72a7af8e3b977f1c 100644
+--- a/out/context.js
++++ b/out/context.js
+@@ -20,7 +20,7 @@ const checker = {
+         };
+     },
+     command(command) {
+-        const hasEntities = checker.filterQuery(":entities:bot_command");
++        const hasEntities = checker.filterQuery([":entities:bot_command", ":caption_entities:bot_command"]);
+         const atCommands = new Set();
+         const noAtCommands = new Set();
+         toArray(command).forEach((cmd) => {
+@@ -36,7 +36,7 @@ const checker = {
+                 return false;
+             const msg = (_a = ctx.message) !== null && _a !== void 0 ? _a : ctx.channelPost;
+             const txt = (_b = msg.text) !== null && _b !== void 0 ? _b : msg.caption;
+-            return msg.entities.some((e) => {
++            return /* local-patch: caption-bot-cmd */ ((msg.entities || msg.caption_entities) || []).some((e) => {
+                 if (e.type !== "bot_command")
+                     return false;
+                 if (e.offset !== 0)

@@ -1292,7 +1292,8 @@
       }
     },
     "patchedDependencies": {
-      "@mariozechner/pi-agent-core@0.65.0": "patches/@mariozechner__pi-agent-core@0.65.0.patch"
+      "@mariozechner/pi-agent-core@0.65.0": "patches/@mariozechner__pi-agent-core@0.65.0.patch",
+      "grammy@1.41.1": "patches/grammy@1.41.1.patch"
     }
   }
 }

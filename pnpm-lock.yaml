@@ -30,6 +30,9 @@ patchedDependencies:
   '@mariozechner/pi-agent-core@0.65.0':
     hash: 194dba1a56a78210992f05664792340320a4b02039745044df1b99358b922980
     path: patches/@mariozechner__pi-agent-core@0.65.0.patch
+  grammy@1.41.1:
+    hash: 6fb92aa0bc49f16436792794ce59c039b142a740fe9180e17c2c085330494605
+    path: patches/grammy@1.41.1.patch
 
 importers:
 
@@ -665,13 +668,13 @@ importers:
     dependencies:
       '@grammyjs/runner':
         specifier: ^2.0.3
-        version: 2.0.3(grammy@1.41.1)
+        version: 2.0.3(grammy@1.41.1(patch_hash=6fb92aa0bc49f16436792794ce59c039b142a740fe9180e17c2c085330494605))
       '@grammyjs/transformer-throttler':
         specifier: ^1.2.1
-        version: 1.2.1(grammy@1.41.1)
+        version: 1.2.1(grammy@1.41.1(patch_hash=6fb92aa0bc49f16436792794ce59c039b142a740fe9180e17c2c085330494605))
       grammy:
         specifier: ^1.41.1
-        version: 1.41.1
+        version: 1.41.1(patch_hash=6fb92aa0bc49f16436792794ce59c039b142a740fe9180e17c2c085330494605)
 
   extensions/tlon:
     dependencies:
@@ -7772,15 +7775,15 @@ snapshots:
       - supports-color
       - utf-8-validate
 
-  '@grammyjs/runner@2.0.3(grammy@1.41.1)':
+  '@grammyjs/runner@2.0.3(grammy@1.41.1(patch_hash=6fb92aa0bc49f16436792794ce59c039b142a740fe9180e17c2c085330494605))':
     dependencies:
       abort-controller: 3.0.0
-      grammy: 1.41.1
+      grammy: 1.41.1(patch_hash=6fb92aa0bc49f16436792794ce59c039b142a740fe9180e17c2c085330494605)
 
-  '@grammyjs/transformer-throttler@1.2.1(grammy@1.41.1)':
+  '@grammyjs/transformer-throttler@1.2.1(grammy@1.41.1(patch_hash=6fb92aa0bc49f16436792794ce59c039b142a740fe9180e17c2c085330494605))':
     dependencies:
       bottleneck: 2.19.5
-      grammy: 1.41.1
+      grammy: 1.41.1(patch_hash=6fb92aa0bc49f16436792794ce59c039b142a740fe9180e17c2c085330494605)
 
   '@grammyjs/types@3.25.0': {}
 
@@ -7793,7 +7796,7 @@ snapshots:
     dependencies:
       lodash.camelcase: 4.3.0
       long: 5.3.2
-      protobufjs: 7.5.4
+      protobufjs: 7.6.6
       yargs: 17.7.2
 
   '@hapi/boom@9.1.4':
@@ -11069,7 +11072,7 @@ snapshots:
 
   graceful-fs@4.2.11: {}
 
-  grammy@1.41.1:
+  grammy@1.41.1(patch_hash=6fb92aa0bc49f16436792794ce59c039b142a740fe9180e17c2c085330494605):
     dependencies:
       '@grammyjs/types': 3.25.0
       abort-controller: 3.0.0
