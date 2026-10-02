@@ -30,7 +30,13 @@ import type { OutboundMediaAccess } from "../../media/load-options.js";
 import { resolveAgentScopedOutboundMediaAccess } from "../../media/read-capability.js";
 import { getGlobalHookRunner } from "../../plugins/hook-runner-global.js";
 import { throwIfAborted } from "./abort.js";
-import { ackDelivery, enqueueDelivery, failDelivery } from "./delivery-queue.js";
+import {
+  ackDelivery,
+  computeBackoffMs,
+  enqueueDelivery,
+  failDelivery,
+  isPermanentDeliveryError,
+} from "./delivery-queue.js";
 import type { OutboundIdentity } from "./identity.js";
 import type { DeliveryMirror } from "./mirror.js";
 import type { NormalizedOutboundPayload } from "./payloads.js";
@@ -311,7 +317,12 @@ function collectPayloadMediaSources(payloads: ReplyPayload[]): string[] {
 export type DeliverOutboundPayloadsParams = DeliverOutboundPayloadsCoreParams & {
   /** @internal Skip write-ahead queue (used by crash-recovery to avoid re-enqueueing). */
   skipQueue?: boolean;
+  /** Disable the inline retry (callers that run their own retry loop). */
+  skipRetry?: boolean;
 };
+
+/** Inline attempts before handing a failed send to the queue's recovery. */
+const INLINE_DELIVERY_ATTEMPTS = 2;
 
 type MessageSentEvent = {
   success: boolean;
@@ -545,27 +556,38 @@ export async function deliverOutboundPayloads(
       }
     : params;
 
-  try {
-    const results = await deliverOutboundPayloadsCore(wrappedParams);
-    if (queueId) {
-      if (hadPartialFailure) {
-        await failDelivery(queueId, "partial delivery failure (bestEffort)").catch(() => {});
-      } else {
-        await ackDelivery(queueId).catch(() => {}); // Best-effort cleanup.
+  // Retry once inline so brief network blips don't send replies straight to
+  // failed/; longer outages are left to the recovery tick.
+  const maxAttempts = params.skipRetry ? 1 : INLINE_DELIVERY_ATTEMPTS;
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      const results = await deliverOutboundPayloadsCore(wrappedParams);
+      if (queueId) {
+        if (hadPartialFailure) {
+          await failDelivery(queueId, "partial delivery failure (bestEffort)").catch(() => {});
+        } else {
+          await ackDelivery(queueId).catch(() => {}); // Best-effort cleanup.
+        }
       }
-    }
-    return results;
-  } catch (err) {
-    if (queueId) {
+      return results;
+    } catch (err) {
       if (isAbortError(err)) {
-        await ackDelivery(queueId).catch(() => {});
-      } else {
-        await failDelivery(queueId, err instanceof Error ? err.message : String(err)).catch(
-          () => {},
-        );
+        if (queueId) {
+          await ackDelivery(queueId).catch(() => {});
+        }
+        throw err;
       }
+      const message = err instanceof Error ? err.message : String(err);
+      if (attempt >= maxAttempts || isPermanentDeliveryError(message)) {
+        if (queueId) {
+          await failDelivery(queueId, message).catch(() => {});
+        }
+        throw err;
+      }
+      await new Promise<void>((resolve) => {
+        setTimeout(resolve, computeBackoffMs(attempt)).unref();
+      });
     }
-    throw err;
   }
 }
 
