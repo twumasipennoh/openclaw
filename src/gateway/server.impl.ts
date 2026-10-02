@@ -1197,6 +1197,26 @@ export async function startGatewayServer(
           log: logRecovery,
           cfg: cfgAtStart,
         });
+        // Keep draining pending/ while running, so entries that outlive the inline
+        // retry are sent once the channel is reachable again (not only on restart).
+        const logRecoveryTick = log.child("delivery-recovery-tick");
+        let recoveryTickRunning = false;
+        setInterval(() => {
+          if (recoveryTickRunning) {
+            return;
+          }
+          recoveryTickRunning = true;
+          recoverPendingDeliveries({
+            deliver: deliverOutboundPayloads,
+            log: logRecoveryTick,
+            cfg: cfgAtStart,
+            maxRecoveryMs: 25_000,
+          })
+            .catch((err) => logRecoveryTick.warn(`tick failed: ${String(err)}`))
+            .finally(() => {
+              recoveryTickRunning = false;
+            });
+        }, 30_000).unref();
       })().catch((err) => log.error(`Delivery recovery failed: ${String(err)}`));
     }
 
