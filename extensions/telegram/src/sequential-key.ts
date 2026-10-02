@@ -36,7 +36,10 @@ export function getTelegramSequentialKey(ctx: TelegramSequentialKeyContext): str
   const chatId = msg?.chat?.id ?? ctx.chat?.id;
   const rawText = msg?.text ?? msg?.caption;
   const botUsername = ctx.me?.username;
-  if (isAbortRequestText(rawText, botUsername ? { botUsername } : undefined)) {
+  if (
+    isAbortRequestText(rawText, botUsername ? { botUsername } : undefined) ||
+    isControlLaneCommand(rawText)
+  ) {
     if (typeof chatId === "number") {
       return `telegram:${chatId}:control`;
     }
@@ -62,4 +65,13 @@ export function getTelegramSequentialKey(ctx: TelegramSequentialKeyContext): str
     return threadId != null ? `telegram:${chatId}:topic:${threadId}` : `telegram:${chatId}`;
   }
   return "telegram:unknown";
+}
+
+// /cancel, /stop and /progress must reach a busy chat immediately instead of
+// queueing behind the in-flight run.
+const CONTROL_LANE_COMMANDS = new Set(["/cancel", "/stop", "/progress"]);
+
+function isControlLaneCommand(rawText: string | undefined): boolean {
+  const normalized = (rawText ?? "").trim().toLowerCase().split("@")[0].trim();
+  return CONTROL_LANE_COMMANDS.has(normalized);
 }
