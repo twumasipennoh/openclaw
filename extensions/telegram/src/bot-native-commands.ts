@@ -75,6 +75,7 @@ import {
 } from "./group-access.js";
 import { resolveTelegramGroupPromptSettings } from "./group-config-helpers.js";
 import { buildInlineKeyboard } from "./inline-keyboard.js";
+import { collectPluginCommandInboundMedia } from "./plugin-command-inbound-media.js";
 import { recordSentMessage } from "./sent-message-cache.js";
 
 const EMPTY_RESPONSE_FALLBACK = "No response generated. Please try again.";
@@ -1070,6 +1071,11 @@ export const registerTelegramNativeCommands = ({
           }
         }
 
+        const inboundMedia = await collectPluginCommandInboundMedia({
+          bot,
+          msg,
+          warn: (message) => runtime.log?.(message),
+        });
         const result = await nativeCommandRuntime.executePluginCommand({
           command: match.command,
           args: match.args,
@@ -1083,6 +1089,9 @@ export const registerTelegramNativeCommands = ({
           to,
           accountId,
           messageThreadId: threadSpec.id,
+          attachments: inboundMedia.attachments,
+          replyTo: inboundMedia.replyTo,
+          structured: inboundMedia.structured,
         });
 
         if (
