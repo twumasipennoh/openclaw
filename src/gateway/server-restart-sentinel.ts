@@ -85,6 +85,8 @@ async function deliverRestartSentinelNotice(params: {
         deps: params.deps,
         bestEffort: false,
         skipQueue: true,
+        // This loop retries on its own; don't multiply attempts.
+        skipRetry: true,
       });
       if (results.length > 0) {
         if (queueId) {
