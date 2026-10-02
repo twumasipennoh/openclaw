@@ -1,3 +1,4 @@
+import type { ReactionTypeEmoji } from "@grammyjs/types";
 import type { Bot, Context } from "grammy";
 import {
   resolveCommandAuthorization,
@@ -1006,6 +1007,14 @@ export const registerTelegramNativeCommands = ({
         });
         if (!auth) {
           return;
+        }
+        const ackEmoji = runtimeCfg.messages?.ackReaction ?? "\u{1F440}";
+        if (ackEmoji) {
+          bot.api
+            .setMessageReaction(chatId, msg.message_id, [
+              { type: "emoji", emoji: ackEmoji } as ReactionTypeEmoji,
+            ])
+            .catch(() => {});
         }
         const { senderId, commandAuthorized, isGroup, isForum, resolvedThreadId } = auth;
         const runtimeContext = await resolveCommandRuntimeContext({
