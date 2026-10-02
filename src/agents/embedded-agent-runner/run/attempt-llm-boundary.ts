@@ -1,13 +1,14 @@
 import { z } from "zod";
 import { stripInboundMetadata } from "../../../auto-reply/reply/strip-inbound-meta.js";
 import { buildTimestampPrefix } from "../../../gateway/server-methods/agent-timestamp.js";
-import type { ImageContent } from "../../../llm/types.js";
+import { hasLegacyRuntimeContextEnvelope, type ImageContent } from "../../../llm/types.js";
 import { INTER_SESSION_PROMPT_PREFIX_BASE } from "../../../sessions/input-provenance.js";
 import { hasPersistedMedia, MEDIA_ONLY_USER_TEXT } from "../../../sessions/user-turn-media.js";
 import { buildLateMediaAttachedProjection } from "../../../sessions/user-turn-transcript.js";
 import {
   escapeInternalRuntimeContextDelimiters,
   OPENCLAW_RUNTIME_CONTEXT_CUSTOM_TYPE,
+  projectRuntimeContextFragments,
   resolveRuntimeContextPromptOwner,
   retainRuntimeContextMessageForPrompt,
   stripHistoricalRuntimeContextCustomMessages,
@@ -27,11 +28,7 @@ import {
   type CurrentUserTimestampMatch,
   type UserTranscriptContext,
 } from "./attempt-history.js";
-import {
-  buildRuntimeContextMessageContent,
-  projectRuntimeContextFragments,
-  type RuntimeContextCustomMessage,
-} from "./runtime-context-prompt.js";
+import type { RuntimeContextCustomMessage } from "./runtime-context-prompt.js";
 
 const runtimeContextDetailsSchema = z.object({
   source: z.literal("openclaw-runtime-context"),
@@ -70,11 +67,16 @@ function projectRuntimeContextMessages(messages: AgentMessage[]): AgentMessage[]
     if (message.role === "custom" && message.customType === OPENCLAW_RUNTIME_CONTEXT_CUSTOM_TYPE) {
       const details = runtimeContextDetailsSchema.safeParse(message.details);
       if (details.success) {
+        if (
+          typeof message.content === "string" &&
+          hasLegacyRuntimeContextEnvelope(message.content)
+        ) {
+          return message;
+        }
         return {
           ...message,
-          content: buildRuntimeContextMessageContent(
-            projectRuntimeContextFragments(details.data.fragments),
-          ),
+          content: projectRuntimeContextFragments(details.data.fragments),
+          details: details.data,
         };
       }
     }

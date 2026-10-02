@@ -7,7 +7,13 @@ import type {
   TextBlockParam,
   ToolResultBlockParam,
 } from "@anthropic-ai/sdk/resources/messages.js";
-import type { Context, Model, Tool } from "@openclaw/llm-core";
+import {
+  isRuntimeContextMessage,
+  readRuntimeContextMetadata,
+  type Context,
+  type Model,
+  type Tool,
+} from "@openclaw/llm-core";
 import { asOptionalObjectRecord } from "@openclaw/normalization-core/record-coerce";
 import { getAiTransportHost } from "../host.js";
 import {
@@ -179,17 +185,18 @@ async function convertAnthropicMessages(
       continue;
     }
     if (msg.role === "user") {
+      const sourceContent = msg.content;
       let content: AnthropicWireMessage["content"];
-      if (typeof msg.content === "string") {
-        if (msg.content.trim().length === 0) {
+      if (typeof sourceContent === "string") {
+        if (sourceContent.trim().length === 0) {
           continue;
         }
-        content = sanitizeTransportPayloadText(msg.content);
+        content = sanitizeTransportPayloadText(sourceContent);
       } else {
         const normalizedContent =
           !managed || model.input.includes("image")
-            ? await normalizeAnthropicInlineContent(msg.content, imageBudget)
-            : msg.content.map((item) =>
+            ? await normalizeAnthropicInlineContent(sourceContent, imageBudget)
+            : sourceContent.map((item) =>
                 item.type === "image"
                   ? { type: "text" as const, text: NON_VISION_USER_IMAGE_PLACEHOLDER }
                   : item,
@@ -219,8 +226,8 @@ async function convertAnthropicMessages(
         }
       }
       if (
-        msg.runtimeContextCarrier &&
-        !(msg.runtimeContextCarrierRetained ?? modelRetainsRuntimeContext)
+        isRuntimeContextMessage(msg) &&
+        !(readRuntimeContextMetadata(msg).retained ?? modelRetainsRuntimeContext)
       ) {
         options.cacheBreakpointOptOutMessageIndexes?.add(params.length);
       }

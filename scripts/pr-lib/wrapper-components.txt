@@ -41,6 +41,7 @@ packages/gateway-protocol/src/validation-errors.ts
 packages/gateway-protocol/src/worker-capacity.ts
 packages/llm-core/package.json
 packages/llm-core/src/model-data.ts
+packages/llm-core/src/types.ts
 packages/media-core/src/constants.ts
 packages/media-core/src/file-name.ts
 packages/media-core/src/mime.ts
@@ -1020,6 +1021,7 @@ src/logging/state.ts
 src/logging/structured-authorization-code.ts
 src/logging/subsystem.ts
 src/logging/timestamps.ts
+src/llm/types.ts
 src/media/media-facts.ts
 src/media/staged-inputs.ts
 src/memory-host-sdk/host/config-utils.ts

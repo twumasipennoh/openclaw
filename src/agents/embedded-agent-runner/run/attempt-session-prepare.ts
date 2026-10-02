@@ -1,6 +1,7 @@
 import type { SessionTranscriptRuntimeTarget } from "../../../config/sessions/session-accessor.js";
 import { OPENCLAW_EMBEDDED_CONTEXT_ENGINE_HOST } from "../../../context-engine/host-compat.js";
 import type { ContextEngine } from "../../../context-engine/types.js";
+import { isRuntimeContextMessage, readRuntimeContextMetadata } from "../../../llm/types.js";
 import {
   attachRuntimePromptMediaFacts,
   readPersistedMediaFacts,
@@ -510,7 +511,12 @@ export async function prepareEmbeddedAttemptSessionBoundary(input: {
           : relocateCurrentRuntimeContextCarrierToTail(normalized),
       );
       for (const message of converted) {
-        if (message.role === "user" && message.runtimeContextCarrier) {
+        if (isRuntimeContextMessage(message)) {
+          message.runtimeContext = {
+            ...readRuntimeContextMetadata(message),
+            retained: input.appendOnlyRuntimeContext,
+          };
+          message.runtimeContextCarrier = true;
           message.runtimeContextCarrierRetained = input.appendOnlyRuntimeContext;
         }
       }

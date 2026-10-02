@@ -275,12 +275,60 @@ describe("prepareEmbeddedAttemptSessionBoundary", () => {
         appendOnlyRuntimeContext ? [user, carrier] : [carrier, user],
       );
       const message = converted.at(-1);
-      expect(message).toMatchObject({ role: "user", runtimeContextCarrier: true });
-      expect(
-        (message as { runtimeContextCarrierRetained?: boolean }).runtimeContextCarrierRetained,
-      ).toBe(appendOnlyRuntimeContext);
+      expect(message).toMatchObject({
+        role: "user",
+        runtimeContext: { retained: appendOnlyRuntimeContext },
+        runtimeContextCarrier: true,
+        runtimeContextCarrierRetained: appendOnlyRuntimeContext,
+      });
     },
   );
+
+  it("preserves shipped version-4 carrier bytes before signed thinking", async () => {
+    const legacyBody = "retained v2026.9.7 context";
+    const legacyText = `<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>\n${legacyBody}\n<<<END_OPENCLAW_INTERNAL_CONTEXT>>>`;
+    const legacyCarrier: AgentMessage = {
+      ...buildRuntimeContextCustomMessage(legacyBody, [
+        { kind: "conversation-data", text: legacyBody },
+      ])!,
+      content: legacyText,
+      timestamp: 2,
+    };
+    const signedReply = makeAssistantMessageFixture({
+      content: [
+        { type: "thinking", thinking: "signed thought", thinkingSignature: "signature" },
+        { type: "text", text: "Original answer" },
+      ],
+    });
+    const { activeSession } = createActiveSession();
+    activeSession.agent.convertToLlm = convertHarnessMessages;
+    await prepareEmbeddedAttemptSessionBoundary({
+      activeSession,
+      appendOnlyRuntimeContext: true,
+      attempt: { prompt: "Continue" },
+      getUserTranscriptContexts: () => undefined,
+      isRawModelRun: false,
+      preparedUserTurnMessage: undefined,
+      sessionManager: createSessionManager({ getHeader: () => ({ version: 4 }) }),
+      setActiveSessionSystemPrompt: vi.fn(),
+    });
+
+    const converted = await activeSession.agent.convertToLlm([
+      { role: "user", content: "Original question", timestamp: 1 },
+      legacyCarrier,
+      signedReply,
+      { role: "user", content: "Continue", timestamp: 4 },
+    ]);
+
+    expect(converted[1]).toMatchObject({
+      role: "user",
+      content: [{ type: "text", text: legacyText }],
+      runtimeContext: { retained: true },
+      runtimeContextCarrier: true,
+      runtimeContextCarrierRetained: true,
+    });
+    expect(converted[2]).toBe(signedReply);
+  });
 
   it.each(["aborted", "rebound-writer"] as const)(
     "does not persist orphan repair for an unavailable owner: %s",
