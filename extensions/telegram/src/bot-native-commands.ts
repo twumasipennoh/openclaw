@@ -80,6 +80,8 @@ import { recordSentMessage } from "./sent-message-cache.js";
 
 const EMPTY_RESPONSE_FALLBACK = "No response generated. Please try again.";
 const TELEGRAM_NATIVE_COMMAND_CALLBACK_PREFIX = "tgcmd:";
+const PLUGIN_COMMAND_MATCH_RETRIES = 4;
+const PLUGIN_COMMAND_MATCH_RETRY_MS = 250;
 
 type TelegramNativeCommandContext = Context & { match?: string };
 type TelegramChunkMode = ReturnType<
@@ -983,7 +985,13 @@ export const registerTelegramNativeCommands = ({
         const rawText = ctx.match?.trim() ?? "";
         const commandBody = `/${pluginCommand.command}${rawText ? ` ${rawText}` : ""}`;
         const nativeCommandRuntime = await loadTelegramNativeCommandRuntime();
-        const match = nativeCommandRuntime.matchPluginCommand(commandBody);
+        let match = nativeCommandRuntime.matchPluginCommand(commandBody);
+        // This handler only exists for commands registered at startup, so a miss
+        // means a plugin reload is mid-flight; give it ~1s to re-register.
+        for (let i = 0; i < PLUGIN_COMMAND_MATCH_RETRIES && !match; i += 1) {
+          await new Promise((resolve) => setTimeout(resolve, PLUGIN_COMMAND_MATCH_RETRY_MS));
+          match = nativeCommandRuntime.matchPluginCommand(commandBody);
+        }
         if (!match) {
           await withTelegramApiErrorLogging({
             operation: "sendMessage",
