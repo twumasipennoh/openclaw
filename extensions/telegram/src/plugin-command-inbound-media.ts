@@ -60,8 +60,9 @@ export async function collectPluginCommandInboundMedia(params: {
     if (!src) {
       return;
     }
-    if (Array.isArray(src.photo) && src.photo.length > 0) {
-      await download(src.photo[src.photo.length - 1].file_id, "image/jpeg", null, fromReply);
+    const largestPhoto = Array.isArray(src.photo) ? src.photo.at(-1) : undefined;
+    if (largestPhoto) {
+      await download(largestPhoto.file_id, "image/jpeg", null, fromReply);
     }
     if (src.animation?.file_id) {
       await download(
