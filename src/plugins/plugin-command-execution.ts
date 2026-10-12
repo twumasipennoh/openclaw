@@ -223,6 +223,9 @@ export async function executeRegisteredPluginCommand(
     accountId: bindingConversation?.accountId ?? params.accountId,
     messageThreadId: params.messageThreadId,
     threadParentId: params.threadParentId,
+    attachments: params.attachments,
+    replyTo: params.replyTo,
+    structured: params.structured,
     diagnosticsSessions: params.diagnosticsSessions,
     runtimeContext: buildRuntimeContext(
       command,

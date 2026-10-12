@@ -286,6 +286,7 @@ describe("getTelegramSequentialConstraints", () => {
 describe("getTelegramSequentialKey control-lane commands", () => {
   const keyFor = (text: string) =>
     getTelegramSequentialKey({
+      me: { username: "my_bot" } as never,
       message: mockMessage({ chat: mockChat({ id: 123 }), text }),
     });
 
@@ -296,7 +297,10 @@ describe("getTelegramSequentialKey control-lane commands", () => {
     },
   );
 
-  it.each(["/cancelled", "/progressive", "please /cancel"])("keeps %j on the chat lane", (text) => {
-    expect(keyFor(text)).toBe("telegram:123");
-  });
+  it.each(["/cancelled", "/progressive", "please /cancel", "/cancel@other_bot"])(
+    "keeps %j on the chat lane",
+    (text) => {
+      expect(keyFor(text)).toBe("telegram:123");
+    },
+  );
 });

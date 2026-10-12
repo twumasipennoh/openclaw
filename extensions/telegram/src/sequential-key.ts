@@ -107,6 +107,20 @@ function resolveTelegramCommandKeyForControlLane(params: {
   )?.key;
 }
 
+// claude-cli's /cancel and /progress are plugin commands, so they are not in the chat
+// command registry above; they must still reach a busy chat ahead of the in-flight run.
+const PLUGIN_CONTROL_LANE_COMMANDS = new Set(["/cancel", "/stop", "/progress"]);
+
+function isPluginControlLaneCommand(rawText: string | undefined, botUsername?: string): boolean {
+  const [command = "", target] = (rawText ?? "").trim().toLowerCase().split("@");
+  // A command addressed to another bot (or to any bot before our identity is known)
+  // stays on the chat lane, matching the abort-command fence above.
+  if (target !== undefined && target.trim() !== botUsername?.toLowerCase()) {
+    return false;
+  }
+  return PLUGIN_CONTROL_LANE_COMMANDS.has(command.trim());
+}
+
 export function isTelegramControlLaneText(params: {
   rawText?: string;
   botUsername?: string;
@@ -117,6 +131,9 @@ export function isTelegramControlLaneText(params: {
     ? { botUsername: params.botUsername }
     : { targetedCommandMode: "pre-identity" as const };
   if (isAbortRequestText(params.rawText, abortCommandOptions)) {
+    return true;
+  }
+  if (isPluginControlLaneCommand(params.rawText, params.botUsername)) {
     return true;
   }
   const key = resolveTelegramCommandKeyForControlLane(params);

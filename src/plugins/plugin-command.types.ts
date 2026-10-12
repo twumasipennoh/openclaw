@@ -47,6 +47,23 @@ export type PluginCommandDiagnosticsSession = {
   threadParentId?: string;
 };
 
+export type PluginCommandAttachment = {
+  path: string;
+  mime: string;
+  originalName: string;
+  /** True when the media came from the replied-to message */
+  fromReply: boolean;
+};
+
+export type PluginCommandReplyTo = {
+  text: string | null;
+  fromUser: string | null;
+  messageId: number;
+  hasMedia: boolean;
+  fromBot: boolean;
+  structured: string;
+};
+
 export type PluginCommandContext = {
   /** The sender's identifier (for example a channel-scoped user ID) */
   senderId?: string;
@@ -96,6 +113,12 @@ export type PluginCommandContext = {
   messageThreadId?: string | number;
   /** Parent conversation id for thread-capable channels */
   threadParentId?: string;
+  /** Inbound media downloaded to local files (message and the message it replies to) */
+  attachments?: PluginCommandAttachment[];
+  /** The message this command replied to, if any */
+  replyTo?: PluginCommandReplyTo | null;
+  /** Contact/location/venue/poll shares formatted as plain text */
+  structured?: string;
   /** Sensitive diagnostics-only session inventory for owner-gated commands. */
   diagnosticsSessions?: PluginCommandDiagnosticsSession[];
   /** Host-bound runtime capabilities scoped to this command invocation. */

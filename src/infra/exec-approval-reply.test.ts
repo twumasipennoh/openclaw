@@ -50,8 +50,8 @@ describe("exec approval reply helpers", () => {
   it("returns null metadata for a null or non-object payload", () => {
     // Fork Patch 7: plugins such as claude-cli return a null payload after sending
     // their own chunks; reading channelData off it threw a TypeError per reply.
-    expect(getExecApprovalReplyMetadata(null as never)).toBeNull();
-    expect(getExecApprovalReplyMetadata(undefined as never)).toBeNull();
+    expect(getExecApprovalReplyMetadata(null)).toBeNull();
+    expect(getExecApprovalReplyMetadata(undefined)).toBeNull();
   });
 
   const invalidReplyMetadataCases = [

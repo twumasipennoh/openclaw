@@ -1,5 +1,5 @@
 diff --git a/out/context.js b/out/context.js
-index efab95699e863c0fcb0d42eee047ed83f9d4812f..868919fa30c917c6ce00200a72a7af8e3b977f1c 100644
+index c250e4b..a259768 100644
 --- a/out/context.js
 +++ b/out/context.js
 @@ -20,7 +20,7 @@ const checker = {

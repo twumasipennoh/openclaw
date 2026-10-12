@@ -221,6 +221,7 @@ patchedDependencies:
   baileys@7.0.0-rc14: 03ae85550381d1bda7d014c9aa9f544ad421d35d745d1167fd5d33f7f715dafb
   chrome-devtools-mcp@1.10.1: d31d6e7e187ea9fd4dad87ed3ad08073c77ffcfddd52bc4761b39a2dfce0ac1e
   ghostty-web@0.4.0: eb0a0b91bbf843ba8dceeade968072a6c7a6be402fdd1e80d466e54241b62fa6
+  grammy@1.46.0: 0bf3aac23ce676cde7c118218bc9bb2a3391521f380620711954afc1757242d9
   matrix-js-sdk@42.4.0: 12d9bb9bdc53b7b96d8d887d0bea6b3072d1fef488b51102caec19fb651c8e92
   vitest@5.0.1: 90ba2969491e095cc2e92a4d38256dfcf64f85078ec29e1762b9429a00b35901
 
@@ -257,7 +258,7 @@ importers:
         version: 2.24.0(@modelcontextprotocol/sdk@1.31.0(supports-color@10.2.2)(zod@4.6.5))(supports-color@10.2.2)
       '@grammyjs/transformer-throttler':
         specifier: 1.2.1
-        version: 1.2.1(grammy@1.46.0(supports-color@10.2.2))
+        version: 1.2.1(grammy@1.46.0(patch_hash=0bf3aac23ce676cde7c118218bc9bb2a3391521f380620711954afc1757242d9)(supports-color@10.2.2))
       '@homebridge/ciao':
         specifier: 1.3.12
         version: 1.3.12(supports-color@10.2.2)
@@ -329,7 +330,7 @@ importers:
         version: 22.1.1(supports-color@10.2.2)
       grammy:
         specifier: 1.46.0
-        version: 1.46.0(supports-color@10.2.2)
+        version: 1.46.0(patch_hash=0bf3aac23ce676cde7c118218bc9bb2a3391521f380620711954afc1757242d9)(supports-color@10.2.2)
       highlight.js:
         specifier: 11.12.0
         version: 11.12.0
@@ -2248,13 +2249,13 @@ importers:
     dependencies:
       '@grammyjs/transformer-throttler':
         specifier: 1.2.1
-        version: 1.2.1(grammy@1.46.0(supports-color@10.2.2))
+        version: 1.2.1(grammy@1.46.0(patch_hash=0bf3aac23ce676cde7c118218bc9bb2a3391521f380620711954afc1757242d9)(supports-color@10.2.2))
       abort-controller:
         specifier: 3.0.0
         version: 3.0.0
       grammy:
         specifier: 1.46.0
-        version: 1.46.0(supports-color@10.2.2)
+        version: 1.46.0(patch_hash=0bf3aac23ce676cde7c118218bc9bb2a3391521f380620711954afc1757242d9)(supports-color@10.2.2)
       typebox:
         specifier: 1.3.34
         version: 1.3.34
@@ -11655,10 +11656,10 @@ snapshots:
       - supports-color
       - utf-8-validate
 
-  '@grammyjs/transformer-throttler@1.2.1(grammy@1.46.0(supports-color@10.2.2))':
+  '@grammyjs/transformer-throttler@1.2.1(grammy@1.46.0(patch_hash=0bf3aac23ce676cde7c118218bc9bb2a3391521f380620711954afc1757242d9)(supports-color@10.2.2))':
     dependencies:
       bottleneck: 2.19.5
-      grammy: 1.46.0(supports-color@10.2.2)
+      grammy: 1.46.0(patch_hash=0bf3aac23ce676cde7c118218bc9bb2a3391521f380620711954afc1757242d9)(supports-color@10.2.2)
 
   '@grammyjs/types@5.0.0': {}
 
@@ -15329,7 +15330,7 @@ snapshots:
 
   graceful-fs@4.2.11: {}
 
-  grammy@1.46.0(supports-color@10.2.2):
+  grammy@1.46.0(patch_hash=0bf3aac23ce676cde7c118218bc9bb2a3391521f380620711954afc1757242d9)(supports-color@10.2.2):
     dependencies:
       '@grammyjs/types': 5.0.0
       abort-controller: 3.0.0

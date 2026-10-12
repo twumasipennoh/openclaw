@@ -50,6 +50,9 @@ export type PluginCommandDispatchContext = Readonly<{
   accountId?: PluginCommandContext["accountId"];
   messageThreadId?: PluginCommandContext["messageThreadId"];
   threadParentId?: PluginCommandContext["threadParentId"];
+  attachments?: PluginCommandContext["attachments"];
+  replyTo?: PluginCommandContext["replyTo"];
+  structured?: PluginCommandContext["structured"];
   diagnosticsSessions?: PluginCommandContext["diagnosticsSessions"];
   diagnosticsUploadApproved?: PluginCommandContext["diagnosticsUploadApproved"];
   diagnosticsPreviewOnly?: PluginCommandContext["diagnosticsPreviewOnly"];

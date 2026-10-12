@@ -304,8 +304,12 @@ export function formatExecApprovalExpiresIn(expiresAtMs: number, nowMs: number):
 }
 
 export function getExecApprovalReplyMetadata(
-  payload: ReplyPayload,
+  payload: ReplyPayload | null | undefined,
 ): ExecApprovalReplyMetadata | null {
+  // Plugins may return a null payload (e.g. claude-cli after sending chunks itself).
+  if (!payload || typeof payload !== "object") {
+    return null;
+  }
   const record = asOptionalRecord(asOptionalRecord(payload.channelData)?.execApproval);
   if (!record) {
     return null;

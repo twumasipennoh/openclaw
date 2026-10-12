@@ -378,9 +378,68 @@ describe("Telegram registered plugin delivery", () => {
   function effects() {
     return requests.filter(
       ({ method }) =>
-        !["sendChatAction", "getChat", "setMyCommands", "deleteMyCommands"].includes(method),
+        ![
+          "sendChatAction",
+          "getChat",
+          "setMyCommands",
+          "deleteMyCommands",
+          // Fork: the 👀 ack reaction on plugin commands is asserted on its own below.
+          "setMessageReaction",
+        ].includes(method),
     );
   }
+
+  // Fork patches: 👀 ack reaction on plugin command dispatch, and reply context passed
+  // through to plugin command handlers.
+  it("reacts with the ack emoji on the command message", async () => {
+    registerCommand(async () => ({ text: "done" }), { progress: false });
+    const message = commandMessage("/plug");
+    await (await createBot(true, true, pluginConfig())).handleUpdate({ update_id: 3300, message });
+    const reaction = requests.find(({ method }) => method === "setMessageReaction");
+    expect(reaction?.payload).toMatchObject({
+      message_id: message.message_id,
+      reaction: [{ type: "emoji", emoji: "👀" }],
+    });
+  });
+
+  it("uses the configured ack reaction", async () => {
+    registerCommand(async () => ({ text: "done" }), { progress: false });
+    const cfg = pluginConfig();
+    cfg.messages = { ...cfg.messages, ackReaction: "👍" };
+    await (
+      await createBot(true, true, cfg)
+    ).handleUpdate({ update_id: 3301, message: commandMessage("/plug") });
+    const reaction = requests.find(({ method }) => method === "setMessageReaction");
+    expect(reaction?.payload).toMatchObject({ reaction: [{ type: "emoji", emoji: "👍" }] });
+  });
+
+  it("passes the replied-to message to the plugin handler", async () => {
+    let seen: Parameters<OpenClawPluginCommandDefinition["handler"]>[0] | undefined;
+    registerCommand(
+      async (ctx) => {
+        seen = ctx;
+        return { text: "done" };
+      },
+      { progress: false },
+    );
+    const message = {
+      ...commandMessage("/plug summarize"),
+      reply_to_message: {
+        message_id: 41,
+        date: 1736380700,
+        chat,
+        from: { id: 99, is_bot: false, first_name: "Bob" },
+        text: "the original message",
+      },
+    };
+    await (await createBot(true, true, pluginConfig())).handleUpdate({ update_id: 3302, message });
+    expect(seen?.replyTo).toMatchObject({
+      messageId: 41,
+      text: "the original message",
+      hasMedia: false,
+    });
+    expect(seen?.attachments).toEqual([]);
+  });
 
   it.each([false, true])("settles a progress edit once (rejected: %s)", async (rejected) => {
     rejectEdit = rejected;

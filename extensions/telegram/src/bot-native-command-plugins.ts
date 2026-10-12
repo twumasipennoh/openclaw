@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import type { ReactionTypeEmoji } from "grammy/types";
+import { resolveAckReaction } from "openclaw/plugin-sdk/channel-feedback";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import type { PluginCommandNativeCandidate } from "openclaw/plugin-sdk/plugin-command-runtime";
 import { hasOutboundReplyContent } from "openclaw/plugin-sdk/reply-payload";
@@ -22,7 +24,9 @@ import {
 import type { TelegramInlineButtons } from "./button-types.js";
 import { shouldSuppressLocalTelegramExecApprovalPrompt } from "./exec-approvals.js";
 import { buildInlineKeyboard } from "./inline-keyboard.js";
+import { collectPluginCommandInboundMedia } from "./plugin-command-inbound-media.js";
 import { recordSentMessage } from "./sent-message-cache.js";
+import { resolveTelegramReactionEmoji } from "./status-reaction-variants.js";
 
 const EMPTY_RESPONSE_FALLBACK = "No response generated. Please try again.";
 
@@ -123,6 +127,21 @@ export async function executeTelegramPluginCommand(
   if (!dispatch) {
     return;
   }
+  // React on the command message so the sender sees it was picked up before a long
+  // plugin run (e.g. /claude) replies.
+  const ackEmoji = resolveTelegramReactionEmoji(
+    resolveAckReaction(dispatch.runtimeCfg, dispatch.route.agentId, {
+      channel: "telegram",
+      accountId: dispatch.accountId,
+    }),
+  );
+  if (ackEmoji) {
+    dispatch.bot.api
+      .setMessageReaction(dispatch.chatId, dispatch.msg.message_id, [
+        { type: "emoji", emoji: ackEmoji } as ReactionTypeEmoji,
+      ])
+      .catch(() => {});
+  }
   const targetSessionEntry = dispatch.nativeCommandRuntime.getSessionEntry({
     agentId: dispatch.route.agentId,
     sessionKey: dispatch.targetSessionKey,
@@ -173,6 +192,11 @@ export async function executeTelegramPluginCommand(
     agentId: dispatch.route.agentId,
     sessionKey: dispatch.targetSessionKey,
   });
+  const inboundMedia = await collectPluginCommandInboundMedia({
+    bot: dispatch.bot,
+    msg: dispatch.msg,
+    warn: (message) => dispatch.runtime.log?.(message),
+  });
   const result = await pluginCommandDispatch.execute({
     senderId: dispatch.senderId,
     channel: "telegram",
@@ -190,6 +214,9 @@ export async function executeTelegramPluginCommand(
     to,
     accountId: dispatch.accountId,
     messageThreadId: dispatch.threadSpec.id,
+    attachments: inboundMedia.attachments,
+    replyTo: inboundMedia.replyTo,
+    structured: inboundMedia.structured,
   });
   const suppressReply =
     shouldSuppressLocalTelegramExecApprovalPrompt({
