@@ -375,17 +375,17 @@ describe("Telegram registered plugin delivery", () => {
     }
   }
 
+  // Fork: the default 👀 ack reaction on plugin commands is asserted on its own below.
+  const isAckReaction = ({ method, payload }: ApiRequest) =>
+    method === "setMessageReaction" &&
+    JSON.stringify(payload.reaction) === JSON.stringify([{ type: "emoji", emoji: "👀" }]);
+
   function effects() {
     return requests.filter(
-      ({ method }) =>
-        ![
-          "sendChatAction",
-          "getChat",
-          "setMyCommands",
-          "deleteMyCommands",
-          // Fork: the 👀 ack reaction on plugin commands is asserted on its own below.
-          "setMessageReaction",
-        ].includes(method),
+      (request) =>
+        !["sendChatAction", "getChat", "setMyCommands", "deleteMyCommands"].includes(
+          request.method,
+        ) && !isAckReaction(request),
     );
   }
 
