@@ -1,9 +1,10 @@
 import { afterAll, afterEach, describe, expect, it } from "vitest";
-import { clearPluginCommands, getPluginCommandSpecs } from "./command-registry-state.js";
+import { clearPluginCommands } from "./command-registry-state.js";
+import { getPluginCommandSpecs } from "./command-specs.js";
 import { loadOpenClawPlugins } from "./loader.js";
 import {
   cleanupPluginLoaderFixturesForTest,
-  makeTempDir,
+  makePluginLoaderTempDir,
   resetPluginLoaderTestStateForTest,
   useNoBundledPlugins,
   writePlugin,
@@ -35,7 +36,7 @@ const commandPluginBody = (id: string, name: string) => `module.exports = {
 describe("scoped plugin reload keeps other plugins' commands", () => {
   it("re-registers only the reloaded plugin's commands", () => {
     useNoBundledPlugins();
-    const dir = makeTempDir();
+    const dir = makePluginLoaderTempDir();
     const keeper = writePlugin({
       id: "keeper-plugin",
       dir: `${dir}/keeper`,
