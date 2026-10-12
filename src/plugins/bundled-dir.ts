@@ -1,95 +1,287 @@
+/** Resolves the bundled plugin directory for source checkouts, dist builds, and tests. */
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { normalizeOptionalLowercaseString } from "@openclaw/normalization-core/string-coerce";
+import { uniqueStrings } from "@openclaw/normalization-core/string-normalization";
+import { isTruthyEnvValue, isVitestRuntimeEnv } from "../infra/env.js";
 import { resolveOpenClawPackageRootSync } from "../infra/openclaw-root.js";
+import { isPathInside } from "../infra/path-guards.js";
+import { tryProcessCwd } from "../infra/safe-cwd.js";
 import { resolveUserPath } from "../utils.js";
+import {
+  pluginCacheExistsSync,
+  pluginCacheRealpathSync,
+  readPluginCacheDirectory,
+  refreshPluginCacheStat,
+} from "./plugin-cache-files.js";
+import { getPluginCache } from "./plugin-cache.js";
+import {
+  resolvePluginRuntimeArtifactPreference,
+  type PluginRuntimeArtifactPreference,
+} from "./plugin-runtime-artifact-selection.js";
 
 const DISABLED_BUNDLED_PLUGINS_DIR = path.join(os.tmpdir(), "openclaw-empty-bundled-plugins");
+const TEST_TRUST_BUNDLED_PLUGINS_DIR_ENV = "OPENCLAW_TEST_TRUST_BUNDLED_PLUGINS_DIR";
 
-function bundledPluginsDisabled(env: NodeJS.ProcessEnv): boolean {
-  const raw = env.OPENCLAW_DISABLE_BUNDLED_PLUGINS?.trim().toLowerCase();
+/** Diagnostic emitted when source-checkout bundled plugins lack dependency installs. */
+type SourceCheckoutDependencyDiagnostic = {
+  source: string;
+  message: string;
+};
+
+/** Returns true when env disables bundled plugin discovery. */
+export function areBundledPluginsDisabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  const raw = normalizeOptionalLowercaseString(env.OPENCLAW_DISABLE_BUNDLED_PLUGINS);
   return raw === "1" || raw === "true";
 }
 
 function resolveDisabledBundledPluginsDir(): string {
-  fs.mkdirSync(DISABLED_BUNDLED_PLUGINS_DIR, { recursive: true });
+  if (!pluginCacheExistsSync(DISABLED_BUNDLED_PLUGINS_DIR)) {
+    fs.mkdirSync(DISABLED_BUNDLED_PLUGINS_DIR, { recursive: true });
+    refreshPluginCacheStat(DISABLED_BUNDLED_PLUGINS_DIR);
+  }
   return DISABLED_BUNDLED_PLUGINS_DIR;
 }
 
-function isSourceCheckoutRoot(packageRoot: string): boolean {
+export function isSourceCheckoutRoot(packageRoot: string): boolean {
   return (
-    fs.existsSync(path.join(packageRoot, ".git")) &&
-    fs.existsSync(path.join(packageRoot, "src")) &&
-    fs.existsSync(path.join(packageRoot, "extensions"))
+    pluginCacheExistsSync(path.join(packageRoot, "pnpm-workspace.yaml")) &&
+    pluginCacheExistsSync(path.join(packageRoot, "src")) &&
+    pluginCacheExistsSync(path.join(packageRoot, "extensions"))
   );
 }
 
-function resolveBundledDirFromPackageRoot(
-  packageRoot: string,
-  preferSourceCheckout: boolean,
-): string | undefined {
-  const sourceExtensionsDir = path.join(packageRoot, "extensions");
-  const builtExtensionsDir = path.join(packageRoot, "dist", "extensions");
-  if (preferSourceCheckout && fs.existsSync(sourceExtensionsDir)) {
-    return sourceExtensionsDir;
+export function shouldTrustTestBundledPluginsDirOverride(env: NodeJS.ProcessEnv): boolean {
+  const separateEnv = env !== process.env;
+  if (
+    !isTruthyEnvValue(env[TEST_TRUST_BUNDLED_PLUGINS_DIR_ENV]) &&
+    !(separateEnv && isTruthyEnvValue(process.env[TEST_TRUST_BUNDLED_PLUGINS_DIR_ENV]))
+  ) {
+    return false;
   }
-  // Local source checkouts stage a runtime-complete bundled plugin tree under
-  // dist-runtime/. Prefer that over source extensions only when the paired
-  // dist/ tree exists; otherwise wrappers can drift ahead of the last build.
-  const runtimeExtensionsDir = path.join(packageRoot, "dist-runtime", "extensions");
-  if (fs.existsSync(runtimeExtensionsDir) && fs.existsSync(builtExtensionsDir)) {
-    return runtimeExtensionsDir;
-  }
-  if (fs.existsSync(builtExtensionsDir)) {
-    return builtExtensionsDir;
-  }
-  if (isSourceCheckoutRoot(packageRoot) && fs.existsSync(sourceExtensionsDir)) {
-    return sourceExtensionsDir;
-  }
-  return undefined;
+  return isVitestRuntimeEnv(env) || (separateEnv && isVitestRuntimeEnv(process.env));
 }
 
-export function resolveBundledPluginsDir(env: NodeJS.ProcessEnv = process.env): string | undefined {
-  if (bundledPluginsDisabled(env)) {
+export function hasUsableBundledPluginTree(pluginsDir: string): boolean {
+  if (!pluginCacheExistsSync(pluginsDir)) {
+    return false;
+  }
+  try {
+    return readPluginCacheDirectory(pluginsDir).some((entry) => {
+      if (!entry.isDirectory()) {
+        return false;
+      }
+      const pluginDir = path.join(pluginsDir, entry.name);
+      return (
+        pluginCacheExistsSync(path.join(pluginDir, "package.json")) ||
+        pluginCacheExistsSync(path.join(pluginDir, "openclaw.plugin.json"))
+      );
+    });
+  } catch {
+    return false;
+  }
+}
+
+function safeRealpathSync(targetPath: string): string | null {
+  // Trusted bundled containment requires native platform canonicalization.
+  return pluginCacheRealpathSync(targetPath, true);
+}
+
+function trustedBundledPluginRootsForPackageRoot(packageRoot: string): string[] {
+  const roots = [
+    path.join(packageRoot, "dist", "extensions"),
+    path.join(packageRoot, "dist-runtime", "extensions"),
+  ];
+  if (isSourceCheckoutRoot(packageRoot)) {
+    roots.push(path.join(packageRoot, "extensions"));
+  }
+  return roots;
+}
+
+function resolvePackageRootsForBundledPlugins(): string[] {
+  const argvRoot = resolveOpenClawPackageRootSync({ argv1: process.argv[1] });
+  const moduleRoot = resolveOpenClawPackageRootSync({ moduleUrl: import.meta.url });
+  return uniqueStrings([argvRoot, moduleRoot].filter((entry): entry is string => Boolean(entry)));
+}
+
+export function resolveSourceCheckoutDependencyDiagnostic(
+  env: NodeJS.ProcessEnv = process.env,
+): SourceCheckoutDependencyDiagnostic | null {
+  if (areBundledPluginsDisabled(env)) {
+    return null;
+  }
+  for (const packageRoot of resolvePackageRootsForBundledPlugins()) {
+    if (!isSourceCheckoutRoot(packageRoot)) {
+      continue;
+    }
+    const extensionsDir = path.join(packageRoot, "extensions");
+    if (
+      !isPluginInPackageBundledRoots({ rootDir: extensionsDir, packageRoot }) ||
+      !hasUsableBundledPluginTree(extensionsDir)
+    ) {
+      continue;
+    }
+    if (pluginCacheExistsSync(path.join(packageRoot, "node_modules", ".pnpm"))) {
+      continue;
+    }
+    return {
+      source: packageRoot,
+      message:
+        "OpenClaw source checkout detected without pnpm workspace dependencies; run `pnpm install` from the repo root so bundled plugins can load package-local dependencies.",
+    };
+  }
+  return null;
+}
+
+function resolveTrustedExistingOverride(resolvedOverride: string): string | null {
+  const realOverride = safeRealpathSync(resolvedOverride);
+  if (!realOverride) {
+    return null;
+  }
+
+  const modulePackageRoot = resolveOpenClawPackageRootSync({ moduleUrl: import.meta.url });
+  if (
+    !modulePackageRoot ||
+    !isPluginInPackageBundledRoots({ rootDir: realOverride, packageRoot: modulePackageRoot })
+  ) {
+    return null;
+  }
+  if (!hasUsableBundledPluginTree(realOverride)) {
+    return null;
+  }
+  return realOverride;
+}
+
+/** Checks physical containment in a package's source or compiled plugin trees. */
+export function isPluginInPackageBundledRoots(params: {
+  rootDir: string;
+  packageRoot: string;
+}): boolean {
+  const realPluginRoot = safeRealpathSync(params.rootDir);
+  const realPackageRoot = safeRealpathSync(params.packageRoot);
+  if (!realPluginRoot || !realPackageRoot) {
+    return false;
+  }
+  return trustedBundledPluginRootsForPackageRoot(params.packageRoot)
+    .map((trustedRoot) => safeRealpathSync(trustedRoot))
+    .some(
+      (trustedRoot) =>
+        trustedRoot !== null &&
+        isPathInside(realPackageRoot, trustedRoot) &&
+        isPathInside(trustedRoot, realPluginRoot),
+    );
+}
+
+/** Recognizes compiled bundle ownership only; this never confers plugin trust. */
+export function isForeignBundledPluginRoot(
+  rootDir: string,
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  const realRootDir = safeRealpathSync(rootDir);
+  if (!realRootDir) {
+    return false;
+  }
+  const extensionsDir = path.dirname(realRootDir);
+  const compiledDir = path.dirname(extensionsDir);
+  if (
+    path.basename(extensionsDir) !== "extensions" ||
+    !["dist", "dist-runtime"].includes(path.basename(compiledDir))
+  ) {
+    // Source extensions remain the documented plugins install --link target.
+    return false;
+  }
+  const packageRoot = path.dirname(compiledDir);
+  if (
+    resolveOpenClawPackageRootSync({ cwd: packageRoot }) !== packageRoot ||
+    !isPluginInPackageBundledRoots({ rootDir: realRootDir, packageRoot })
+  ) {
+    return false;
+  }
+  const activeBundledDir = resolveBundledPluginsDir(env);
+  const realActiveDir = activeBundledDir ? safeRealpathSync(activeBundledDir) : null;
+  if (realActiveDir && isPathInside(realActiveDir, realRootDir)) {
+    return false;
+  }
+  const runningRoots = resolvePackageRootsForBundledPlugins();
+  // Unknown roots (e.g. compiled sibling layouts) cannot establish foreign ownership.
+  return (
+    runningRoots.length > 0 &&
+    !runningRoots.some((runningRoot) =>
+      isPluginInPackageBundledRoots({ rootDir: realRootDir, packageRoot: runningRoot }),
+    )
+  );
+}
+
+export function resolveBundledDirFromPackageRoot(
+  packageRoot: string,
+  preference: PluginRuntimeArtifactPreference = "bundled",
+): string | undefined {
+  const builtExtensionsDir = path.join(packageRoot, "dist", "extensions");
+  const runtimeExtensionsDir = path.join(packageRoot, "dist-runtime", "extensions");
+  if (isSourceCheckoutRoot(packageRoot)) {
+    const sourceExtensionsDir = path.join(packageRoot, "extensions");
+    // Runtime execution follows its host graph; candidate/update inspection keeps
+    // the packaged default without borrowing the inspecting process's graph.
+    const roots =
+      preference === "source"
+        ? [sourceExtensionsDir]
+        : [builtExtensionsDir, runtimeExtensionsDir, sourceExtensionsDir];
+    return roots.find(
+      (rootDir) =>
+        isPluginInPackageBundledRoots({ rootDir, packageRoot }) &&
+        hasUsableBundledPluginTree(rootDir),
+    );
+  }
+  return pluginCacheExistsSync(builtExtensionsDir)
+    ? [runtimeExtensionsDir, builtExtensionsDir].find((rootDir) =>
+        isPluginInPackageBundledRoots({ rootDir, packageRoot }),
+      )
+    : undefined;
+}
+
+function resolveBundledPluginsDirUncached(env: NodeJS.ProcessEnv): string | undefined {
+  if (areBundledPluginsDisabled(env)) {
     return resolveDisabledBundledPluginsDir();
   }
 
   const override = env.OPENCLAW_BUNDLED_PLUGINS_DIR?.trim();
+  let rejectedExistingOverride: string | null = null;
   if (override) {
     const resolvedOverride = resolveUserPath(override, env);
-    if (fs.existsSync(resolvedOverride)) {
-      return resolvedOverride;
-    }
-    // Installed CLIs can inherit stale bundled-dir overrides from older shells
-    // or debug sessions. Prefer the package that owns argv[1] over a broken
-    // override so bundled providers keep working in packaged installs.
-    try {
-      const argvPackageRoot = resolveOpenClawPackageRootSync({ argv1: process.argv[1] });
-      if (argvPackageRoot && !isSourceCheckoutRoot(argvPackageRoot)) {
-        const argvFallback = resolveBundledDirFromPackageRoot(argvPackageRoot, false);
-        if (argvFallback) {
-          return argvFallback;
-        }
+    if (pluginCacheExistsSync(resolvedOverride)) {
+      if (shouldTrustTestBundledPluginsDirOverride(env)) {
+        return path.resolve(resolvedOverride);
       }
-    } catch {
-      // ignore
+      const trustedOverride = resolveTrustedExistingOverride(resolvedOverride);
+      if (trustedOverride) {
+        return trustedOverride;
+      }
+      rejectedExistingOverride = resolvedOverride;
     }
-    return resolvedOverride;
   }
 
-  const preferSourceCheckout = Boolean(env.VITEST);
-
   try {
-    const packageRoots = [
-      resolveOpenClawPackageRootSync({ argv1: process.argv[1] }),
-      resolveOpenClawPackageRootSync({ cwd: process.cwd() }),
-      resolveOpenClawPackageRootSync({ moduleUrl: import.meta.url }),
-    ].filter(
-      (entry, index, all): entry is string => Boolean(entry) && all.indexOf(entry) === index,
+    const argvRoot = resolveOpenClawPackageRootSync({ argv1: process.argv[1] });
+    const rejectedOverrideUsesArgvRoot = Boolean(
+      argvRoot &&
+      rejectedExistingOverride &&
+      isPluginInPackageBundledRoots({
+        rootDir: rejectedExistingOverride,
+        packageRoot: argvRoot,
+      }),
+    );
+    const safeArgvRoot = rejectedOverrideUsesArgvRoot ? null : argvRoot;
+    const moduleRoot = resolveOpenClawPackageRootSync({ moduleUrl: import.meta.url });
+    const packageRoots = uniqueStrings(
+      [safeArgvRoot, moduleRoot].filter((entry): entry is string => Boolean(entry)),
     );
     for (const packageRoot of packageRoots) {
-      const bundledDir = resolveBundledDirFromPackageRoot(packageRoot, preferSourceCheckout);
+      const bundledDir = resolveBundledDirFromPackageRoot(
+        packageRoot,
+        resolvePluginRuntimeArtifactPreference(),
+      );
       if (bundledDir) {
         return bundledDir;
       }
@@ -102,11 +294,11 @@ export function resolveBundledPluginsDir(env: NodeJS.ProcessEnv = process.env): 
   try {
     const execDir = path.dirname(process.execPath);
     const siblingBuilt = path.join(execDir, "dist", "extensions");
-    if (fs.existsSync(siblingBuilt)) {
+    if (pluginCacheExistsSync(siblingBuilt)) {
       return siblingBuilt;
     }
     const sibling = path.join(execDir, "extensions");
-    if (fs.existsSync(sibling)) {
+    if (pluginCacheExistsSync(sibling)) {
       return sibling;
     }
   } catch {
@@ -118,7 +310,7 @@ export function resolveBundledPluginsDir(env: NodeJS.ProcessEnv = process.env): 
     let cursor = path.dirname(fileURLToPath(import.meta.url));
     for (let i = 0; i < 6; i += 1) {
       const candidate = path.join(cursor, "extensions");
-      if (fs.existsSync(candidate)) {
+      if (pluginCacheExistsSync(candidate)) {
         return candidate;
       }
       const parent = path.dirname(cursor);
@@ -132,4 +324,42 @@ export function resolveBundledPluginsDir(env: NodeJS.ProcessEnv = process.env): 
   }
 
   return undefined;
+}
+
+export function resolveBundledPluginsDir(env: NodeJS.ProcessEnv = process.env): string | undefined {
+  const disabled = areBundledPluginsDisabled(env);
+  const override = disabled ? undefined : env.OPENCLAW_BUNDLED_PLUGINS_DIR?.trim();
+  const resolvedOverride = override ? resolveUserPath(override, env) : undefined;
+  const trustOverride = shouldTrustTestBundledPluginsDirOverride(env);
+  const argv1 = process.argv[1];
+  const execPath = process.execPath;
+  const cwd = tryProcessCwd();
+  const metadata = getPluginCache().metadata;
+  const cached = metadata.bundledPluginsDir;
+  // Reuse the selected root, not just its filesystem facts. Management scopes and
+  // Gateway restart acquire a new owner; config activation retains this inventory.
+  if (
+    cached &&
+    cached.moduleUrl === import.meta.url &&
+    cached.disabled === disabled &&
+    cached.resolvedOverride === resolvedOverride &&
+    cached.trustOverride === trustOverride &&
+    cached.argv1 === argv1 &&
+    cached.execPath === execPath &&
+    cached.cwd === cwd
+  ) {
+    return cached.value;
+  }
+  const value = resolveBundledPluginsDirUncached(env);
+  metadata.bundledPluginsDir = {
+    moduleUrl: import.meta.url,
+    disabled,
+    resolvedOverride,
+    trustOverride,
+    argv1,
+    execPath,
+    cwd,
+    value,
+  };
+  return value;
 }

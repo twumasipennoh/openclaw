@@ -4,302 +4,150 @@ read_when:
   - Running the Gateway from the CLI (dev or servers)
   - Debugging Gateway auth, bind modes, and connectivity
   - Discovering gateways via Bonjour (local + wide-area DNS-SD)
-title: "gateway"
+  - Integrating an external Gateway process supervisor
+title: "Gateway"
+sidebarTitle: "Gateway"
 ---
 
-# Gateway CLI
-
-The Gateway is OpenClaw’s WebSocket server (channels, nodes, sessions, hooks).
-
-Subcommands in this page live under `openclaw gateway …`.
-
-Related docs:
-
-- [/gateway/bonjour](/gateway/bonjour)
-- [/gateway/discovery](/gateway/discovery)
-- [/gateway/configuration](/gateway/configuration)
-
-## Run the Gateway
-
-Run a local Gateway process:
-
-```bash
-openclaw gateway
-```
-
-Foreground alias:
-
-```bash
-openclaw gateway run
-```
-
-Notes:
-
-- By default, the Gateway refuses to start unless `gateway.mode=local` is set in `~/.openclaw/openclaw.json`. Use `--allow-unconfigured` for ad-hoc/dev runs.
-- `openclaw onboard --mode local` and `openclaw setup` are expected to write `gateway.mode=local`. If the file exists but `gateway.mode` is missing, treat that as a broken or clobbered config and repair it instead of assuming local mode implicitly.
-- If the file exists and `gateway.mode` is missing, the Gateway treats that as suspicious config damage and refuses to “guess local” for you.
-- Binding beyond loopback without auth is blocked (safety guardrail).
-- `SIGUSR1` triggers an in-process restart when authorized (`commands.restart` is enabled by default; set `commands.restart: false` to block manual restart, while gateway tool/config apply/update remain allowed).
-- `SIGINT`/`SIGTERM` handlers stop the gateway process, but they don’t restore any custom terminal state. If you wrap the CLI with a TUI or raw-mode input, restore the terminal before exit.
-
-### Options
-
-- `--port <port>`: WebSocket port (default comes from config/env; usually `18789`).
-- `--bind <loopback|lan|tailnet|auto|custom>`: listener bind mode.
-- `--auth <token|password>`: auth mode override.
-- `--token <token>`: token override (also sets `OPENCLAW_GATEWAY_TOKEN` for the process).
-- `--password <password>`: password override. Warning: inline passwords can be exposed in local process listings.
-- `--password-file <path>`: read the gateway password from a file.
-- `--tailscale <off|serve|funnel>`: expose the Gateway via Tailscale.
-- `--tailscale-reset-on-exit`: reset Tailscale serve/funnel config on shutdown.
-- `--allow-unconfigured`: allow gateway start without `gateway.mode=local` in config. This bypasses the startup guard for ad-hoc/dev bootstrap only; it does not write or repair the config file.
-- `--dev`: create a dev config + workspace if missing (skips BOOTSTRAP.md).
-- `--reset`: reset dev config + credentials + sessions + workspace (requires `--dev`).
-- `--force`: kill any existing listener on the selected port before starting.
-- `--verbose`: verbose logs.
-- `--ws-log <auto|full|compact>`: websocket log style (default `auto`).
-- `--compact`: alias for `--ws-log compact`.
-- `--raw-stream`: log raw model stream events to jsonl.
-- `--raw-stream-path <path>`: raw stream jsonl path.
-
-## Query a running Gateway
-
-All query commands use WebSocket RPC.
-
-Output modes:
-
-- Default: human-readable (colored in TTY).
-- `--json`: machine-readable JSON (no styling/spinner).
-- `--no-color` (or `NO_COLOR=1`): disable ANSI while keeping human layout.
-
-Shared options (where supported):
-
-- `--url <url>`: Gateway WebSocket URL.
-- `--token <token>`: Gateway token.
-- `--password <password>`: Gateway password.
-- `--timeout <ms>`: timeout/budget (varies per command).
-- `--expect-final`: wait for a “final” response (agent calls).
-
-Note: when you set `--url`, the CLI does not fall back to config or environment credentials.
-Pass `--token` or `--password` explicitly. Missing explicit credentials is an error.
-
-### `gateway health`
-
-```bash
-openclaw gateway health --url ws://127.0.0.1:18789
-```
-
-### `gateway usage-cost`
-
-Fetch usage-cost summaries from session logs.
-
-```bash
-openclaw gateway usage-cost
-openclaw gateway usage-cost --days 7
-openclaw gateway usage-cost --json
-```
-
-Options:
-
-- `--days <days>`: number of days to include (default `30`).
-
-### `gateway status`
-
-`gateway status` shows the Gateway service (launchd/systemd/schtasks) plus an optional RPC probe.
-
-```bash
-openclaw gateway status
-openclaw gateway status --json
-openclaw gateway status --require-rpc
-```
-
-Options:
-
-- `--url <url>`: add an explicit probe target. Configured remote + localhost are still probed.
-- `--token <token>`: token auth for the probe.
-- `--password <password>`: password auth for the probe.
-- `--timeout <ms>`: probe timeout (default `10000`).
-- `--no-probe`: skip the RPC probe (service-only view).
-- `--deep`: scan system-level services too.
-- `--require-rpc`: exit non-zero when the RPC probe fails. Cannot be combined with `--no-probe`.
-
-Notes:
-
-- `gateway status` stays available for diagnostics even when the local CLI config is missing or invalid.
-- `gateway status` resolves configured auth SecretRefs for probe auth when possible.
-- If a required auth SecretRef is unresolved in this command path, `gateway status --json` reports `rpc.authWarning` when probe connectivity/auth fails; pass `--token`/`--password` explicitly or resolve the secret source first.
-- If the probe succeeds, unresolved auth-ref warnings are suppressed to avoid false positives.
-- Use `--require-rpc` in scripts and automation when a listening service is not enough and you need the Gateway RPC itself to be healthy.
-- `--deep` adds a best-effort scan for extra launchd/systemd/schtasks installs. When multiple gateway-like services are detected, human output prints cleanup hints and warns that most setups should run one gateway per machine.
-- Human output includes the resolved file log path plus the CLI-vs-service config paths/validity snapshot to help diagnose profile or state-dir drift.
-- On Linux systemd installs, service auth drift checks read both `Environment=` and `EnvironmentFile=` values from the unit (including `%h`, quoted paths, multiple files, and optional `-` files).
-- Drift checks resolve `gateway.auth.token` SecretRefs using merged runtime env (service command env first, then process env fallback).
-- If token auth is not effectively active (explicit `gateway.auth.mode` of `password`/`none`/`trusted-proxy`, or mode unset where password can win and no token candidate can win), token-drift checks skip config token resolution.
-
-### `gateway probe`
-
-`gateway probe` is the “debug everything” command. It always probes:
-
-- your configured remote gateway (if set), and
-- localhost (loopback) **even if remote is configured**.
-
-If you pass `--url`, that explicit target is added ahead of both. Human output labels the
-targets as:
-
-- `URL (explicit)`
-- `Remote (configured)` or `Remote (configured, inactive)`
-- `Local loopback`
-
-If multiple gateways are reachable, it prints all of them. Multiple gateways are supported when you use isolated profiles/ports (e.g., a rescue bot), but most installs still run a single gateway.
-
-```bash
-openclaw gateway probe
-openclaw gateway probe --json
-```
-
-Interpretation:
-
-- `Reachable: yes` means at least one target accepted a WebSocket connect.
-- `RPC: ok` means detail RPC calls (`health`/`status`/`system-presence`/`config.get`) also succeeded.
-- `RPC: limited - missing scope: operator.read` means connect succeeded but detail RPC is scope-limited. This is reported as **degraded** reachability, not full failure.
-- Exit code is non-zero only when no probed target is reachable.
-
-JSON notes (`--json`):
-
-- Top level:
-  - `ok`: at least one target is reachable.
-  - `degraded`: at least one target had scope-limited detail RPC.
-  - `primaryTargetId`: best target to treat as the active winner in this order: explicit URL, SSH tunnel, configured remote, then local loopback.
-  - `warnings[]`: best-effort warning records with `code`, `message`, and optional `targetIds`.
-  - `network`: local loopback/tailnet URL hints derived from current config and host networking.
-  - `discovery.timeoutMs` and `discovery.count`: the actual discovery budget/result count used for this probe pass.
-- Per target (`targets[].connect`):
-  - `ok`: reachability after connect + degraded classification.
-  - `rpcOk`: full detail RPC success.
-  - `scopeLimited`: detail RPC failed due to missing operator scope.
-
-Common warning codes:
-
-- `ssh_tunnel_failed`: SSH tunnel setup failed; the command fell back to direct probes.
-- `multiple_gateways`: more than one target was reachable; this is unusual unless you intentionally run isolated profiles, such as a rescue bot.
-- `auth_secretref_unresolved`: a configured auth SecretRef could not be resolved for a failed target.
-- `probe_scope_limited`: WebSocket connect succeeded, but detail RPC was limited by missing `operator.read`.
-
-#### Remote over SSH (Mac app parity)
-
-The macOS app “Remote over SSH” mode uses a local port-forward so the remote gateway (which may be bound to loopback only) becomes reachable at `ws://127.0.0.1:<port>`.
-
-CLI equivalent:
-
-```bash
-openclaw gateway probe --ssh user@gateway-host
-```
-
-Options:
-
-- `--ssh <target>`: `user@host` or `user@host:port` (port defaults to `22`).
-- `--ssh-identity <path>`: identity file.
-- `--ssh-auto`: pick the first discovered gateway host as SSH target from the resolved
-  discovery endpoint (`local.` plus the configured wide-area domain, if any). TXT-only
-  hints are ignored.
-
-Config (optional, used as defaults):
-
-- `gateway.remote.sshTarget`
-- `gateway.remote.sshIdentity`
-
-### `gateway call <method>`
-
-Low-level RPC helper.
-
-```bash
-openclaw gateway call status
-openclaw gateway call logs.tail --params '{"sinceMs": 60000}'
-```
-
-Options:
-
-- `--params <json>`: JSON object string for params (default `{}`)
-- `--url <url>`
-- `--token <token>`
-- `--password <password>`
-- `--timeout <ms>`
-- `--expect-final`
-- `--json`
-
-Notes:
-
-- `--params` must be valid JSON.
-- `--expect-final` is mainly for agent-style RPCs that stream intermediate events before a final payload.
-
-## Manage the Gateway service
-
-```bash
-openclaw gateway install
-openclaw gateway start
-openclaw gateway stop
-openclaw gateway restart
-openclaw gateway uninstall
-```
-
-Command options:
-
-- `gateway status`: `--url`, `--token`, `--password`, `--timeout`, `--no-probe`, `--require-rpc`, `--deep`, `--json`
-- `gateway install`: `--port`, `--runtime <node|bun>`, `--token`, `--force`, `--json`
-- `gateway uninstall|start|stop|restart`: `--json`
-
-Notes:
-
-- `gateway install` supports `--port`, `--runtime`, `--token`, `--force`, `--json`.
-- When token auth requires a token and `gateway.auth.token` is SecretRef-managed, `gateway install` validates that the SecretRef is resolvable but does not persist the resolved token into service environment metadata.
-- If token auth requires a token and the configured token SecretRef is unresolved, install fails closed instead of persisting fallback plaintext.
-- For password auth on `gateway run`, prefer `OPENCLAW_GATEWAY_PASSWORD`, `--password-file`, or a SecretRef-backed `gateway.auth.password` over inline `--password`.
-- In inferred auth mode, shell-only `OPENCLAW_GATEWAY_PASSWORD` does not relax install token requirements; use durable config (`gateway.auth.password` or config `env`) when installing a managed service.
-- If both `gateway.auth.token` and `gateway.auth.password` are configured and `gateway.auth.mode` is unset, install is blocked until mode is set explicitly.
-- Lifecycle commands accept `--json` for scripting.
-
-## Discover gateways (Bonjour)
-
-`gateway discover` scans for Gateway beacons (`_openclaw-gw._tcp`).
-
-- Multicast DNS-SD: `local.`
-- Unicast DNS-SD (Wide-Area Bonjour): choose a domain (example: `openclaw.internal.`) and set up split DNS + a DNS server; see [/gateway/bonjour](/gateway/bonjour)
-
-Only gateways with Bonjour discovery enabled (default) advertise the beacon.
-
-Wide-Area discovery records include (TXT):
-
-- `role` (gateway role hint)
-- `transport` (transport hint, e.g. `gateway`)
-- `gatewayPort` (WebSocket port, usually `18789`)
-- `sshPort` (optional; clients default SSH targets to `22` when it is absent)
-- `tailnetDns` (MagicDNS hostname, when available)
-- `gatewayTls` / `gatewayTlsSha256` (TLS enabled + cert fingerprint)
-- `cliPath` (remote-install hint written to the wide-area zone)
-
-### `gateway discover`
-
-```bash
-openclaw gateway discover
-```
-
-Options:
-
-- `--timeout <ms>`: per-command timeout (browse/resolve); default `2000`.
-- `--json`: machine-readable output (also disables styling/spinner).
-
-Examples:
-
-```bash
-openclaw gateway discover --timeout 4000
-openclaw gateway discover --json | jq '.beacons[].wsUrl'
-```
-
-Notes:
-
-- The CLI scans `local.` plus the configured wide-area domain when one is enabled.
-- `wsUrl` in JSON output is derived from the resolved service endpoint, not from TXT-only
-  hints such as `lanHost` or `tailnetDns`.
-- On `local.` mDNS, `sshPort` and `cliPath` are only broadcast when
-  `discovery.mdns.mode` is `full`. Wide-area DNS-SD still writes `cliPath`; `sshPort`
-  stays optional there too.
+The Gateway is OpenClaw's WebSocket server (channels, nodes, sessions, hooks). All subcommands on the pages listed here live under `openclaw gateway ...`.
+
+`openclaw daemon ...` is a legacy alias for the service-control subcommands; see [`openclaw daemon`](/cli/daemon).
+
+<CardGroup cols={3}>
+  <Card title="Bonjour discovery" href="/gateway/bonjour">
+    Local mDNS + wide-area DNS-SD setup.
+  </Card>
+  <Card title="Discovery overview" href="/gateway/discovery">
+    How OpenClaw advertises and finds gateways.
+  </Card>
+  <Card title="Configuration" href="/gateway/configuration">
+    Top-level gateway config keys.
+  </Card>
+</CardGroup>
+
+## Gateway CLI pages
+
+This page is an index. Five pages document `openclaw gateway`, one per reader
+job. Open the page that matches your task.
+
+| Page                                                            | Read it when                                                                       |
+| --------------------------------------------------------------- | ---------------------------------------------------------------------------------- |
+| [Run the Gateway](/cli/gateway/running)                         | You are starting the Gateway, tuning its run options, or reading its shared token. |
+| [Restart and supervision](/cli/gateway/restart-and-supervision) | You are restarting the Gateway, or an external supervisor owns its lifecycle.      |
+| [Query a running Gateway](/cli/gateway/query)                   | You want health, status, stability, diagnostics, or a direct RPC call.             |
+| [Manage the Gateway service](/cli/gateway/service)              | You are installing, starting, stopping, or repairing the native service.           |
+| [Discover gateways (Bonjour)](/cli/gateway/discovery)           | You are looking for gateways over mDNS or wide-area DNS-SD.                        |
+
+`openclaw gateway install` installs and starts the service. `--force` reinstalls an existing install and may restart a running Gateway. Finish offline configuration and runtime repairs before installation.
+
+## Where each section moved
+
+Every anchor from the previous single-page version still resolves here, so an
+existing link such as `/cli/gateway#manage-the-gateway-service` keeps working.
+Each entry points at the page that now holds the content.
+
+- <a id="run-the-gateway" />[Run the Gateway](/cli/gateway/running#run-the-gateway)
+- <a id="options" />[Options](/cli/gateway/running#options)
+- <a id="reveal-the-configured-token" />[Reveal the configured token](/cli/gateway/running#reveal-the-configured-token)
+- <a id="restart-the-gateway" />[Restart the Gateway](/cli/gateway/restart-and-supervision#restart-the-gateway)
+- <a id="install-identity" />[Install identity](/cli/gateway/restart-and-supervision#install-identity)
+- <a id="external-supervisors" />[External supervisors](/cli/gateway/restart-and-supervision#external-supervisors)
+- <a id="gateway-profiling" />[Gateway profiling](/cli/gateway/restart-and-supervision#gateway-profiling)
+- <a id="query-a-running-gateway" />[Query a running Gateway](/cli/gateway/query#query-a-running-gateway)
+- <a id="gateway-health" />[`gateway health`](/cli/gateway/query#gateway-health)
+- <a id="gateway-usage-cost" />[`gateway usage-cost`](/cli/gateway/query#gateway-usage-cost)
+- <a id="gateway-stability" />[`gateway stability`](/cli/gateway/query#gateway-stability)
+- <a id="gateway-diagnostics-export" />[`gateway diagnostics export`](/cli/gateway/query#gateway-diagnostics-export)
+- <a id="gateway-status" />[`gateway status`](/cli/gateway/query#gateway-status)
+- <a id="gateway-probe" />[`gateway probe`](/cli/gateway/query#gateway-probe)
+- <a id="remote-over-ssh-(mac-app-parity)" />[Remote over SSH (Mac app parity)](/cli/gateway/query#remote-over-ssh-%28mac-app-parity%29)
+- <a id="gateway-call-%3Cmethod%3E" />[`gateway call <method>`](/cli/gateway/query#gateway-call-%3Cmethod%3E)
+- <a id="gateway-suspend" />[`gateway suspend`](/cli/gateway/query#gateway-suspend)
+- <a id="gateway-resume-%3Csuspensionid%3E" />[`gateway resume <suspensionId>`](/cli/gateway/query#gateway-resume-%3Csuspensionid%3E)
+- <a id="manage-the-gateway-service" />[Manage the Gateway service](/cli/gateway/service#manage-the-gateway-service)
+- <a id="recover-an-unreadable-native-service-definition" />[Recover an unreadable native service definition](/cli/gateway/service#recover-an-unreadable-native-service-definition)
+- <a id="lifecycle-requests-from-gateway-chat" />[Lifecycle requests from Gateway chat](/cli/gateway/service#lifecycle-requests-from-gateway-chat)
+- <a id="install-with-a-wrapper" />[Install with a wrapper](/cli/gateway/service#install-with-a-wrapper)
+- <a id="discover-gateways-(bonjour)" />[Discover gateways (Bonjour)](/cli/gateway/discovery#discover-gateways-%28bonjour%29)
+- <a id="gateway-discover" />[`gateway discover`](/cli/gateway/discovery#gateway-discover)
+- <a id="remote-over-ssh-mac-app-parity" />[Remote over SSH (Mac app parity)](/cli/gateway/query#remote-over-ssh-mac-app-parity)
+- <a id="gateway-call-&lt;method&gt;" />[`gateway call <method>`](/cli/gateway/query#gateway-call-%3Cmethod%3E)
+- <a id="gateway-resume-&lt;suspensionid&gt;" />[`gateway resume <suspensionId>`](/cli/gateway/query#gateway-resume-%3Csuspensionid%3E)
+- <a id="discover-gateways-bonjour" />[Discover gateways (Bonjour)](/cli/gateway/discovery#discover-gateways-bonjour)
+
+Option, tab, and panel anchors:
+
+- <a id="startup-behavior" />[Startup behavior](/cli/gateway/running#startup-behavior)
+- <a id="param-port" />[`--port`](/cli/gateway/running#param-port)
+- <a id="param-bind" />[`--bind`](/cli/gateway/running#param-bind)
+- <a id="param-token" />[`--token`](/cli/gateway/running#param-token)
+- <a id="param-auth" />[`--auth`](/cli/gateway/running#param-auth)
+- <a id="param-password" />[`--password`](/cli/gateway/running#param-password)
+- <a id="param-tailscale" />[`--tailscale`](/cli/gateway/running#param-tailscale)
+- <a id="param-allow-unconfigured" />[`--allow-unconfigured`](/cli/gateway/running#param-allow-unconfigured)
+- <a id="param-dev" />[`--dev`](/cli/gateway/running#param-dev)
+- <a id="param-ambient-channels" />[`--ambient-channels`](/cli/gateway/running#param-ambient-channels)
+- <a id="param-dev-ambient-channels" />[`--dev-ambient-channels`](/cli/gateway/running#param-dev-ambient-channels)
+- <a id="param-reset" />[`--reset`](/cli/gateway/running#param-reset)
+- <a id="param-force" />[`--force`](/cli/gateway/running#param-force)
+- <a id="param-verbose" />[`--verbose`](/cli/gateway/running#param-verbose)
+- <a id="param-cli-backend-logs" />[`--cli-backend-logs`](/cli/gateway/running#param-cli-backend-logs)
+- <a id="param-ws-log" />[`--ws-log`](/cli/gateway/running#param-ws-log)
+- <a id="param-compact" />[`--compact`](/cli/gateway/running#param-compact)
+- <a id="param-raw-stream" />[`--raw-stream`](/cli/gateway/running#param-raw-stream)
+- <a id="output-modes" />[Output modes](/cli/gateway/query#output-modes)
+- <a id="shared-options" />[Shared options](/cli/gateway/query#shared-options)
+- <a id="param-port-1" />[`--port`](/cli/gateway/query#param-port)
+- <a id="param-days" />[`--days`](/cli/gateway/query#param-days)
+- <a id="param-agent" />[`--agent`](/cli/gateway/query#param-agent)
+- <a id="param-all-agents" />[`--all-agents`](/cli/gateway/query#param-all-agents)
+- <a id="param-limit" />[`--limit`](/cli/gateway/query#param-limit)
+- <a id="param-type" />[`--type`](/cli/gateway/query#param-type)
+- <a id="param-since-seq" />[`--since-seq`](/cli/gateway/query#param-since-seq)
+- <a id="param-bundle-path" />[`--bundle`](/cli/gateway/query#param-bundle-path)
+- <a id="param-export" />[`--export`](/cli/gateway/query#param-export)
+- <a id="privacy-and-bundle-behavior" />[Privacy and bundle behavior](/cli/gateway/query#privacy-and-bundle-behavior)
+- <a id="param-log-lines" />[`--log-lines`](/cli/gateway/query#param-log-lines)
+- <a id="param-log-bytes" />[`--log-bytes`](/cli/gateway/query#param-log-bytes)
+- <a id="param-url" />[`--url`](/cli/gateway/query#param-url)
+- <a id="param-token-1" />[`--token`](/cli/gateway/query#param-token)
+- <a id="param-password-1" />[`--password`](/cli/gateway/query#param-password)
+- <a id="param-timeout" />[`--timeout`](/cli/gateway/query#param-timeout)
+- <a id="param-no-stability-bundle" />[`--no-stability-bundle`](/cli/gateway/query#param-no-stability-bundle)
+- <a id="param-json" />[`--json`](/cli/gateway/query#param-json)
+- <a id="param-url-1" />[`--url`](/cli/gateway/query#param-url-1)
+- <a id="param-port-2" />[`--port`](/cli/gateway/query#param-port-1)
+- <a id="param-token-2" />[`--token`](/cli/gateway/query#param-token-1)
+- <a id="param-password-2" />[`--password`](/cli/gateway/query#param-password-1)
+- <a id="param-timeout-1" />[`--timeout`](/cli/gateway/query#param-timeout-1)
+- <a id="param-no-probe" />[`--no-probe`](/cli/gateway/query#param-no-probe)
+- <a id="param-deep" />[`--deep`](/cli/gateway/query#param-deep)
+- <a id="param-require-rpc" />[`--require-rpc`](/cli/gateway/query#param-require-rpc)
+- <a id="status-semantics" />[Status semantics](/cli/gateway/query#status-semantics)
+- <a id="linux-systemd-auth-drift-checks" />[Linux systemd auth-drift checks](/cli/gateway/query#linux-systemd-auth-drift-checks)
+- <a id="param-port-3" />[`--port`](/cli/gateway/query#param-port-2)
+- <a id="interpretation" />[Interpretation](/cli/gateway/query#interpretation)
+- <a id="json-output" />[JSON output](/cli/gateway/query#json-output)
+- <a id="common-warning-codes" />[Common warning codes](/cli/gateway/query#common-warning-codes)
+- <a id="param-ssh" />[`--ssh`](/cli/gateway/query#param-ssh)
+- <a id="param-ssh-auto" />[`--ssh-auto`](/cli/gateway/query#param-ssh-auto)
+- <a id="param-params" />[`--params`](/cli/gateway/query#param-params)
+- <a id="param-url-2" />[`--url`](/cli/gateway/query#param-url-2)
+- <a id="param-port-4" />[`--port`](/cli/gateway/query#param-port-3)
+- <a id="param-token-3" />[`--token`](/cli/gateway/query#param-token-2)
+- <a id="param-password-3" />[`--password`](/cli/gateway/query#param-password-2)
+- <a id="param-timeout-2" />[`--timeout`](/cli/gateway/query#param-timeout-2)
+- <a id="param-expect-final" />[`--expect-final`](/cli/gateway/query#param-expect-final)
+- <a id="param-json-1" />[`--json`](/cli/gateway/query#param-json-1)
+- <a id="command-options" />[Command options](/cli/gateway/service#command-options)
+- <a id="service-runtime" />[Service runtime](/cli/gateway/service#service-runtime)
+- <a id="lifecycle-behavior" />[Lifecycle behavior](/cli/gateway/service#lifecycle-behavior)
+- <a id="managed-gateway-heap-sizing" />[Managed Gateway heap sizing](/cli/gateway/service#managed-gateway-heap-sizing)
+- <a id="auth-and-secretrefs-at-install-time" />[Auth and SecretRefs at install time](/cli/gateway/service#auth-and-secretrefs-at-install-time)
+- <a id="param-timeout-3" />[`--timeout`](/cli/gateway/discovery#param-timeout)
+- <a id="param-json-2" />[`--json`](/cli/gateway/discovery#param-json)
+
+## Related
+
+- [CLI reference](/cli)
+- [Gateway runbook](/gateway)

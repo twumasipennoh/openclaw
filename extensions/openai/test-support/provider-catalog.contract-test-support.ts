@@ -1,16 +1,16 @@
-import { beforeEach, describe, it, vi } from "vitest";
-import {
-  expectAugmentedCodexCatalog,
-  expectCodexBuiltInSuppression,
-  expectCodexMissingAuthHint,
-  importProviderRuntimeCatalogModule,
-  loadBundledPluginPublicSurfaceSync,
-} from "../../../test/helpers/plugins/provider-catalog.js";
-import type { ProviderPlugin } from "../../../test/helpers/plugins/provider-catalog.js";
+// Openai provider module implements model/runtime integration.
 import {
   registerProviderPlugin,
   requireRegisteredProvider,
-} from "../../../test/helpers/plugins/provider-registration.js";
+} from "openclaw/plugin-sdk/plugin-test-runtime";
+import {
+  expectAugmentedCodexCatalog,
+  expectedOpenaiPluginCodexCatalogEntriesWithGpt55,
+  expectCodexMissingAuthHint,
+  importProviderRuntimeCatalogModule,
+} from "openclaw/plugin-sdk/provider-test-contracts";
+import type { ProviderPlugin } from "openclaw/plugin-sdk/provider-test-contracts";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const PROVIDER_CATALOG_CONTRACT_TIMEOUT_MS = 300_000;
 
@@ -23,29 +23,44 @@ const resolveOwningPluginIdsForProviderMock = vi.hoisted(() =>
   vi.fn<ResolveOwningPluginIdsForProvider>(() => undefined),
 );
 const resolveCatalogHookProviderPluginIdsMock = vi.hoisted(() =>
-  vi.fn<ResolveCatalogHookProviderPluginIds>((_) => [] as string[]),
+  vi.fn<ResolveCatalogHookProviderPluginIds>((_params) => [] as string[]),
 );
 
-vi.mock("../../../src/plugins/providers.js", () => ({
-  resolveOwningPluginIdsForProvider: (params: unknown) =>
-    resolveOwningPluginIdsForProviderMock(params as never),
-  resolveCatalogHookProviderPluginIds: (params: unknown) =>
-    resolveCatalogHookProviderPluginIdsMock(params as never),
-}));
-
-vi.mock("../../../src/plugins/providers.runtime.js", () => ({
-  resolvePluginProviders: (params: unknown) => resolvePluginProvidersMock(params as never),
-}));
+vi.mock("openclaw/plugin-sdk/provider-catalog-runtime", async () => {
+  const actual = await vi.importActual<
+    typeof import("openclaw/plugin-sdk/provider-catalog-runtime")
+  >("openclaw/plugin-sdk/provider-catalog-runtime");
+  const resolveCatalogHookProviders = (params: unknown) =>
+    resolvePluginProvidersMock({
+      onlyPluginIds: resolveCatalogHookProviderPluginIdsMock(params),
+    });
+  return {
+    ...actual,
+    augmentModelCatalogWithProviderPlugins: async (params: {
+      context: Parameters<NonNullable<ProviderPlugin["augmentModelCatalog"]>>[0];
+    }) => {
+      const supplemental = [];
+      for (const provider of resolveCatalogHookProviders(params)) {
+        const entries = await provider.augmentModelCatalog?.(params.context);
+        if (entries?.length) {
+          supplemental.push(...entries);
+        }
+      }
+      return supplemental;
+    },
+    resolveOwningPluginIdsForProvider: (params: unknown) =>
+      resolveOwningPluginIdsForProviderMock(params as never),
+    resolveCatalogHookProviderPluginIds: (params: unknown) =>
+      resolveCatalogHookProviderPluginIdsMock(params as never),
+    isPluginProvidersLoadInFlight: () => false,
+    resolvePluginProviders: (params: unknown) => resolvePluginProvidersMock(params as never),
+  };
+});
 
 export function describeOpenAIProviderCatalogContract() {
   const contractDepsPromise = (async () => {
     vi.resetModules();
-    const openaiPlugin = loadBundledPluginPublicSurfaceSync<{
-      default: Parameters<typeof registerProviderPlugin>[0]["plugin"];
-    }>({
-      pluginId: "openai",
-      artifactBasename: "index.js",
-    });
+    const openaiPlugin = await import("../index.js");
     const openaiProviders = (
       await registerProviderPlugin({
         plugin: openaiPlugin.default,
@@ -54,15 +69,9 @@ export function describeOpenAIProviderCatalogContract() {
       })
     ).providers;
     const openaiProvider = requireRegisteredProvider(openaiProviders, "openai", "provider");
-    const {
-      augmentModelCatalogWithProviderPlugins,
-      resetProviderRuntimeHookCacheForTest,
-      resolveProviderBuiltInModelSuppression,
-    } = await importProviderRuntimeCatalogModule();
+    const { augmentModelCatalogWithProviderPlugins } = await importProviderRuntimeCatalogModule();
     return {
       augmentModelCatalogWithProviderPlugins,
-      resetProviderRuntimeHookCacheForTest,
-      resolveProviderBuiltInModelSuppression,
       openaiProviders,
       openaiProvider,
     };
@@ -73,8 +82,7 @@ export function describeOpenAIProviderCatalogContract() {
     { timeout: PROVIDER_CATALOG_CONTRACT_TIMEOUT_MS },
     () => {
       beforeEach(async () => {
-        const { resetProviderRuntimeHookCacheForTest, openaiProviders } = await contractDepsPromise;
-        resetProviderRuntimeHookCacheForTest();
+        const { openaiProviders } = await contractDepsPromise;
 
         resolvePluginProvidersMock.mockReset();
         resolvePluginProvidersMock.mockImplementation((params?: { onlyPluginIds?: string[] }) => {
@@ -90,7 +98,6 @@ export function describeOpenAIProviderCatalogContract() {
           switch (params.provider) {
             case "azure-openai-responses":
             case "openai":
-            case "openai-codex":
               return ["openai"];
             default:
               return undefined;
@@ -105,17 +112,60 @@ export function describeOpenAIProviderCatalogContract() {
         const { openaiProvider } = await contractDepsPromise;
         expectCodexMissingAuthHint(
           (params) => openaiProvider.buildMissingAuthMessage?.(params.context) ?? undefined,
+          "openai/gpt-6-astra",
         );
-      });
-
-      it("keeps built-in model suppression wired through the provider runtime", async () => {
-        const { resolveProviderBuiltInModelSuppression } = await contractDepsPromise;
-        expectCodexBuiltInSuppression(resolveProviderBuiltInModelSuppression);
       });
 
       it("keeps bundled model augmentation wired through the provider runtime", async () => {
         const { augmentModelCatalogWithProviderPlugins } = await contractDepsPromise;
-        await expectAugmentedCodexCatalog(augmentModelCatalogWithProviderPlugins);
+        await expectAugmentedCodexCatalog(
+          augmentModelCatalogWithProviderPlugins,
+          expectedOpenaiPluginCodexCatalogEntriesWithGpt55,
+        );
+      });
+
+      it("stops catalog template searches after the preferred rows match", async () => {
+        const { openaiProvider } = await contractDepsPromise;
+        const preferredIds = ["gpt-5.4-pro", "gpt-5.4", "gpt-5.4-mini", "gpt-5.4-nano"];
+        const cost = { input: 2, output: 8, cacheRead: 1, cacheWrite: 0 };
+        let providerReads = 0;
+        const entries = Array.from({ length: 1_000 }, (_, index) => ({
+          get provider() {
+            providerReads += 1;
+            return "openai";
+          },
+          id: preferredIds[index] ?? `unrelated-${index}`,
+          name: `Catalog row ${index}`,
+          api: "openai-responses" as const,
+          baseUrl: "https://api.example/v1",
+          cost,
+        }));
+        const before = structuredClone(entries);
+        providerReads = 0;
+
+        const result = await openaiProvider.augmentModelCatalog?.({ env: {}, entries });
+        const observedReads = providerReads;
+        expect(result).toEqual(
+          ["gpt-5.5-pro", "gpt-5.4", "gpt-5.4-pro", "gpt-5.4-mini", "gpt-5.4-nano"].map(
+            (id, index) =>
+              Object.assign(
+                {
+                  provider: "openai",
+                  id,
+                  name: id,
+                  api: "openai-responses",
+                  baseUrl: "https://api.example/v1",
+                  cost,
+                  reasoning: true,
+                  input: ["text", "image"],
+                  contextWindow: index < 3 ? 1_050_000 : 400_000,
+                },
+                index === 0 ? { contextTokens: 272_000 } : {},
+              ),
+          ),
+        );
+        expect(entries).toEqual(before);
+        expect(observedReads).toBeLessThan(32);
       });
     },
   );

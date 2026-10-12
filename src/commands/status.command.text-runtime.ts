@@ -1,32 +1,11 @@
-export { formatCliCommand } from "../cli/command-format.js";
-export { resolveGatewayPort } from "../config/config.js";
+// Text-mode status runtime barrel.
+// Command orchestration loads this owner only for text diagnostics and reports.
+
+export { getTerminalTableWidth } from "../../packages/terminal-core/src/table.js";
+export { theme } from "../../packages/terminal-core/src/theme.js";
 export { info } from "../globals.js";
-export { resolveControlUiLinks } from "../gateway/control-ui-links.js";
-export { formatTimeAgo } from "../infra/format-time/format-relative.ts";
-export { formatGitInstallLabel } from "../infra/update-check.js";
-export {
-  resolveMemoryCacheSummary,
-  resolveMemoryFtsState,
-  resolveMemoryVectorState,
-} from "../memory-host-sdk/status.js";
-export {
-  formatPluginCompatibilityNotice,
-  summarizePluginCompatibility,
-} from "../plugins/status.js";
-export { getTerminalTableWidth, renderTable } from "../terminal/table.js";
-export { theme } from "../terminal/theme.js";
-export { formatHealthChannelLines } from "./health.js";
-export { groupChannelIssuesByChannel } from "./status-all/channel-issues.js";
-export { formatGatewayAuthUsed } from "./status-all/format.js";
-export {
-  formatDuration,
-  formatKTokens,
-  formatPromptCacheCompact,
-  formatTokensCompact,
-  shortenText,
-} from "./status.format.js";
-export {
-  formatUpdateAvailableHint,
-  formatUpdateOneLiner,
-  resolveUpdateAvailability,
-} from "./status.update.js";
+export { formatUsageReportLines } from "../infra/provider-usage.format.js";
+export { buildStatusUpdateSurface } from "./status-all/format.js";
+export { buildStatusCommandReportData } from "./status.command-report-data.ts";
+export { buildStatusCommandReportLines } from "./status.command-report.ts";
+export { formatStatusConfigDiagnosticEntries } from "./status.format.js";

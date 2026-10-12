@@ -1,70 +1,92 @@
-import { loadConfig } from "../config/config.js";
+import { AgentSelectionRequiredError, resolveDefaultAgentId } from "../agents/agent-scope.js";
+import { getRuntimeConfig } from "../config/io.js";
 import type { SessionEntry } from "../config/sessions.js";
-import { getAgentRunContext, registerAgentRunContext } from "../infra/agent-events.js";
-import { toAgentRequestSessionKey } from "../routing/session-key.js";
+import type { SessionTranscriptRuntimeTarget } from "../config/sessions/session-accessor.types.js";
+import { resolvePersistedSessionStoreOwner } from "../config/sessions/session-store-owner.js";
+import type { OpenClawConfig } from "../config/types.js";
+import { getAgentRunContext } from "../infra/agent-run-registry.js";
+import { normalizeAgentId, parseAgentSessionKey } from "../routing/session-key.js";
 import { resolvePreferredSessionKeyForSessionIdMatches } from "../sessions/session-id-resolution.js";
-import { loadCombinedSessionStoreForGateway } from "./session-utils.js";
+import { resolveChatRunOwnerAgentId } from "./chat-run-owner.js";
+import type { SessionRowProjection } from "./session-row-projection.js";
+import { resolveSessionStoreIdentity } from "./session-store-key.js";
 
-const RUN_LOOKUP_CACHE_LIMIT = 256;
-const RUN_LOOKUP_MISS_TTL_MS = 1_000;
-
-type RunLookupCacheEntry = {
-  sessionKey: string | null;
-  expiresAt: number | null;
-};
-
-const resolvedSessionKeyByRunId = new Map<string, RunLookupCacheEntry>();
-
-function setResolvedSessionKeyCache(runId: string, sessionKey: string | null): void {
-  if (!runId) {
-    return;
+// Stored keys must match their logical owner, including fixed-store sentinels.
+function sessionKeyMatchesAgent(sessionKey: string, agentId: string, cfg: OpenClawConfig): boolean {
+  const normalizedAgentId = normalizeAgentId(agentId);
+  const parsed = parseAgentSessionKey(sessionKey);
+  if (!parsed && sessionKey.trim().toLowerCase().startsWith("agent:")) {
+    return false;
   }
-  if (
-    !resolvedSessionKeyByRunId.has(runId) &&
-    resolvedSessionKeyByRunId.size >= RUN_LOOKUP_CACHE_LIMIT
-  ) {
-    const oldest = resolvedSessionKeyByRunId.keys().next().value;
-    if (oldest) {
-      resolvedSessionKeyByRunId.delete(oldest);
+  try {
+    return (
+      resolveSessionStoreIdentity({ cfg, sessionKey, agentId, preserveQualifiedAddress: true })
+        .agentId === normalizedAgentId
+    );
+  } catch (error) {
+    if (error instanceof AgentSelectionRequiredError) {
+      return false;
     }
+    throw error;
   }
-  resolvedSessionKeyByRunId.set(runId, {
-    sessionKey,
-    expiresAt: sessionKey === null ? Date.now() + RUN_LOOKUP_MISS_TTL_MS : null,
-  });
 }
 
-export function resolveSessionKeyForRun(runId: string) {
-  const cached = getAgentRunContext(runId)?.sessionKey;
-  if (cached) {
-    return cached;
+/** Resolves the selected run owner and unchanged key without storage reads. */
+export function resolveSessionForRun(
+  runId: string,
+  opts: { agentId?: string; projection?: Pick<SessionRowProjection, "findBySessionId"> } = {},
+): Pick<SessionTranscriptRuntimeTarget, "sessionKey" | "agentId"> | undefined {
+  const context = getAgentRunContext(runId);
+  // Keyless admission is intentional for hidden internal work; never infer its parent.
+  if (context && !context.sessionKey) {
+    return undefined;
   }
-  const cachedLookup = resolvedSessionKeyByRunId.get(runId);
-  if (cachedLookup !== undefined) {
-    if (cachedLookup.sessionKey !== null) {
-      return cachedLookup.sessionKey;
-    }
-    if ((cachedLookup.expiresAt ?? 0) > Date.now()) {
+  const explicitAgentId = opts.agentId?.trim() ? normalizeAgentId(opts.agentId) : undefined;
+  const cached = context?.sessionKey;
+  const cachedAgentId = resolveChatRunOwnerAgentId(context ?? {});
+  if (cached) {
+    if (!cachedAgentId) {
       return undefined;
     }
-    resolvedSessionKeyByRunId.delete(runId);
+    if (!explicitAgentId) {
+      return { sessionKey: cached, agentId: cachedAgentId };
+    }
   }
-  const cfg = loadConfig();
-  const { store } = loadCombinedSessionStoreForGateway(cfg);
-  const matches = Object.entries(store).filter(
-    (entry): entry is [string, SessionEntry] => entry[1]?.sessionId === runId,
+  const cfg = getRuntimeConfig();
+  const storeOwner = explicitAgentId ? undefined : resolvePersistedSessionStoreOwner(cfg);
+  const requestedAgentId =
+    explicitAgentId ??
+    (storeOwner?.kind === "configured"
+      ? storeOwner.agentId
+      : normalizeAgentId(resolveDefaultAgentId(cfg)));
+  if (
+    cached &&
+    (!context?.agentId?.trim() || cachedAgentId === requestedAgentId) &&
+    sessionKeyMatchesAgent(cached, requestedAgentId, cfg)
+  ) {
+    return { sessionKey: cached, agentId: cachedAgentId ?? requestedAgentId };
+  }
+  // The projection owns both hits and absence. Committed identity publications
+  // update its index, so orphan events need neither scans nor a timed miss cache.
+  const matches: Array<{ key: string; entry: SessionEntry; agentId: string }> = [];
+  for (const row of opts.projection?.findBySessionId({
+    sessionId: runId,
+    agentId: requestedAgentId,
+    federated: true,
+  }) ?? []) {
+    const entry = row.sharingEntry ?? row.entry;
+    if (
+      entry?.sessionId === runId &&
+      (!explicitAgentId || row.agentId === explicitAgentId) &&
+      sessionKeyMatchesAgent(row.key, row.agentId, cfg)
+    ) {
+      matches.push({ key: row.key, entry, agentId: row.agentId });
+    }
+  }
+  const storeKey = resolvePreferredSessionKeyForSessionIdMatches(
+    matches.map(({ key, entry }) => [key, entry]),
+    runId,
   );
-  const storeKey = resolvePreferredSessionKeyForSessionIdMatches(matches, runId);
-  if (storeKey) {
-    const sessionKey = toAgentRequestSessionKey(storeKey) ?? storeKey;
-    registerAgentRunContext(runId, { sessionKey });
-    setResolvedSessionKeyCache(runId, sessionKey);
-    return sessionKey;
-  }
-  setResolvedSessionKeyCache(runId, null);
-  return undefined;
-}
-
-export function resetResolvedSessionKeyForRunCacheForTest(): void {
-  resolvedSessionKeyByRunId.clear();
+  const selected = matches.find(({ key }) => key === storeKey);
+  return selected ? { sessionKey: selected.key, agentId: selected.agentId } : undefined;
 }

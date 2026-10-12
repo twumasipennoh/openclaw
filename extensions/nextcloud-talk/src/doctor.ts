@@ -1,109 +1,113 @@
+import os from "node:os";
+import path from "node:path";
 import type {
   ChannelDoctorAdapter,
-  ChannelDoctorConfigMutation,
-  ChannelDoctorLegacyConfigRule,
+  ChannelDoctorSequenceResult,
 } from "openclaw/plugin-sdk/channel-contract";
-import type { OpenClawConfig } from "openclaw/plugin-sdk/config-runtime";
+import { fileExists } from "openclaw/plugin-sdk/file-access-runtime";
+import { resolveGatewayPort } from "openclaw/plugin-sdk/gateway-config-runtime";
+import { resolveStateDir } from "openclaw/plugin-sdk/state-paths";
 import {
-  hasLegacyFlatAllowPrivateNetworkAlias,
-  migrateLegacyFlatAllowPrivateNetworkAlias,
-} from "openclaw/plugin-sdk/ssrf-runtime";
+  isNextcloudTalkAccountConfigured,
+  listNextcloudTalkAccountIds,
+  resolveNextcloudTalkAccount,
+} from "./accounts.js";
+import { probeNextcloudTalkBotResponseFeature } from "./bot-preflight.js";
+import {
+  legacyConfigRules as NEXTCLOUD_TALK_LEGACY_CONFIG_RULES,
+  normalizeCompatibilityConfig as normalizeNextcloudTalkCompatibilityConfig,
+} from "./doctor-contract.js";
+import type { CoreConfig } from "./types.js";
+import {
+  DEFAULT_NEXTCLOUD_TALK_WEBHOOK_PATH,
+  describeNextcloudTalkWebhookRouteConflict,
+  resolveNextcloudTalkLegacyWebhook,
+} from "./webhook-route.js";
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
-}
-
-function hasLegacyAllowPrivateNetworkInAccounts(value: unknown): boolean {
-  const accounts = isRecord(value) ? value : null;
-  return Boolean(
-    accounts &&
-    Object.values(accounts).some((account) =>
-      hasLegacyFlatAllowPrivateNetworkAlias(isRecord(account) ? account : {}),
-    ),
-  );
-}
-
-function normalizeNextcloudTalkCompatibilityConfig(
-  cfg: OpenClawConfig,
-): ChannelDoctorConfigMutation {
-  const channels = isRecord(cfg.channels) ? cfg.channels : null;
-  const nextcloudTalk = isRecord(channels?.["nextcloud-talk"]) ? channels["nextcloud-talk"] : null;
-  if (!nextcloudTalk) {
-    return { config: cfg, changes: [] };
+function sanitizeLegacyReplaySegment(value: string): string {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return "default";
   }
+  return trimmed.replace(/[^a-zA-Z0-9_-]/g, "_");
+}
 
-  const changes: string[] = [];
-  let updatedNextcloudTalk = nextcloudTalk;
-  let changed = false;
-
-  const topLevel = migrateLegacyFlatAllowPrivateNetworkAlias({
-    entry: updatedNextcloudTalk,
-    pathPrefix: "channels.nextcloud-talk",
-    changes,
-  });
-  updatedNextcloudTalk = topLevel.entry;
-  changed = changed || topLevel.changed;
-
-  const accounts = isRecord(updatedNextcloudTalk.accounts) ? updatedNextcloudTalk.accounts : null;
-  if (accounts) {
-    let accountsChanged = false;
-    const nextAccounts: Record<string, unknown> = { ...accounts };
-    for (const [accountId, accountValue] of Object.entries(accounts)) {
-      const account = isRecord(accountValue) ? accountValue : null;
-      if (!account) {
-        continue;
-      }
-      const migrated = migrateLegacyFlatAllowPrivateNetworkAlias({
-        entry: account,
-        pathPrefix: `channels.nextcloud-talk.accounts.${accountId}`,
-        changes,
-      });
-      if (!migrated.changed) {
-        continue;
-      }
-      nextAccounts[accountId] = migrated.entry;
-      accountsChanged = true;
+function runNextcloudTalkDoctorSequence(params: {
+  cfg: CoreConfig;
+  env?: NodeJS.ProcessEnv;
+}): ChannelDoctorSequenceResult {
+  const infoNotes: string[] = [];
+  const warningNotes: string[] = [];
+  for (const accountId of listNextcloudTalkAccountIds(params.cfg)) {
+    const account = resolveNextcloudTalkAccount({ cfg: params.cfg, accountId });
+    if (!account.enabled || !isNextcloudTalkAccountConfigured(account)) {
+      continue;
     }
-    if (accountsChanged) {
-      updatedNextcloudTalk = { ...updatedNextcloudTalk, accounts: nextAccounts };
-      changed = true;
+    const gatewayPort = resolveGatewayPort({ gateway: params.cfg.gateway }, params.env);
+    const webhookPath = account.config.webhookPath ?? DEFAULT_NEXTCLOUD_TALK_WEBHOOK_PATH;
+    const destination = `Gateway port ${gatewayPort}${webhookPath}`;
+    const legacyListener = resolveNextcloudTalkLegacyWebhook(account.config);
+    const routeConflict = describeNextcloudTalkWebhookRouteConflict(webhookPath, gatewayPort);
+    if (routeConflict) {
+      warningNotes.push(
+        `- channels.nextcloud-talk.${account.accountId}: ${routeConflict}` +
+          (legacyListener
+            ? ` Legacy webhook listener ${legacyListener.host}:${legacyListener.port} remains available; verify the new route before removing the legacyWebhook pin.`
+            : " This account cannot start until the callback path is changed."),
+      );
+    } else if (legacyListener) {
+      infoNotes.push(
+        `- channels.nextcloud-talk.${account.accountId}: legacy webhook listener ${legacyListener.host}:${legacyListener.port} forwards to the Gateway route. ` +
+          `Point the Nextcloud callback or reverse-proxy upstream to ${destination}, verify delivery, then remove the legacyWebhook pin; use legacyWebhook: false to override an inherited endpoint.`,
+      );
+    } else {
+      infoNotes.push(
+        `- channels.nextcloud-talk.${account.accountId}: no legacy listener is configured; use ${destination} for the Nextcloud callback or reverse-proxy upstream.`,
+      );
     }
   }
-
-  if (!changed) {
-    return { config: cfg, changes: [] };
-  }
-
-  return {
-    config: {
-      ...cfg,
-      channels: {
-        ...cfg.channels,
-        "nextcloud-talk": updatedNextcloudTalk as NonNullable<
-          OpenClawConfig["channels"]
-        >["nextcloud-talk"],
-      },
-    },
-    changes,
-  };
+  return { changeNotes: [], warningNotes, infoNotes };
 }
 
-const NEXTCLOUD_TALK_LEGACY_CONFIG_RULES: ChannelDoctorLegacyConfigRule[] = [
-  {
-    path: ["channels", "nextcloud-talk"],
-    message:
-      'channels.nextcloud-talk.allowPrivateNetwork is legacy; use channels.nextcloud-talk.network.dangerouslyAllowPrivateNetwork instead. Run "openclaw doctor --fix".',
-    match: (value) => hasLegacyFlatAllowPrivateNetworkAlias(isRecord(value) ? value : {}),
-  },
-  {
-    path: ["channels", "nextcloud-talk", "accounts"],
-    message:
-      'channels.nextcloud-talk.accounts.<id>.allowPrivateNetwork is legacy; use channels.nextcloud-talk.accounts.<id>.network.dangerouslyAllowPrivateNetwork instead. Run "openclaw doctor --fix".',
-    match: hasLegacyAllowPrivateNetworkInAccounts,
-  },
-];
+async function collectNextcloudTalkBotResponseWarnings(params: {
+  cfg: CoreConfig;
+}): Promise<string[]> {
+  const warnings: string[] = [];
+  for (const accountId of listNextcloudTalkAccountIds(params.cfg)) {
+    const account = resolveNextcloudTalkAccount({ cfg: params.cfg, accountId });
+    if (!account.enabled || !account.secret || !account.baseUrl) {
+      continue;
+    }
+    const result = await probeNextcloudTalkBotResponseFeature({
+      account,
+      timeoutMs: 5_000,
+    });
+    if (!result.ok) {
+      warnings.push(`- channels.nextcloud-talk.${account.accountId}: ${result.message}`);
+    }
+  }
+  return warnings;
+}
 
 export const nextcloudTalkDoctor: ChannelDoctorAdapter = {
   legacyConfigRules: NEXTCLOUD_TALK_LEGACY_CONFIG_RULES,
-  normalizeCompatibilityConfig: ({ cfg }) => normalizeNextcloudTalkCompatibilityConfig(cfg),
+  normalizeCompatibilityConfig: normalizeNextcloudTalkCompatibilityConfig,
+  runConfigSequence: runNextcloudTalkDoctorSequence,
+  collectPreviewWarnings: collectNextcloudTalkBotResponseWarnings,
+  repairConfig: ({ cfg, doctorFixCommand, env = process.env }) => {
+    const replayDir = path.join(
+      resolveStateDir(env, os.homedir),
+      "nextcloud-talk",
+      "replay-dedupe",
+    );
+    for (const accountId of listNextcloudTalkAccountIds(cfg)) {
+      const legacyPath = path.join(replayDir, `${sanitizeLegacyReplaySegment(accountId)}.json`);
+      if (fileExists(legacyPath)) {
+        throw new Error(
+          `Retired pre-July Nextcloud Talk replay state at ${legacyPath} was left unchanged. Install OpenClaw 2026.9.5, run "${doctorFixCommand}", then upgrade to latest. See https://docs.openclaw.ai/install/updating#upgrading-very-old-versions.`,
+        );
+      }
+    }
+    return { config: cfg, changes: [] };
+  },
 };

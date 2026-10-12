@@ -1,40 +1,45 @@
+import {
+  normalizeLowercaseStringOrEmpty,
+  normalizeStringEntries,
+} from "openclaw/plugin-sdk/string-coerce-runtime";
+
+export function normalizeSignalReactionRecipient(raw: string): string {
+  const withoutSignal = raw
+    .trim()
+    .replace(/^signal:/i, "")
+    .trim();
+  return /^uuid:/i.test(withoutSignal) ? withoutSignal.slice("uuid:".length).trim() : withoutSignal;
+}
+
 export function normalizeSignalMessagingTarget(raw: string): string | undefined {
-  const trimmed = raw.trim();
-  if (!trimmed) {
+  const normalized = raw
+    .trim()
+    .replace(/^signal:/i, "")
+    .trim();
+  const prefix = /^(group|username|u|uuid):/i.exec(normalized)?.[0];
+  if (!prefix) {
+    return normalizeLowercaseStringOrEmpty(normalized) || undefined;
+  }
+  const id = normalized.slice(prefix.length).trim();
+  if (!id) {
     return undefined;
   }
-  let normalized = trimmed;
-  if (normalized.toLowerCase().startsWith("signal:")) {
-    normalized = normalized.slice("signal:".length).trim();
+  switch (prefix.toLowerCase()) {
+    case "group:":
+      return `group:${id}`;
+    case "username:":
+    case "u:":
+      return normalizeLowercaseStringOrEmpty(`username:${id}`);
+    default:
+      return normalizeLowercaseStringOrEmpty(id);
   }
-  if (!normalized) {
-    return undefined;
-  }
-  const lower = normalized.toLowerCase();
-  if (lower.startsWith("group:")) {
-    const id = normalized.slice("group:".length).trim();
-    return id ? `group:${id}` : undefined;
-  }
-  if (lower.startsWith("username:")) {
-    const id = normalized.slice("username:".length).trim();
-    return id ? `username:${id}`.toLowerCase() : undefined;
-  }
-  if (lower.startsWith("u:")) {
-    const id = normalized.slice("u:".length).trim();
-    return id ? `username:${id}`.toLowerCase() : undefined;
-  }
-  if (lower.startsWith("uuid:")) {
-    const id = normalized.slice("uuid:".length).trim();
-    return id ? id.toLowerCase() : undefined;
-  }
-  return normalized.toLowerCase();
 }
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const UUID_COMPACT_PATTERN = /^[0-9a-f]{32}$/i;
 
 export function looksLikeSignalTargetId(raw: string, normalized?: string): boolean {
-  const candidates = [raw, normalized ?? ""].map((value) => value.trim()).filter(Boolean);
+  const candidates = normalizeStringEntries([raw, normalized ?? ""]);
 
   for (const candidate of candidates) {
     if (/^(signal:)?(group:|username:|u:)/i.test(candidate)) {

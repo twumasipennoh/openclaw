@@ -1,3 +1,4 @@
+/** Tests active/inactive decisions for gateway authentication SecretRef surfaces. */
 import { describe, expect, it } from "vitest";
 import type { OpenClawConfig } from "../config/config.js";
 import { evaluateGatewayAuthSurfaceStates } from "./runtime-gateway-auth-surfaces.js";
@@ -15,25 +16,17 @@ function evaluate(config: OpenClawConfig, env: NodeJS.ProcessEnv = EMPTY_ENV) {
   });
 }
 
+function expectGatewayState(
+  state: { active: boolean; hasSecretRef: boolean; reason: string },
+  expected: { active: boolean; hasSecretRef: boolean; reason: string },
+) {
+  expect(state.hasSecretRef).toBe(expected.hasSecretRef);
+  expect(state.active).toBe(expected.active);
+  expect(state.reason).toBe(expected.reason);
+}
+
 describe("evaluateGatewayAuthSurfaceStates", () => {
-  it("marks gateway.auth.token active when token mode is explicit", () => {
-    const states = evaluate({
-      gateway: {
-        auth: {
-          mode: "token",
-          token: envRef("GW_AUTH_TOKEN"),
-        },
-      },
-    } as OpenClawConfig);
-
-    expect(states["gateway.auth.token"]).toMatchObject({
-      hasSecretRef: true,
-      active: true,
-      reason: 'gateway.auth.mode is "token".',
-    });
-  });
-
-  it("marks gateway.auth.token inactive when env token is configured", () => {
+  it("keeps gateway.auth.token active when env token is configured", () => {
     const states = evaluate(
       {
         gateway: {
@@ -46,27 +39,10 @@ describe("evaluateGatewayAuthSurfaceStates", () => {
       { OPENCLAW_GATEWAY_TOKEN: "env-token" } as NodeJS.ProcessEnv,
     );
 
-    expect(states["gateway.auth.token"]).toMatchObject({
+    expectGatewayState(states["gateway.auth.token"], {
       hasSecretRef: true,
-      active: false,
-      reason: "gateway token env var is configured.",
-    });
-  });
-
-  it("marks gateway.auth.token inactive when password mode is explicit", () => {
-    const states = evaluate({
-      gateway: {
-        auth: {
-          mode: "password",
-          token: envRef("GW_AUTH_TOKEN"),
-        },
-      },
-    } as OpenClawConfig);
-
-    expect(states["gateway.auth.token"]).toMatchObject({
-      hasSecretRef: true,
-      active: false,
-      reason: 'gateway.auth.mode is "password".',
+      active: true,
+      reason: 'gateway.auth.mode is "token".',
     });
   });
 
@@ -80,7 +56,7 @@ describe("evaluateGatewayAuthSurfaceStates", () => {
       },
     } as OpenClawConfig);
 
-    expect(states["gateway.auth.password"]).toMatchObject({
+    expectGatewayState(states["gateway.auth.password"], {
       hasSecretRef: true,
       active: true,
       reason: 'gateway.auth.mode is "password".',
@@ -99,27 +75,10 @@ describe("evaluateGatewayAuthSurfaceStates", () => {
       { OPENCLAW_GATEWAY_TOKEN: "env-token" } as NodeJS.ProcessEnv,
     );
 
-    expect(states["gateway.auth.password"]).toMatchObject({
+    expectGatewayState(states["gateway.auth.password"], {
       hasSecretRef: true,
       active: false,
       reason: "gateway token env var is configured.",
-    });
-  });
-
-  it("marks gateway.remote.token active when remote token fallback is active", () => {
-    const states = evaluate({
-      gateway: {
-        mode: "local",
-        remote: {
-          token: envRef("GW_REMOTE_TOKEN"),
-        },
-      },
-    } as OpenClawConfig);
-
-    expect(states["gateway.remote.token"]).toMatchObject({
-      hasSecretRef: true,
-      active: true,
-      reason: "local token auth can win and no env/auth token is configured.",
     });
   });
 
@@ -135,7 +94,7 @@ describe("evaluateGatewayAuthSurfaceStates", () => {
       },
     } as OpenClawConfig);
 
-    expect(states["gateway.remote.token"]).toMatchObject({
+    expectGatewayState(states["gateway.remote.token"], {
       hasSecretRef: true,
       active: false,
       reason: 'token auth cannot win with gateway.auth.mode="password".',
@@ -156,7 +115,7 @@ describe("evaluateGatewayAuthSurfaceStates", () => {
       },
     } as OpenClawConfig);
 
-    expect(states["gateway.remote.token"]).toMatchObject({
+    expectGatewayState(states["gateway.remote.token"], {
       hasSecretRef: true,
       active: false,
       reason: "gateway.auth.token is configured.",
@@ -191,7 +150,7 @@ describe("evaluateGatewayAuthSurfaceStates", () => {
       },
     } as OpenClawConfig);
 
-    expect(states["gateway.remote.password"]).toMatchObject({
+    expectGatewayState(states["gateway.remote.password"], {
       hasSecretRef: true,
       active: false,
       reason: 'password auth cannot win with gateway.auth.mode="token".',

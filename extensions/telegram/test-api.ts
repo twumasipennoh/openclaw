@@ -1,11 +1,9 @@
-export { buildTelegramMessageContextForTest } from "./src/bot-message-context.test-harness.js";
-export { handleTelegramAction } from "./src/action-runtime.js";
-export { telegramMessageActionRuntime } from "./src/channel-actions.js";
-export { telegramPlugin } from "./src/channel.js";
-export { listTelegramAccountIds, resolveTelegramAccount } from "./src/accounts.js";
-export { resolveTelegramFetch } from "./src/fetch.js";
-export { makeProxyFetch } from "./src/proxy.js";
-export { telegramOutbound } from "./src/outbound-adapter.js";
-export { setTelegramRuntime } from "./src/runtime.js";
-export { sendMessageTelegram, sendPollTelegram, type TelegramApiOverride } from "./src/send.js";
-export { resetTelegramThreadBindingsForTests } from "./src/thread-bindings.js";
+export { getOrCreateAccountThrottler } from "./src/account-throttler.js";
+export { renderTelegramProgressDraftPreview } from "./src/progress-draft-preview.js";
+export { telegramHtmlToPlainTextFallback } from "./src/format.js";
+export { resolveTelegramMessageCacheScope } from "./src/message-cache-persistence.js";
+export { createTelegramMessageCache } from "./src/message-cache.js";
+export {
+  clearTelegramRuntimeForTest,
+  resetTelegramMessageCacheForTest,
+} from "./src/runtime.test-support.js";

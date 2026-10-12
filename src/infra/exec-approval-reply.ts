@@ -1,5 +1,22 @@
+import { expectDefined } from "@openclaw/normalization-core";
+import { asOptionalRecord } from "@openclaw/normalization-core/record-coerce";
+import {
+  normalizeOptionalLowercaseString,
+  normalizeOptionalString,
+} from "@openclaw/normalization-core/string-coerce";
+import { isWellFormedApprovalId } from "../../packages/gateway-protocol/src/schema/approval-id.js";
 import type { ReplyPayload } from "../auto-reply/types.js";
-import type { InteractiveReply, InteractiveReplyButton } from "../interactive/payload.js";
+import type {
+  MessagePresentation,
+  MessagePresentationAction,
+  MessagePresentationButton,
+} from "../interactive/payload.js";
+import { formatHumanList } from "../shared/human-list.js";
+// Builds reply payloads for exec approval prompts and outcomes.
+import { formatFencedCodeBlock } from "../shared/markdown-code.js";
+import { formatApprovalDisplayPath } from "./approval-display-paths.js";
+import { summarizeApprovalScope, type ApprovalScope } from "./approval-scope.js";
+import type { ChannelApprovalKind } from "./approval-types.js";
 import {
   describeNativeExecApprovalClientSetup,
   listNativeExecApprovalClientLabels,
@@ -20,7 +37,7 @@ export type ExecApprovalUnavailableReason =
 export type ExecApprovalReplyMetadata = {
   approvalId: string;
   approvalSlug: string;
-  approvalKind: "exec" | "plugin";
+  approvalKind: ChannelApprovalKind;
   agentId?: string;
   allowedDecisions?: readonly ExecApprovalReplyDecision[];
   sessionKey?: string;
@@ -29,8 +46,16 @@ export type ExecApprovalReplyMetadata = {
 export type ExecApprovalActionDescriptor = {
   decision: ExecApprovalReplyDecision;
   label: string;
-  style: NonNullable<InteractiveReplyButton["style"]>;
+  style: NonNullable<MessagePresentationButton["style"]>;
+  /** Optional semantic action; omitted by the shipped command-backed builders. */
+  action?: MessagePresentationAction;
+  /** Copyable text fallback retained for non-interactive approval surfaces. */
   command: string;
+};
+
+/** Approval descriptor guaranteed to carry a canonical typed approval action. */
+export type TypedApprovalActionDescriptor = ExecApprovalActionDescriptor & {
+  action: Extract<MessagePresentationAction, { type: "approval" }>;
 };
 
 export type ExecApprovalPendingReplyParams = {
@@ -45,6 +70,7 @@ export type ExecApprovalPendingReplyParams = {
   cwd?: string;
   host: ExecHost;
   nodeId?: string;
+  scope?: ApprovalScope | null;
   sessionKey?: string | null;
   expiresAtMs?: number;
   nowMs?: number;
@@ -57,36 +83,25 @@ export type ExecApprovalUnavailableReplyParams = {
   accountId?: string;
   reason: ExecApprovalUnavailableReason;
   sentApproverDms?: boolean;
+  host?: ExecHost;
+  nodeId?: string;
 };
 
-function formatHumanList(values: readonly string[]): string {
-  if (values.length === 0) {
-    return "";
+function buildGenericNativeExecApprovalFallbackText(params?: {
+  excludeChannel?: string;
+  host?: ExecHost;
+  nodeId?: string;
+}): string {
+  const clients = formatHumanList(listNativeExecApprovalClientLabels(params));
+  let manualRecovery =
+    "Print the Control UI URL with `openclaw dashboard --no-open`, open it in a browser, then use the approval inbox.";
+  if (params?.host === "node") {
+    const nodeId = normalizeOptionalString(params.nodeId) ?? "<id|name|ip>";
+    manualRecovery += ` Inspect the node's effective exec policy with \`openclaw approvals get --node ${nodeId}\`.`;
   }
-  if (values.length === 1) {
-    return values[0];
-  }
-  if (values.length === 2) {
-    return `${values[0]} or ${values[1]}`;
-  }
-  return `${values.slice(0, -1).join(", ")}, or ${values.at(-1)}`;
-}
-
-function resolveNativeExecApprovalClientList(params?: { excludeChannel?: string }): string {
-  return formatHumanList(
-    listNativeExecApprovalClientLabels({
-      excludeChannel: params?.excludeChannel,
-    }),
-  );
-}
-
-function buildGenericNativeExecApprovalFallbackText(params?: { excludeChannel?: string }): string {
-  const clients = resolveNativeExecApprovalClientList({
-    excludeChannel: params?.excludeChannel,
-  });
   return clients
-    ? `Approve it from the Web UI or terminal UI, or enable a native chat approval client such as ${clients}. If those accounts already know your owner ID via allowFrom or owner config, OpenClaw can often infer approvers automatically.`
-    : "Approve it from the Web UI or terminal UI.";
+    ? `Approve it from the Web UI, or enable a native chat approval client such as ${clients}. ${manualRecovery} If those accounts already know your owner ID via allowFrom or owner config, OpenClaw can often infer approvers automatically.`
+    : `Approve it from the Web UI. ${manualRecovery}`;
 }
 
 function resolveAllowedDecisions(params: {
@@ -96,15 +111,6 @@ function resolveAllowedDecisions(params: {
   return params.allowedDecisions ?? resolveExecApprovalAllowedDecisions({ ask: params.ask });
 }
 
-function buildApprovalCommandFence(
-  descriptors: readonly ExecApprovalActionDescriptor[],
-): string | null {
-  if (descriptors.length === 0) {
-    return null;
-  }
-  return buildFence(descriptors.map((descriptor) => descriptor.command).join("\n"), "txt");
-}
-
 export function buildExecApprovalCommandText(params: {
   approvalCommandId: string;
   decision: ExecApprovalReplyDecision;
@@ -112,86 +118,142 @@ export function buildExecApprovalCommandText(params: {
   return `/approve ${params.approvalCommandId} ${params.decision}`;
 }
 
-export function buildExecApprovalActionDescriptors(params: {
+type BuildExecApprovalActionDescriptorsParams = {
   approvalCommandId: string;
   ask?: string | null;
   allowedDecisions?: readonly ExecApprovalReplyDecision[];
-}): ExecApprovalActionDescriptor[] {
+};
+
+function buildApprovalActionDescriptors(
+  approvalCommandId: string,
+  allowedDecisions: readonly ExecApprovalReplyDecision[],
+): ExecApprovalActionDescriptor[] {
+  const decisions: Pick<ExecApprovalActionDescriptor, "decision" | "label" | "style">[] = [
+    { decision: "allow-once", label: "Allow Once", style: "success" },
+    { decision: "allow-always", label: "Allow Always", style: "primary" },
+    { decision: "deny", label: "Deny", style: "danger" },
+  ];
+  return decisions
+    .filter((descriptor) => allowedDecisions.includes(descriptor.decision))
+    .map((descriptor) => ({
+      decision: descriptor.decision,
+      label: descriptor.label,
+      style: descriptor.style,
+      command: buildExecApprovalCommandText({
+        approvalCommandId,
+        decision: descriptor.decision,
+      }),
+    }));
+}
+
+export function buildExecApprovalActionDescriptors(
+  params: BuildExecApprovalActionDescriptorsParams,
+): ExecApprovalActionDescriptor[] {
   const approvalCommandId = params.approvalCommandId.trim();
-  if (!approvalCommandId) {
+  return approvalCommandId
+    ? buildApprovalActionDescriptors(approvalCommandId, resolveAllowedDecisions(params))
+    : [];
+}
+
+/** Build approval descriptors with explicit owner-aware typed actions. */
+export function buildTypedApprovalActionDescriptors(
+  params: BuildExecApprovalActionDescriptorsParams & {
+    approvalKind: ChannelApprovalKind;
+  },
+): TypedApprovalActionDescriptor[] {
+  const approvalId = params.approvalCommandId;
+  if (!isWellFormedApprovalId(approvalId)) {
     return [];
   }
-  const allowedDecisions = resolveAllowedDecisions(params);
-  const descriptors: ExecApprovalActionDescriptor[] = [];
-  if (allowedDecisions.includes("allow-once")) {
-    descriptors.push({
-      decision: "allow-once",
-      label: "Allow Once",
-      style: "success",
-      command: buildExecApprovalCommandText({
-        approvalCommandId,
-        decision: "allow-once",
-      }),
-    });
-  }
-  if (allowedDecisions.includes("allow-always")) {
-    descriptors.push({
-      decision: "allow-always",
-      label: "Allow Always",
-      style: "primary",
-      command: buildExecApprovalCommandText({
-        approvalCommandId,
-        decision: "allow-always",
-      }),
-    });
-  }
-  if (allowedDecisions.includes("deny")) {
-    descriptors.push({
-      decision: "deny",
-      label: "Deny",
-      style: "danger",
-      command: buildExecApprovalCommandText({
-        approvalCommandId,
-        decision: "deny",
-      }),
-    });
-  }
-  return descriptors;
-}
-
-function buildApprovalInteractiveButtons(
-  allowedDecisions: readonly ExecApprovalReplyDecision[],
-  approvalId: string,
-): InteractiveReplyButton[] {
-  return buildExecApprovalActionDescriptors({
-    approvalCommandId: approvalId,
-    allowedDecisions,
-  }).map((descriptor) => ({
-    label: descriptor.label,
-    value: descriptor.command,
-    style: descriptor.style,
-  }));
-}
-
-export function buildApprovalInteractiveReply(params: {
-  approvalId: string;
-  ask?: string | null;
-  allowedDecisions?: readonly ExecApprovalReplyDecision[];
-}): InteractiveReply | undefined {
-  const buttons = buildApprovalInteractiveButtons(
-    resolveAllowedDecisions(params),
-    params.approvalId,
+  return buildApprovalActionDescriptors(approvalId, resolveAllowedDecisions(params)).map(
+    (descriptor) => ({
+      decision: descriptor.decision,
+      label: descriptor.label,
+      style: descriptor.style,
+      command: descriptor.command,
+      action: {
+        type: "approval",
+        approvalId,
+        approvalKind: params.approvalKind,
+        decision: descriptor.decision,
+      },
+    }),
   );
+}
+
+/** Build portable approval controls from decision descriptors. */
+export function buildApprovalPresentationFromActionDescriptors(
+  actions: readonly ExecApprovalActionDescriptor[],
+): MessagePresentation | undefined {
+  const buttons: MessagePresentationButton[] = actions.map((descriptor) => {
+    const action =
+      descriptor.action ??
+      ({ type: "command", command: descriptor.command } satisfies MessagePresentationAction);
+    return {
+      label: descriptor.label,
+      action,
+      ...(descriptor.action ? {} : { value: descriptor.command }),
+      style: descriptor.style,
+    };
+  });
   return buttons.length > 0 ? { blocks: [{ type: "buttons", buttons }] } : undefined;
 }
 
-export function buildExecApprovalInteractiveReply(params: {
+type BuildApprovalPresentationParams = {
+  approvalId: string;
+  ask?: string | null;
+  allowedDecisions?: readonly ExecApprovalReplyDecision[];
+};
+
+/** Build the shipped command-backed portable approval controls. */
+export function buildApprovalButtonPresentation(
+  params: BuildApprovalPresentationParams,
+): MessagePresentation | undefined {
+  return buildApprovalPresentationFromActionDescriptors(
+    buildExecApprovalActionDescriptors({
+      approvalCommandId: params.approvalId,
+      ask: params.ask,
+      allowedDecisions: params.allowedDecisions,
+    }),
+  );
+}
+
+/** Build portable approval controls with explicit owner-aware typed actions. */
+export function buildTypedApprovalPresentation(
+  params: BuildApprovalPresentationParams & { approvalKind: ChannelApprovalKind },
+): MessagePresentation | undefined {
+  return buildApprovalPresentationFromActionDescriptors(
+    buildTypedApprovalActionDescriptors({
+      approvalCommandId: params.approvalId,
+      approvalKind: params.approvalKind,
+      ask: params.ask,
+      allowedDecisions: params.allowedDecisions,
+    }),
+  );
+}
+
+/** Build the shipped command-backed exec-approval presentation. */
+export function buildExecApprovalPresentation(params: {
   approvalCommandId: string;
   ask?: string | null;
   allowedDecisions?: readonly ExecApprovalReplyDecision[];
-}): InteractiveReply | undefined {
-  return buildApprovalInteractiveReply({
+}): MessagePresentation | undefined {
+  return buildApprovalButtonPresentation({
     approvalId: params.approvalCommandId,
+    ask: params.ask,
+    allowedDecisions: params.allowedDecisions,
+  });
+}
+
+/** Build an exec-approval presentation with canonical typed decision actions. */
+export function buildTypedExecApprovalPresentation(params: {
+  approvalCommandId: string;
+  ask?: string | null;
+  allowedDecisions?: readonly ExecApprovalReplyDecision[];
+}): MessagePresentation | undefined {
+  return buildTypedApprovalPresentation({
+    approvalId: params.approvalCommandId,
+    approvalKind: "exec",
     ask: params.ask,
     allowedDecisions: params.allowedDecisions,
   });
@@ -211,9 +273,9 @@ export function parseExecApprovalCommandText(
   if (!match) {
     return null;
   }
-  const rawDecision = match[2].toLowerCase();
+  const rawDecision = normalizeOptionalLowercaseString(match[2]) ?? "";
   return {
-    approvalId: match[1],
+    approvalId: expectDefined(match[1], "exec approval reply regex capture 1"),
     decision:
       rawDecision === "always" ? "allow-always" : (rawDecision as ExecApprovalReplyDecision),
   };
@@ -241,47 +303,30 @@ export function formatExecApprovalExpiresIn(expiresAtMs: number, nowMs: number):
   return parts.join(" ");
 }
 
-function buildFence(text: string, language?: string): string {
-  let fence = "```";
-  while (text.includes(fence)) {
-    fence += "`";
-  }
-  const languagePrefix = language ? language : "";
-  return `${fence}${languagePrefix}\n${text}\n${fence}`;
-}
-
 export function getExecApprovalReplyMetadata(
-  payload: ReplyPayload | null | undefined,
+  payload: ReplyPayload,
 ): ExecApprovalReplyMetadata | null {
-  // Plugins may return a null payload (e.g. claude-cli after sending chunks itself).
-  if (!payload || typeof payload !== "object") {
+  const record = asOptionalRecord(asOptionalRecord(payload.channelData)?.execApproval);
+  if (!record) {
     return null;
   }
-  const channelData = payload.channelData;
-  if (!channelData || typeof channelData !== "object" || Array.isArray(channelData)) {
-    return null;
-  }
-  const execApproval = channelData.execApproval;
-  if (!execApproval || typeof execApproval !== "object" || Array.isArray(execApproval)) {
-    return null;
-  }
-  const record = execApproval as Record<string, unknown>;
-  const approvalId = typeof record.approvalId === "string" ? record.approvalId.trim() : "";
-  const approvalSlug = typeof record.approvalSlug === "string" ? record.approvalSlug.trim() : "";
+  const approvalId = normalizeOptionalString(record.approvalId) ?? "";
+  const approvalSlug = normalizeOptionalString(record.approvalSlug) ?? "";
   if (!approvalId || !approvalSlug) {
     return null;
   }
-  const approvalKind = record.approvalKind === "plugin" ? "plugin" : "exec";
+  const approvalKind =
+    record.approvalKind === "plugin" || record.approvalKind === "system-agent"
+      ? record.approvalKind
+      : "exec";
   const allowedDecisions = Array.isArray(record.allowedDecisions)
     ? record.allowedDecisions.filter(
         (value): value is ExecApprovalReplyDecision =>
           value === "allow-once" || value === "allow-always" || value === "deny",
       )
     : undefined;
-  const agentId =
-    typeof record.agentId === "string" ? record.agentId.trim() || undefined : undefined;
-  const sessionKey =
-    typeof record.sessionKey === "string" ? record.sessionKey.trim() || undefined : undefined;
+  const agentId = normalizeOptionalString(record.agentId);
+  const sessionKey = normalizeOptionalString(record.sessionKey);
   return {
     approvalId,
     approvalSlug,
@@ -311,19 +356,21 @@ export function buildExecApprovalPendingReplyPayload(
   lines.push("Approval required.");
   if (primaryAction) {
     lines.push("Run:");
-    lines.push(buildFence(primaryAction.command, "txt"));
+    lines.push(formatFencedCodeBlock(primaryAction.command, "txt"));
   }
   lines.push("Pending command:");
-  lines.push(buildFence(params.command, "sh"));
-  const secondaryFence = buildApprovalCommandFence(secondaryActions);
-  if (secondaryFence) {
-    lines.push("Other options:");
-    lines.push(secondaryFence);
+  lines.push(formatFencedCodeBlock(params.command, "sh"));
+  if (secondaryActions.length > 0) {
+    lines.push(
+      "Other options:",
+      formatFencedCodeBlock(
+        secondaryActions.map((descriptor) => descriptor.command).join("\n"),
+        "txt",
+      ),
+    );
   }
   if (!allowedDecisions.includes("allow-always")) {
-    lines.push(
-      "The effective approval policy requires approval every time, so Allow Always is unavailable.",
-    );
+    lines.push("Allow Always is unavailable for this command.");
   }
   const info: string[] = [];
   info.push(`Host: ${params.host}`);
@@ -331,7 +378,10 @@ export function buildExecApprovalPendingReplyPayload(
     info.push(`Node: ${params.nodeId}`);
   }
   if (params.cwd) {
-    info.push(`CWD: ${params.cwd}`);
+    info.push(`CWD: ${formatApprovalDisplayPath(params.cwd)}`);
+  }
+  if (params.scope) {
+    info.push(`Scope: ${summarizeApprovalScope(params.scope)}`);
   }
   if (typeof params.expiresAtMs === "number" && Number.isFinite(params.expiresAtMs)) {
     info.push(
@@ -343,7 +393,7 @@ export function buildExecApprovalPendingReplyPayload(
 
   return {
     text: lines.join("\n\n"),
-    interactive: buildApprovalInteractiveReply({
+    presentation: buildApprovalButtonPresentation({
       approvalId: params.approvalId,
       allowedDecisions,
     }),
@@ -352,11 +402,25 @@ export function buildExecApprovalPendingReplyPayload(
         approvalId: params.approvalId,
         approvalSlug: params.approvalSlug,
         approvalKind: "exec",
-        agentId: params.agentId?.trim() || undefined,
+        agentId: normalizeOptionalString(params.agentId),
         allowedDecisions,
-        sessionKey: params.sessionKey?.trim() || undefined,
+        sessionKey: normalizeOptionalString(params.sessionKey),
       },
     },
+  };
+}
+
+/** Build an exec approval prompt with canonical typed decision actions. */
+export function buildTypedExecApprovalPendingReplyPayload(
+  params: ExecApprovalPendingReplyParams,
+): ReplyPayload {
+  const payload = buildExecApprovalPendingReplyPayload(params);
+  return {
+    ...payload,
+    presentation: buildTypedExecApprovalPresentation({
+      approvalCommandId: params.approvalId,
+      allowedDecisions: resolveAllowedDecisions(params),
+    }),
   };
 }
 
@@ -364,6 +428,11 @@ export function buildExecApprovalUnavailableReplyPayload(
   params: ExecApprovalUnavailableReplyParams,
 ): ReplyPayload {
   const lines: string[] = [];
+  const channelData = {
+    execApprovalUnavailable: {
+      reason: params.reason,
+    },
+  };
   const warningText = params.warningText?.trim();
   if (warningText) {
     lines.push(warningText);
@@ -373,6 +442,7 @@ export function buildExecApprovalUnavailableReplyPayload(
     lines.push(getExecApprovalApproverDmNoticeText());
     return {
       text: lines.join("\n\n"),
+      channelData,
     };
   }
 
@@ -380,7 +450,7 @@ export function buildExecApprovalUnavailableReplyPayload(
     lines.push(
       `Exec approval is required, but native chat exec approvals are not configured on ${params.channelLabel ?? "this platform"}.`,
     );
-    const channel = params.channel?.trim().toLowerCase();
+    const channel = normalizeOptionalLowercaseString(params.channel);
     const setupText =
       channel && params.channelLabel && supportsNativeExecApprovalClient(channel)
         ? describeNativeExecApprovalClientSetup({
@@ -392,7 +462,12 @@ export function buildExecApprovalUnavailableReplyPayload(
     if (setupText) {
       lines.push(setupText);
     } else {
-      lines.push(buildGenericNativeExecApprovalFallbackText());
+      lines.push(
+        buildGenericNativeExecApprovalFallbackText({
+          host: params.host,
+          nodeId: params.nodeId,
+        }),
+      );
     }
   } else if (params.reason === "initiating-platform-unsupported") {
     lines.push(
@@ -401,6 +476,8 @@ export function buildExecApprovalUnavailableReplyPayload(
     lines.push(
       buildGenericNativeExecApprovalFallbackText({
         excludeChannel: params.channel,
+        host: params.host,
+        nodeId: params.nodeId,
       }),
     );
   } else {
@@ -408,11 +485,15 @@ export function buildExecApprovalUnavailableReplyPayload(
       "Exec approval is required, but no interactive approval client is currently available.",
     );
     lines.push(
-      `${buildGenericNativeExecApprovalFallbackText()} Then retry the command. You can usually leave execApprovals.approvers unset when owner config already identifies the approvers.`,
+      `${buildGenericNativeExecApprovalFallbackText({
+        host: params.host,
+        nodeId: params.nodeId,
+      })} Then retry the command. You can usually leave execApprovals.approvers unset when owner config already identifies the approvers.`,
     );
   }
 
   return {
     text: lines.join("\n\n"),
+    channelData,
   };
 }

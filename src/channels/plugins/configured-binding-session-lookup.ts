@@ -1,12 +1,15 @@
+import { normalizeAccountId } from "../../routing/session-key.js";
 import type { ConfiguredBindingRecordResolution } from "./binding-types.js";
 import type { CompiledConfiguredBindingRegistry } from "./configured-binding-compiler.js";
 import { listConfiguredBindingConsumers } from "./configured-binding-consumers.js";
 import {
-  materializeConfiguredBindingRecord,
   resolveAccountMatchPriority,
   resolveCompiledBindingChannel,
 } from "./configured-binding-match.js";
 
+/**
+ * Resolves a configured binding record from a stateful target session key.
+ */
 export function resolveConfiguredBindingRecordBySessionKeyFromRegistry(params: {
   registry: CompiledConfiguredBindingRegistry;
   sessionKey: string;
@@ -30,7 +33,6 @@ export function resolveConfiguredBindingRecordBySessionKeyFromRegistry(params: {
       continue;
     }
     let wildcardMatch: ConfiguredBindingRecordResolution | null = null;
-    let exactMatch: ConfiguredBindingRecordResolution | null = null;
     for (const rule of rules) {
       if (rule.targetFactory.driverId !== consumer.id) {
         continue;
@@ -42,9 +44,10 @@ export function resolveConfiguredBindingRecordBySessionKeyFromRegistry(params: {
       if (accountMatchPriority === 0) {
         continue;
       }
-      const materializedTarget = materializeConfiguredBindingRecord({
-        rule,
-        accountId: parsed.accountId,
+      // Materialize candidate targets before matching because wildcard rules can derive
+      // provider-specific target session keys from parsed session-key facts.
+      const materializedTarget = rule.targetFactory.materialize({
+        accountId: normalizeAccountId(parsed.accountId),
         conversation: rule.target,
       });
       const matchesSessionKey =
@@ -56,14 +59,11 @@ export function resolveConfiguredBindingRecordBySessionKeyFromRegistry(params: {
         }) ?? materializedTarget.record.targetSessionKey === sessionKey;
       if (matchesSessionKey) {
         if (accountMatchPriority === 2) {
-          exactMatch = materializedTarget;
-          break;
+          // Exact account matches outrank wildcard account bindings for the same session key.
+          return materializedTarget;
         }
         wildcardMatch = materializedTarget;
       }
-    }
-    if (exactMatch) {
-      return exactMatch;
     }
     if (wildcardMatch) {
       return wildcardMatch;

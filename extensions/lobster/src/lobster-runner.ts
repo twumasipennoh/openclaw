@@ -1,21 +1,35 @@
-import { randomUUID } from "node:crypto";
-import { existsSync } from "node:fs";
-import { createRequire } from "node:module";
+import { stat } from "node:fs/promises";
 import path from "node:path";
 import { Readable, Writable } from "node:stream";
-import { pathToFileURL } from "node:url";
+import {
+  extractErrorCode,
+  toErrorObject as toLintErrorObject,
+} from "openclaw/plugin-sdk/error-runtime";
+import { isPathInside } from "openclaw/plugin-sdk/file-access-runtime";
+import { raceWithTimeout } from "openclaw/plugin-sdk/time-runtime";
 
-export type LobsterEnvelope =
+type LobsterInputRequest = {
+  type?: "input_request";
+  prompt: string;
+  responseSchema: unknown;
+  defaults?: unknown;
+  subject?: unknown;
+  resumeToken?: string;
+};
+
+type LobsterEnvelope =
   | {
       ok: true;
-      status: "ok" | "needs_approval" | "cancelled";
+      status: "ok" | "needs_approval" | "needs_input" | "cancelled";
       output: unknown[];
       requiresApproval: null | {
         type: "approval_request";
         prompt: string;
         items: unknown[];
         resumeToken?: string;
+        approvalId?: string;
       };
+      requiresInput?: LobsterInputRequest;
     }
   | {
       ok: false;
@@ -27,7 +41,10 @@ export type LobsterRunnerParams = {
   pipeline?: string;
   argsJson?: string;
   token?: string;
+  approvalId?: string;
   approve?: boolean;
+  responseJson?: string;
+  cancel?: boolean;
   cwd: string;
   timeoutMs: number;
   maxStdoutBytes: number;
@@ -45,24 +62,20 @@ type EmbeddedToolContext = {
   stdout?: NodeJS.WritableStream;
   stderr?: NodeJS.WritableStream;
   signal?: AbortSignal;
-  registry?: unknown;
-  llmAdapters?: Record<string, unknown>;
 };
 
 type EmbeddedToolEnvelope = {
-  protocolVersion?: number;
   ok: boolean;
-  status?: "ok" | "needs_approval" | "cancelled";
+  status?: "ok" | "needs_approval" | "needs_input" | "cancelled";
   output?: unknown[];
   requiresApproval?: {
-    type?: "approval_request";
     prompt: string;
     items: unknown[];
-    preview?: string;
     resumeToken?: string;
+    approvalId?: string;
   } | null;
+  requiresInput?: LobsterInputRequest | null;
   error?: {
-    type?: string;
     message: string;
   };
 };
@@ -75,89 +88,16 @@ type EmbeddedToolRuntime = {
     ctx?: EmbeddedToolContext;
   }) => Promise<EmbeddedToolEnvelope>;
   resumeToolRequest: (params: {
-    token: string;
-    approved: boolean;
+    token?: string;
+    approvalId?: string;
+    approved?: boolean;
+    response?: unknown;
+    cancel?: boolean;
     ctx?: EmbeddedToolContext;
   }) => Promise<EmbeddedToolEnvelope>;
 };
 
-type ToolRuntimeDeps = {
-  createDefaultRegistry: () => unknown;
-  parsePipeline: (pipeline: string) => Array<{
-    name: string;
-    args: Record<string, unknown>;
-    raw: string;
-  }>;
-  decodeResumeToken: (token: string) => {
-    kind?: string;
-    stateKey?: string;
-    filePath?: string;
-  };
-  encodeToken: (payload: Record<string, unknown>) => string;
-  runPipeline: (params: {
-    pipeline: Array<{ name: string; args: Record<string, unknown>; raw: string }>;
-    registry: unknown;
-    input: AsyncIterable<unknown> | unknown[];
-    stdin: NodeJS.ReadableStream;
-    stdout: NodeJS.WritableStream;
-    stderr: NodeJS.WritableStream;
-    env: Record<string, string | undefined>;
-    mode: "tool";
-    cwd: string;
-    llmAdapters?: Record<string, unknown>;
-    signal?: AbortSignal;
-  }) => Promise<{
-    items: unknown[];
-    halted?: boolean;
-    haltedAt?: { index?: number };
-  }>;
-  runWorkflowFile: (params: {
-    filePath: string;
-    args?: Record<string, unknown>;
-    ctx: EmbeddedToolContext;
-    resume?: Record<string, unknown>;
-    approved?: boolean;
-  }) => Promise<{
-    status: "ok" | "needs_approval" | "cancelled";
-    output: unknown[];
-    requiresApproval?: EmbeddedToolEnvelope["requiresApproval"];
-  }>;
-  readStateJson: (params: {
-    env: Record<string, string | undefined>;
-    key: string;
-  }) => Promise<unknown>;
-  writeStateJson: (params: {
-    env: Record<string, string | undefined>;
-    key: string;
-    value: unknown;
-  }) => Promise<void>;
-  deleteStateJson: (params: {
-    env: Record<string, string | undefined>;
-    key: string;
-  }) => Promise<void>;
-};
-
-type PipelineResumeState = {
-  pipeline: Array<{ name: string; args: Record<string, unknown>; raw: string }>;
-  resumeAtIndex: number;
-  items: unknown[];
-  prompt?: string;
-  createdAt: string;
-};
-
-type LoadEmbeddedToolRuntime = () => Promise<EmbeddedToolRuntime>;
-
-type ApprovalRequestItem = {
-  type: "approval_request";
-  prompt: string;
-  items: unknown[];
-  resumeToken?: string;
-};
-
-function normalizeForCwdSandbox(p: string): string {
-  const normalized = path.normalize(p);
-  return process.platform === "win32" ? normalized.toLowerCase() : normalized;
-}
+const workflowExts = new Set([".lobster", ".yaml", ".yml", ".json"]);
 
 export function resolveLobsterCwd(cwdRaw: unknown): string {
   if (typeof cwdRaw !== "string" || !cwdRaw.trim()) {
@@ -170,11 +110,7 @@ export function resolveLobsterCwd(cwdRaw: unknown): string {
   const base = process.cwd();
   const resolved = path.resolve(base, cwd);
 
-  const rel = path.relative(normalizeForCwdSandbox(base), normalizeForCwdSandbox(resolved));
-  if (rel === "" || rel === ".") {
-    return resolved;
-  }
-  if (rel.startsWith("..") || path.isAbsolute(rel)) {
+  if (!isPathInside(base, resolved)) {
     throw new Error("cwd must stay within the gateway working directory");
   }
   return resolved;
@@ -194,557 +130,159 @@ function createLimitedSink(maxBytes: number, label: "stdout" | "stderr") {
   });
 }
 
-function normalizeEnvelope(envelope: EmbeddedToolEnvelope): LobsterEnvelope {
-  if (envelope.ok) {
-    return {
-      ok: true,
-      status: envelope.status ?? "ok",
-      output: Array.isArray(envelope.output) ? envelope.output : [],
-      requiresApproval: envelope.requiresApproval
-        ? {
-            type: "approval_request",
-            prompt: envelope.requiresApproval.prompt,
-            items: envelope.requiresApproval.items,
-            ...(envelope.requiresApproval.resumeToken
-              ? { resumeToken: envelope.requiresApproval.resumeToken }
-              : {}),
-          }
-        : null,
-    };
+function normalizeEnvelope(
+  envelope: EmbeddedToolEnvelope,
+  maxStdoutBytes: number,
+): Extract<LobsterEnvelope, { ok: true }> {
+  if (!envelope.ok) {
+    throw new Error(envelope.error?.message ?? "lobster runtime failed");
   }
-  return {
-    ok: false,
-    error: {
-      type: envelope.error?.type,
-      message: envelope.error?.message ?? "lobster runtime failed",
-    },
+  if (envelope.status === "needs_input" && !envelope.requiresInput?.resumeToken) {
+    throw new Error("Lobster input request is missing its resume token");
+  }
+  const normalized: Extract<LobsterEnvelope, { ok: true }> = {
+    ok: true,
+    status: envelope.status ?? "ok",
+    output: Array.isArray(envelope.output) ? envelope.output : [],
+    requiresApproval: envelope.requiresApproval
+      ? {
+          type: "approval_request",
+          prompt: envelope.requiresApproval.prompt,
+          items: envelope.requiresApproval.items,
+          ...(envelope.requiresApproval.resumeToken
+            ? { resumeToken: envelope.requiresApproval.resumeToken }
+            : {}),
+          ...(envelope.requiresApproval.approvalId
+            ? { approvalId: envelope.requiresApproval.approvalId }
+            : {}),
+        }
+      : null,
+    ...(envelope.requiresInput
+      ? { requiresInput: { ...envelope.requiresInput, type: "input_request" as const } }
+      : {}),
   };
-}
-
-function throwOnErrorEnvelope(envelope: LobsterEnvelope): Extract<LobsterEnvelope, { ok: true }> {
-  if (envelope.ok) {
-    return envelope;
+  if (Buffer.byteLength(JSON.stringify(normalized, null, 2), "utf8") > maxStdoutBytes) {
+    throw new Error("lobster runtime result exceeded maxStdoutBytes");
   }
-  throw new Error(envelope.error.message);
-}
-
-function asApprovalRequestItem(item: unknown): ApprovalRequestItem | null {
-  if (!item || typeof item !== "object") {
-    return null;
-  }
-  const candidate = item as Partial<ApprovalRequestItem>;
-  if (candidate.type !== "approval_request") {
-    return null;
-  }
-  if (typeof candidate.prompt !== "string" || !Array.isArray(candidate.items)) {
-    return null;
-  }
-  return candidate as ApprovalRequestItem;
-}
-
-async function resolveWorkflowFile(candidate: string, cwd: string) {
-  const { stat } = await import("node:fs/promises");
-  const resolved = path.isAbsolute(candidate) ? candidate : path.resolve(cwd, candidate);
-  const fileStat = await stat(resolved);
-  if (!fileStat.isFile()) {
-    throw new Error("Workflow path is not a file");
-  }
-  const ext = path.extname(resolved).toLowerCase();
-  if (![".lobster", ".yaml", ".yml", ".json"].includes(ext)) {
-    throw new Error("Workflow file must end in .lobster, .yaml, .yml, or .json");
-  }
-  return resolved;
+  return normalized;
 }
 
 async function detectWorkflowFile(candidate: string, cwd: string) {
   const trimmed = candidate.trim();
-  if (!trimmed || trimmed.includes("|")) {
+  if (!trimmed || trimmed.includes("|") || !workflowExts.has(path.extname(trimmed).toLowerCase())) {
     return null;
   }
+  const resolved = path.isAbsolute(trimmed) ? trimmed : path.resolve(cwd, trimmed);
   try {
-    return await resolveWorkflowFile(trimmed, cwd);
-  } catch {
-    return null;
-  }
-}
-
-function parseWorkflowArgs(argsJson: string) {
-  return JSON.parse(argsJson) as Record<string, unknown>;
-}
-
-function createEmbeddedToolContext(
-  params: LobsterRunnerParams,
-  signal?: AbortSignal,
-): EmbeddedToolContext {
-  const env = { ...process.env } as Record<string, string | undefined>;
-  return {
-    cwd: params.cwd,
-    env,
-    mode: "tool",
-    stdin: Readable.from([]),
-    stdout: createLimitedSink(Math.max(1024, params.maxStdoutBytes), "stdout"),
-    stderr: createLimitedSink(Math.max(1024, params.maxStdoutBytes), "stderr"),
-    signal,
-  };
-}
-
-async function withTimeout<T>(
-  timeoutMs: number,
-  fn: (signal?: AbortSignal) => Promise<T>,
-): Promise<T> {
-  const timeout = Math.max(200, timeoutMs);
-  const controller = new AbortController();
-  return await new Promise<T>((resolve, reject) => {
-    const onTimeout = () => {
-      const error = new Error("lobster runtime timed out");
-      controller.abort(error);
-      reject(error);
-    };
-
-    const timer = setTimeout(onTimeout, timeout);
-    void fn(controller.signal).then(
-      (value) => {
-        clearTimeout(timer);
-        resolve(value);
-      },
-      (error) => {
-        clearTimeout(timer);
-        reject(error);
-      },
-    );
-  });
-}
-
-function createFallbackEmbeddedToolRuntime(deps: ToolRuntimeDeps): EmbeddedToolRuntime {
-  const createToolContext = (ctx: EmbeddedToolContext = {}) => ({
-    cwd: ctx.cwd ?? process.cwd(),
-    env: { ...process.env, ...ctx.env },
-    mode: "tool" as const,
-    stdin: ctx.stdin ?? Readable.from([]),
-    stdout: ctx.stdout ?? createLimitedSink(512_000, "stdout"),
-    stderr: ctx.stderr ?? createLimitedSink(512_000, "stderr"),
-    signal: ctx.signal,
-    registry: ctx.registry ?? deps.createDefaultRegistry(),
-    llmAdapters: ctx.llmAdapters,
-  });
-
-  const okEnvelope = (
-    status: "ok" | "needs_approval" | "cancelled",
-    output: unknown[],
-    requiresApproval: EmbeddedToolEnvelope["requiresApproval"],
-  ): EmbeddedToolEnvelope => ({
-    protocolVersion: 1,
-    ok: true,
-    status,
-    output,
-    requiresApproval,
-  });
-
-  const errorEnvelope = (type: string, message: string): EmbeddedToolEnvelope => ({
-    protocolVersion: 1,
-    ok: false,
-    error: { type, message },
-  });
-
-  const streamFromItems = (items: unknown[]) =>
-    (async function* () {
-      for (const item of items) {
-        yield item;
-      }
-    })();
-
-  const savePipelineResumeState = async (
-    env: Record<string, string | undefined>,
-    state: PipelineResumeState,
-  ) => {
-    const stateKey = `pipeline_resume_${randomUUID()}`;
-    await deps.writeStateJson({ env, key: stateKey, value: state });
-    return stateKey;
-  };
-
-  const loadPipelineResumeState = async (
-    env: Record<string, string | undefined>,
-    stateKey: string,
-  ) => {
-    const stored = await deps.readStateJson({ env, key: stateKey });
-    if (!stored || typeof stored !== "object") {
-      throw new Error("Pipeline resume state not found");
+    if (!(await stat(resolved)).isFile()) {
+      throw new Error("Workflow path is not a file");
     }
-    const data = stored as Partial<PipelineResumeState>;
-    if (!Array.isArray(data.pipeline)) {
-      throw new Error("Invalid pipeline resume state");
+    return resolved;
+  } catch (error) {
+    if (/\s/.test(trimmed) && extractErrorCode(error) === "ENOENT") {
+      return null;
     }
-    if (typeof data.resumeAtIndex !== "number") {
-      throw new Error("Invalid pipeline resume state");
-    }
-    if (!Array.isArray(data.items)) {
-      throw new Error("Invalid pipeline resume state");
-    }
-    return data as PipelineResumeState;
-  };
-
-  return {
-    async runToolRequest({ pipeline, filePath, args, ctx = {} }) {
-      const runtime = createToolContext(ctx);
-      const hasPipeline = typeof pipeline === "string" && pipeline.trim().length > 0;
-      const hasFile = typeof filePath === "string" && filePath.trim().length > 0;
-
-      if (!hasPipeline && !hasFile) {
-        return errorEnvelope("parse_error", "run requires either pipeline or filePath");
-      }
-      if (hasPipeline && hasFile) {
-        return errorEnvelope("parse_error", "run accepts either pipeline or filePath, not both");
-      }
-
-      if (hasFile) {
-        try {
-          const output = await deps.runWorkflowFile({
-            filePath: filePath!,
-            args,
-            ctx: runtime,
-          });
-
-          if (output.status === "needs_approval") {
-            return okEnvelope("needs_approval", [], output.requiresApproval ?? null);
-          }
-          if (output.status === "cancelled") {
-            return okEnvelope("cancelled", [], null);
-          }
-          return okEnvelope("ok", output.output, null);
-        } catch (error) {
-          return errorEnvelope(
-            "runtime_error",
-            error instanceof Error ? error.message : String(error),
-          );
-        }
-      }
-
-      let parsed;
-      try {
-        parsed = deps.parsePipeline(String(pipeline));
-      } catch (error) {
-        return errorEnvelope("parse_error", error instanceof Error ? error.message : String(error));
-      }
-
-      try {
-        const output = await deps.runPipeline({
-          pipeline: parsed,
-          registry: runtime.registry,
-          input: [],
-          stdin: runtime.stdin!,
-          stdout: runtime.stdout!,
-          stderr: runtime.stderr!,
-          env: runtime.env,
-          mode: "tool",
-          cwd: runtime.cwd,
-          llmAdapters: runtime.llmAdapters,
-          signal: runtime.signal,
-        });
-
-        const approval =
-          output.halted && output.items.length === 1
-            ? asApprovalRequestItem(output.items[0])
-            : null;
-
-        if (approval) {
-          const stateKey = await savePipelineResumeState(runtime.env, {
-            pipeline: parsed,
-            resumeAtIndex: (output.haltedAt?.index ?? -1) + 1,
-            items: approval.items,
-            prompt: approval.prompt,
-            createdAt: new Date().toISOString(),
-          });
-
-          const resumeToken = deps.encodeToken({
-            protocolVersion: 1,
-            v: 1,
-            kind: "pipeline-resume",
-            stateKey,
-          });
-
-          return okEnvelope("needs_approval", [], {
-            type: "approval_request",
-            prompt: approval.prompt,
-            items: approval.items,
-            resumeToken,
-          });
-        }
-
-        return okEnvelope("ok", output.items, null);
-      } catch (error) {
-        return errorEnvelope(
-          "runtime_error",
-          error instanceof Error ? error.message : String(error),
-        );
-      }
-    },
-
-    async resumeToolRequest({ token, approved, ctx = {} }) {
-      const runtime = createToolContext(ctx);
-      let payload: { kind?: string; stateKey?: string; filePath?: string };
-
-      try {
-        payload = deps.decodeResumeToken(token);
-      } catch (error) {
-        return errorEnvelope("parse_error", error instanceof Error ? error.message : String(error));
-      }
-
-      if (!approved) {
-        if (payload.kind === "workflow-file" && payload.stateKey) {
-          await deps.deleteStateJson({ env: runtime.env, key: payload.stateKey });
-        }
-        if (payload.kind === "pipeline-resume" && payload.stateKey) {
-          await deps.deleteStateJson({ env: runtime.env, key: payload.stateKey });
-        }
-        return okEnvelope("cancelled", [], null);
-      }
-
-      if (payload.kind === "workflow-file" && payload.filePath) {
-        try {
-          const output = await deps.runWorkflowFile({
-            filePath: payload.filePath,
-            ctx: runtime,
-            resume: payload as Record<string, unknown>,
-            approved: true,
-          });
-
-          if (output.status === "needs_approval") {
-            return okEnvelope("needs_approval", [], output.requiresApproval ?? null);
-          }
-          if (output.status === "cancelled") {
-            return okEnvelope("cancelled", [], null);
-          }
-          return okEnvelope("ok", output.output, null);
-        } catch (error) {
-          return errorEnvelope(
-            "runtime_error",
-            error instanceof Error ? error.message : String(error),
-          );
-        }
-      }
-
-      try {
-        const resumeState = await loadPipelineResumeState(runtime.env, payload.stateKey ?? "");
-        const remaining = resumeState.pipeline.slice(resumeState.resumeAtIndex);
-
-        const output = await deps.runPipeline({
-          pipeline: remaining,
-          registry: runtime.registry,
-          input: streamFromItems(resumeState.items),
-          stdin: runtime.stdin!,
-          stdout: runtime.stdout!,
-          stderr: runtime.stderr!,
-          env: runtime.env,
-          mode: "tool",
-          cwd: runtime.cwd,
-          llmAdapters: runtime.llmAdapters,
-          signal: runtime.signal,
-        });
-
-        const approval =
-          output.halted && output.items.length === 1
-            ? asApprovalRequestItem(output.items[0])
-            : null;
-
-        if (approval) {
-          const nextStateKey = await savePipelineResumeState(runtime.env, {
-            pipeline: remaining,
-            resumeAtIndex: (output.haltedAt?.index ?? -1) + 1,
-            items: approval.items,
-            prompt: approval.prompt,
-            createdAt: new Date().toISOString(),
-          });
-          if (payload.stateKey) {
-            await deps.deleteStateJson({ env: runtime.env, key: payload.stateKey });
-          }
-
-          const resumeToken = deps.encodeToken({
-            protocolVersion: 1,
-            v: 1,
-            kind: "pipeline-resume",
-            stateKey: nextStateKey,
-          });
-
-          return okEnvelope("needs_approval", [], {
-            type: "approval_request",
-            prompt: approval.prompt,
-            items: approval.items,
-            resumeToken,
-          });
-        }
-
-        if (payload.stateKey) {
-          await deps.deleteStateJson({ env: runtime.env, key: payload.stateKey });
-        }
-        return okEnvelope("ok", output.items, null);
-      } catch (error) {
-        return errorEnvelope(
-          "runtime_error",
-          error instanceof Error ? error.message : String(error),
-        );
-      }
-    },
-  };
-}
-
-async function importInstalledLobsterModule<T>(
-  lobsterRoot: string,
-  relativePath: string,
-): Promise<T> {
-  const target = path.join(lobsterRoot, relativePath);
-  return (await import(pathToFileURL(target).href)) as T;
-}
-
-function resolveInstalledLobsterRoot() {
-  const require = createRequire(import.meta.url);
-  const sdkEntry = require.resolve("@clawdbot/lobster");
-  let currentDir = path.dirname(sdkEntry);
-
-  while (true) {
-    const packageJsonPath = path.join(currentDir, "package.json");
-    if (existsSync(packageJsonPath)) {
-      return currentDir;
-    }
-    const parentDir = path.dirname(currentDir);
-    if (parentDir === currentDir) {
-      throw new Error("Unable to resolve the installed @clawdbot/lobster package root");
-    }
-    currentDir = parentDir;
+    throw error;
   }
 }
 
 async function loadEmbeddedToolRuntimeFromPackage(): Promise<EmbeddedToolRuntime> {
-  const lobsterRoot = resolveInstalledLobsterRoot();
-  const coreIndexPath = path.join(lobsterRoot, "dist/src/core/index.js");
-
-  try {
-    const core = await import(pathToFileURL(coreIndexPath).href);
-    if (typeof core.runToolRequest === "function" && typeof core.resumeToolRequest === "function") {
-      return {
-        runToolRequest: core.runToolRequest as EmbeddedToolRuntime["runToolRequest"],
-        resumeToolRequest: core.resumeToolRequest as EmbeddedToolRuntime["resumeToolRequest"],
-      };
-    }
-  } catch {
-    // The current published npm package does not export/ship ./core yet.
-  }
-
-  const [
-    registryModule,
-    parserModule,
-    resumeModule,
-    tokenModule,
-    runtimeModule,
-    workflowModule,
-    storeModule,
-  ] = await Promise.all([
-    importInstalledLobsterModule<{
-      createDefaultRegistry: ToolRuntimeDeps["createDefaultRegistry"];
-    }>(lobsterRoot, "dist/src/commands/registry.js"),
-    importInstalledLobsterModule<{ parsePipeline: ToolRuntimeDeps["parsePipeline"] }>(
-      lobsterRoot,
-      "dist/src/parser.js",
-    ),
-    importInstalledLobsterModule<{ decodeResumeToken: ToolRuntimeDeps["decodeResumeToken"] }>(
-      lobsterRoot,
-      "dist/src/resume.js",
-    ),
-    importInstalledLobsterModule<{ encodeToken: ToolRuntimeDeps["encodeToken"] }>(
-      lobsterRoot,
-      "dist/src/token.js",
-    ),
-    importInstalledLobsterModule<{ runPipeline: ToolRuntimeDeps["runPipeline"] }>(
-      lobsterRoot,
-      "dist/src/runtime.js",
-    ),
-    importInstalledLobsterModule<{ runWorkflowFile: ToolRuntimeDeps["runWorkflowFile"] }>(
-      lobsterRoot,
-      "dist/src/workflows/file.js",
-    ),
-    importInstalledLobsterModule<{
-      readStateJson: ToolRuntimeDeps["readStateJson"];
-      writeStateJson: ToolRuntimeDeps["writeStateJson"];
-      deleteStateJson: ToolRuntimeDeps["deleteStateJson"];
-    }>(lobsterRoot, "dist/src/state/store.js"),
-  ]);
-
-  return createFallbackEmbeddedToolRuntime({
-    createDefaultRegistry: registryModule.createDefaultRegistry,
-    parsePipeline: parserModule.parsePipeline,
-    decodeResumeToken: resumeModule.decodeResumeToken,
-    encodeToken: tokenModule.encodeToken,
-    runPipeline: runtimeModule.runPipeline,
-    runWorkflowFile: workflowModule.runWorkflowFile,
-    readStateJson: storeModule.readStateJson,
-    writeStateJson: storeModule.writeStateJson,
-    deleteStateJson: storeModule.deleteStateJson,
-  });
+  // Joined specifier keeps bundlers from statically resolving
+  // @clawdbot/lobster/core; the plugin's declared @clawdbot/lobster dependency
+  // provides it at runtime, so it is a used direct dependency.
+  const coreSpecifier = ["@clawdbot", "lobster", "core"].join("/");
+  return (await import(coreSpecifier)) as EmbeddedToolRuntime;
 }
 
 export function createEmbeddedLobsterRunner(options?: {
-  loadRuntime?: LoadEmbeddedToolRuntime;
+  loadRuntime?: () => Promise<EmbeddedToolRuntime>;
 }): LobsterRunner {
   const loadRuntime = options?.loadRuntime ?? loadEmbeddedToolRuntimeFromPackage;
   let runtimePromise: Promise<EmbeddedToolRuntime> | undefined;
-
-  const getRuntime = () => {
-    runtimePromise ??= loadRuntime().catch((error) => {
-      runtimePromise = undefined;
-      throw error;
-    });
-    return runtimePromise;
-  };
-
   return {
     async run(params) {
-      const runtime = await getRuntime();
-      return await withTimeout(params.timeoutMs, async (signal) => {
-        const ctx = createEmbeddedToolContext(params, signal);
+      runtimePromise ??= loadRuntime();
+      const runtime = await runtimePromise;
+      const controller = new AbortController();
+      return await raceWithTimeout(
+        async () => {
+          const maxStdoutBytes = Math.max(1024, params.maxStdoutBytes);
+          const ctx: EmbeddedToolContext = {
+            cwd: params.cwd,
+            env: { ...process.env },
+            mode: "tool",
+            stdin: Readable.from([]),
+            stdout: createLimitedSink(maxStdoutBytes, "stdout"),
+            stderr: createLimitedSink(maxStdoutBytes, "stderr"),
+            signal: controller.signal,
+          };
+          let envelope: EmbeddedToolEnvelope;
 
-        if (params.action === "run") {
-          const pipeline = params.pipeline?.trim() ?? "";
-          if (!pipeline) {
-            throw new Error("pipeline required");
-          }
+          if (params.action === "run") {
+            const pipeline = params.pipeline?.trim() ?? "";
+            if (!pipeline) {
+              throw new Error("pipeline required");
+            }
 
-          const filePath = await detectWorkflowFile(pipeline, params.cwd);
-          if (filePath) {
-            const parsedArgsJson = params.argsJson?.trim() ?? "";
-            let args: Record<string, unknown> | undefined;
-            if (parsedArgsJson) {
+            const filePath = await detectWorkflowFile(pipeline, params.cwd);
+            if (filePath) {
+              const parsedArgsJson = params.argsJson?.trim() ?? "";
+              let args: Record<string, unknown> | undefined;
+              if (parsedArgsJson) {
+                try {
+                  args = JSON.parse(parsedArgsJson) as Record<string, unknown>;
+                } catch {
+                  throw new Error("run --args-json must be valid JSON");
+                }
+              }
+              envelope = await runtime.runToolRequest({ filePath, args, ctx });
+            } else {
+              envelope = await runtime.runToolRequest({ pipeline, ctx });
+            }
+          } else {
+            const token = params.token?.trim() ?? "";
+            const approvalId = params.approvalId?.trim() ?? "";
+            if (!token && !approvalId) {
+              throw new Error("token or approvalId required");
+            }
+            const hasApproval = typeof params.approve === "boolean";
+            const hasResponse = params.responseJson !== undefined;
+            const hasCancel = params.cancel !== undefined;
+            if (Number(hasApproval) + Number(hasResponse) + Number(hasCancel) !== 1) {
+              throw new Error(
+                "resume requires exactly one of approve, responseJson, or cancel: true",
+              );
+            }
+            if (hasCancel && params.cancel !== true) {
+              throw new Error("cancel must be true");
+            }
+            let response: unknown;
+            if (params.responseJson !== undefined) {
               try {
-                args = parseWorkflowArgs(parsedArgsJson);
+                response = JSON.parse(params.responseJson);
               } catch {
-                throw new Error("run --args-json must be valid JSON");
+                throw new Error("responseJson must be valid JSON");
               }
             }
-            return throwOnErrorEnvelope(
-              normalizeEnvelope(await runtime.runToolRequest({ filePath, args, ctx })),
-            );
-          }
-
-          return throwOnErrorEnvelope(
-            normalizeEnvelope(await runtime.runToolRequest({ pipeline, ctx })),
-          );
-        }
-
-        const token = params.token?.trim() ?? "";
-        if (!token) {
-          throw new Error("token required");
-        }
-        if (typeof params.approve !== "boolean") {
-          throw new Error("approve required");
-        }
-
-        return throwOnErrorEnvelope(
-          normalizeEnvelope(
-            await runtime.resumeToolRequest({
-              token,
-              approved: params.approve,
+            envelope = await runtime.resumeToolRequest({
+              ...(token ? { token } : {}),
+              ...(approvalId ? { approvalId } : {}),
+              ...(hasApproval ? { approved: params.approve } : {}),
+              ...(hasResponse ? { response } : {}),
+              ...(hasCancel ? { cancel: true } : {}),
               ctx,
-            }),
-          ),
-        );
+            });
+          }
+          return normalizeEnvelope(envelope, maxStdoutBytes);
+        },
+        Math.max(200, params.timeoutMs),
+        () => {
+          const error = new Error("lobster runtime timed out");
+          controller.abort(error);
+          throw error;
+        },
+      ).catch((error: unknown) => {
+        throw toLintErrorObject(error, "Non-Error rejection");
       });
     },
   };

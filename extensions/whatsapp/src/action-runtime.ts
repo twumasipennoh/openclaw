@@ -1,11 +1,11 @@
-import type { AgentToolResult } from "@mariozechner/pi-agent-core";
+import type { AgentToolResult } from "openclaw/plugin-sdk/agent-core";
 import {
   createActionGate,
   jsonResult,
   readReactionParams,
   readStringParam,
 } from "openclaw/plugin-sdk/channel-actions";
-import type { OpenClawConfig } from "openclaw/plugin-sdk/config-runtime";
+import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import { resolveAuthorizedWhatsAppOutboundTarget } from "./action-runtime-target-auth.js";
 import { resolveWhatsAppReactionLevel } from "./reaction-level.js";
 import { sendReactionWhatsApp } from "./send.js";
@@ -25,10 +25,7 @@ export async function handleWhatsAppAction(
 
   if (action === "react") {
     const accountId = readStringParam(params, "accountId");
-    if (!whatsAppConfig) {
-      throw new Error("WhatsApp reactions are disabled.");
-    }
-    if (!isActionEnabled("reactions")) {
+    if (!whatsAppConfig || !isActionEnabled("reactions")) {
       throw new Error("WhatsApp reactions are disabled.");
     }
     const reactionLevelInfo = resolveWhatsAppReactionLevel({
@@ -64,6 +61,7 @@ export async function handleWhatsAppAction(
       fromMe,
       participant: participant ?? undefined,
       accountId: resolved.accountId,
+      cfg,
     });
     if (!remove && !isEmpty) {
       return jsonResult({ ok: true, added: emoji });

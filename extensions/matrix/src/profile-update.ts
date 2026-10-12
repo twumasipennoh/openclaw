@@ -1,6 +1,7 @@
 import { normalizeAccountId } from "openclaw/plugin-sdk/account-id";
 import { updateMatrixOwnProfile } from "./matrix/actions/profile.js";
 import { updateMatrixAccountConfig, resolveMatrixConfigPath } from "./matrix/config-update.js";
+import type { MatrixProfileSyncResult } from "./matrix/profile.js";
 import { getMatrixRuntime } from "./runtime.js";
 import type { CoreConfig } from "./types.js";
 
@@ -8,13 +9,7 @@ export type MatrixProfileUpdateResult = {
   accountId: string;
   displayName: string | null;
   avatarUrl: string | null;
-  profile: {
-    displayNameUpdated: boolean;
-    avatarUpdated: boolean;
-    resolvedAvatarUrl: string | null;
-    uploadedAvatarSource: "http" | "path" | null;
-    convertedAvatarFromHttp: boolean;
-  };
+  profile: Omit<MatrixProfileSyncResult, "skipped">;
   configPath: string;
 };
 
@@ -27,7 +22,7 @@ export async function applyMatrixProfileUpdate(params: {
   mediaLocalRoots?: readonly string[];
 }): Promise<MatrixProfileUpdateResult> {
   const runtime = getMatrixRuntime();
-  const persistedCfg = runtime.config.loadConfig() as CoreConfig;
+  const persistedCfg = runtime.config.current() as CoreConfig;
   const accountId = normalizeAccountId(params.account);
   const displayName = params.displayName?.trim() || null;
   const avatarUrl = params.avatarUrl?.trim() || null;
@@ -37,7 +32,7 @@ export async function applyMatrixProfileUpdate(params: {
   }
 
   const synced = await updateMatrixOwnProfile({
-    cfg: params.cfg,
+    cfg: params.cfg ?? persistedCfg,
     accountId,
     displayName: displayName ?? undefined,
     avatarUrl: avatarUrl ?? undefined,
@@ -50,19 +45,17 @@ export async function applyMatrixProfileUpdate(params: {
     name: displayName ?? undefined,
     avatarUrl: persistedAvatarUrl ?? undefined,
   });
-  await runtime.config.writeConfigFile(updated as never);
+  await runtime.config.replaceConfigFile({
+    nextConfig: updated as never,
+    afterWrite: { mode: "auto" },
+  });
+  const { skipped: _skipped, ...profile } = synced;
 
   return {
     accountId,
     displayName,
     avatarUrl: persistedAvatarUrl ?? null,
-    profile: {
-      displayNameUpdated: synced.displayNameUpdated,
-      avatarUpdated: synced.avatarUpdated,
-      resolvedAvatarUrl: synced.resolvedAvatarUrl,
-      uploadedAvatarSource: synced.uploadedAvatarSource,
-      convertedAvatarFromHttp: synced.convertedAvatarFromHttp,
-    },
+    profile,
     configPath: resolveMatrixConfigPath(updated, accountId),
   };
 }

@@ -1,266 +1,348 @@
 import { spawn } from "node:child_process";
-import { randomUUID } from "node:crypto";
-import fs from "node:fs/promises";
-import net from "node:net";
-import os from "node:os";
-import path from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
-import type { OpenClawConfig } from "openclaw/plugin-sdk/core";
-import { seedQaAgentWorkspace } from "./qa-agent-workspace.js";
-import { buildQaGatewayConfig } from "./qa-gateway-config.js";
+import { formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";
+import { closeQaRuntimeStores } from "openclaw/plugin-sdk/qa-runtime";
+import { runQaGatewayCliCommand } from "./gateway-child-command.js";
+import { QaGatewayChildLifecycle, type QaGatewayStopOptions } from "./gateway-child-lifecycle.js";
+import {
+  createQaGatewayChildLogAccess,
+  formatQaGatewayProcessBoundaryStartupFailure,
+  monitorQaGatewayChildFailure,
+  throwQaGatewayChildFailure,
+  type QaChildFailure,
+} from "./gateway-child-process.js";
+import {
+  isRetryableRpcStartupError,
+  QA_GATEWAY_CHILD_STARTUP_MAX_ATTEMPTS,
+  resolveQaGatewayStartupRetry,
+  waitForGatewayListening,
+  waitForGatewayReady,
+  waitForQaGatewayRestartBoundary,
+} from "./gateway-child-readiness.js";
+import {
+  prepareQaGatewayChild,
+  type QaGatewayChildParams,
+  type QaGatewayChildStateMutationContext,
+} from "./gateway-child-setup.js";
+import { startQaGatewayRpcClient } from "./gateway-rpc-client.js";
+import { readProcessTreeCpuMs, readProcessTreeRssBytes } from "./process-tree-cpu.js";
 
-async function getFreePort() {
-  return await new Promise<number>((resolve, reject) => {
-    const server = net.createServer();
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", () => {
-      const address = server.address();
-      if (!address || typeof address === "string") {
-        reject(new Error("failed to allocate port"));
-        return;
+export type { QaGatewayChildCommand } from "./gateway-child-command.js";
+export type { QaGatewayStopResult, QaGatewayStopOptions } from "./gateway-child-lifecycle.js";
+export type { QaGatewayChildListeningContext } from "./gateway-child-setup.js";
+export type { QaCliBackendAuthMode } from "./providers/env.js";
+export type QaGatewayChild = Awaited<ReturnType<typeof startOwnedGatewayChild>>;
+
+export function createQaGatewayChild() {
+  const lifetime = new QaGatewayChildLifecycle();
+  let started = false;
+  return {
+    start(params: QaGatewayChildParams) {
+      if (started) {
+        throw new Error("qa gateway child startup already requested");
       }
-      server.close((error) => (error ? reject(error) : resolve(address.port)));
-    });
-  });
-}
-
-function buildQaRuntimeEnv(params: {
-  configPath: string;
-  gatewayToken: string;
-  homeDir: string;
-  stateDir: string;
-  xdgConfigHome: string;
-  xdgDataHome: string;
-  xdgCacheHome: string;
-  providerMode?: "mock-openai" | "live-openai";
-}) {
-  const env: NodeJS.ProcessEnv = {
-    ...process.env,
-    HOME: params.homeDir,
-    OPENCLAW_HOME: params.homeDir,
-    OPENCLAW_CONFIG_PATH: params.configPath,
-    OPENCLAW_STATE_DIR: params.stateDir,
-    OPENCLAW_OAUTH_DIR: path.join(params.stateDir, "credentials"),
-    OPENCLAW_GATEWAY_TOKEN: params.gatewayToken,
-    OPENCLAW_SKIP_BROWSER_CONTROL_SERVER: "1",
-    OPENCLAW_SKIP_GMAIL_WATCHER: "1",
-    OPENCLAW_SKIP_CANVAS_HOST: "1",
-    OPENCLAW_NO_RESPAWN: "1",
-    OPENCLAW_TEST_FAST: "1",
-    XDG_CONFIG_HOME: params.xdgConfigHome,
-    XDG_DATA_HOME: params.xdgDataHome,
-    XDG_CACHE_HOME: params.xdgCacheHome,
+      started = true;
+      lifetime.repoRoot = params.repoRoot;
+      return lifetime.run(() => startOwnedGatewayChild(params, lifetime));
+    },
+    stop: (opts?: QaGatewayStopOptions) => lifetime.stop(opts),
   };
-  if (params.providerMode === "mock-openai") {
-    for (const key of [
-      "OPENAI_API_KEY",
-      "OPENAI_BASE_URL",
-      "GEMINI_API_KEY",
-      "GOOGLE_API_KEY",
-      "VOYAGE_API_KEY",
-      "MISTRAL_API_KEY",
-      "AWS_ACCESS_KEY_ID",
-      "AWS_SECRET_ACCESS_KEY",
-      "AWS_SESSION_TOKEN",
-      "AWS_REGION",
-      "AWS_BEARER_TOKEN_BEDROCK",
-    ]) {
-      delete env[key];
-    }
-  }
-  return env;
 }
 
-async function waitForGatewayReady(baseUrl: string, logs: () => string, timeoutMs = 30_000) {
-  const startedAt = Date.now();
-  while (Date.now() - startedAt < timeoutMs) {
-    try {
-      const response = await fetch(`${baseUrl}/healthz`);
-      if (response.ok) {
-        return;
-      }
-    } catch {
-      // retry until timeout
-    }
-    await sleep(250);
-  }
-  throw new Error(`gateway failed to become healthy:\n${logs()}`);
-}
-
-async function runCliJson(params: { cwd: string; env: NodeJS.ProcessEnv; args: string[] }) {
-  const stdout: Buffer[] = [];
-  const stderr: Buffer[] = [];
-  await new Promise<void>((resolve, reject) => {
-    const child = spawn(process.execPath, params.args, {
-      cwd: params.cwd,
-      env: params.env,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    child.stdout.on("data", (chunk) => stdout.push(Buffer.from(chunk)));
-    child.stderr.on("data", (chunk) => stderr.push(Buffer.from(chunk)));
-    child.once("error", reject);
-    child.once("exit", (code) => {
-      if (code === 0) {
-        resolve();
-        return;
-      }
-      reject(
-        new Error(
-          `gateway cli failed (${code ?? "unknown"}): ${Buffer.concat(stderr).toString("utf8")}`,
-        ),
-      );
-    });
-  });
-  const text = Buffer.concat(stdout).toString("utf8").trim();
-  return text ? (JSON.parse(text) as unknown) : {};
-}
-
-export async function startQaGatewayChild(params: {
-  repoRoot: string;
-  providerBaseUrl?: string;
-  qaBusBaseUrl: string;
-  providerMode?: "mock-openai" | "live-openai";
-  primaryModel?: string;
-  alternateModel?: string;
-  fastMode?: boolean;
-  controlUiEnabled?: boolean;
-}) {
-  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-qa-suite-"));
-  const workspaceDir = path.join(tempRoot, "workspace");
-  const stateDir = path.join(tempRoot, "state");
-  const homeDir = path.join(tempRoot, "home");
-  const xdgConfigHome = path.join(tempRoot, "xdg-config");
-  const xdgDataHome = path.join(tempRoot, "xdg-data");
-  const xdgCacheHome = path.join(tempRoot, "xdg-cache");
-  const configPath = path.join(tempRoot, "openclaw.json");
-  const gatewayPort = await getFreePort();
-  const gatewayToken = `qa-suite-${randomUUID()}`;
-  await seedQaAgentWorkspace({
+async function startOwnedGatewayChild(
+  params: QaGatewayChildParams,
+  lifetime: QaGatewayChildLifecycle,
+) {
+  const setup = await prepareQaGatewayChild(params, lifetime);
+  const {
+    output,
+    logs,
+    stdoutLog,
+    stderrLog,
+    nodeExecPath,
+    gatewayCwd,
+    cliArgsPrefix,
     workspaceDir,
-    repoRoot: params.repoRoot,
-  });
-  await Promise.all([
-    fs.mkdir(stateDir, { recursive: true }),
-    fs.mkdir(homeDir, { recursive: true }),
-    fs.mkdir(xdgConfigHome, { recursive: true }),
-    fs.mkdir(xdgDataHome, { recursive: true }),
-    fs.mkdir(xdgCacheHome, { recursive: true }),
-  ]);
-  const cfg = buildQaGatewayConfig({
-    bind: "loopback",
-    gatewayPort,
-    gatewayToken,
-    providerBaseUrl: params.providerBaseUrl,
-    qaBusBaseUrl: params.qaBusBaseUrl,
-    workspaceDir,
-    providerMode: params.providerMode,
-    primaryModel: params.primaryModel,
-    alternateModel: params.alternateModel,
-    fastMode: params.fastMode,
-    controlUiEnabled: params.controlUiEnabled,
-  });
-  await fs.writeFile(configPath, `${JSON.stringify(cfg, null, 2)}\n`, "utf8");
-
-  const stdout: Buffer[] = [];
-  const stderr: Buffer[] = [];
-  const env = buildQaRuntimeEnv({
+    stateDir,
+    tempRoot,
     configPath,
     gatewayToken,
-    homeDir,
-    stateDir,
-    xdgConfigHome,
-    xdgDataHome,
-    xdgCacheHome,
-    providerMode: params.providerMode,
-  });
-
-  const child = spawn(
-    process.execPath,
-    [
-      "dist/index.js",
-      "gateway",
-      "run",
-      "--port",
-      String(gatewayPort),
-      "--bind",
-      "loopback",
-      "--allow-unconfigured",
-    ],
-    {
-      cwd: params.repoRoot,
-      env,
-      stdio: ["ignore", "pipe", "pipe"],
-    },
-  );
-  child.stdout.on("data", (chunk) => stdout.push(Buffer.from(chunk)));
-  child.stderr.on("data", (chunk) => stderr.push(Buffer.from(chunk)));
-
-  const baseUrl = `http://127.0.0.1:${gatewayPort}`;
-  const wsUrl = `ws://127.0.0.1:${gatewayPort}`;
-  const logs = () =>
-    `${Buffer.concat(stdout).toString("utf8")}\n${Buffer.concat(stderr).toString("utf8")}`.trim();
-  const keepTemp = process.env.OPENCLAW_QA_KEEP_TEMP === "1";
-
-  try {
-    await waitForGatewayReady(baseUrl, logs);
-  } catch (error) {
-    child.kill("SIGTERM");
-    throw error;
+  } = setup;
+  let active!: ReturnType<QaGatewayChildLifecycle["register"]>;
+  let getChildFailure: (() => QaChildFailure | null) | undefined;
+  let launch!: Awaited<ReturnType<typeof setup.prepareAttempt>>;
+  const requireRpcClient = () => {
+    if (!lifetime.rpcClient) {
+      throw new Error("qa gateway rpc client is not ready");
+    }
+    return lifetime.rpcClient;
+  };
+  const throwActiveChildFailure = () => {
+    lifetime.assertOpen();
+    throwQaGatewayChildFailure(getChildFailure, logs);
+  };
+  const stopAttempt = async (startupError?: unknown) => {
+    const result = await lifetime.stopProcess();
+    const errors = [...result.errors];
+    try {
+      await lifetime.rpcClient?.stop();
+    } catch (error) {
+      errors.push(error);
+    }
+    lifetime.rpcClient = null;
+    if (errors.length) {
+      throw new AggregateError(
+        startupError === undefined ? errors : [startupError, ...errors],
+        "qa gateway attempt cleanup failed",
+        { cause: startupError },
+      );
+    }
+  };
+  const launchReady = async (initial: boolean, attempt = 1) => {
+    lifetime.assertOpen();
+    const gatewayArgs = setup.buildGatewayArgs();
+    const prepared = lifetime.controller
+      ? await lifetime.controller.prepare({ args: gatewayArgs, cwd: gatewayCwd, env: launch.env })
+      : null;
+    lifetime.assertOpen();
+    const child = spawn(nodeExecPath, gatewayArgs, {
+      cwd: gatewayCwd,
+      env: prepared?.env ?? launch.env,
+      detached: process.platform !== "win32",
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    // Register synchronously: acceptance/readiness may reject with descendants
+    // still alive, and replacement must immediately supersede its stopped parent.
+    active = lifetime.register(child, prepared);
+    for (const [stream, label, log] of [
+      [child.stdout, "stdout", stdoutLog],
+      [child.stderr, "stderr", stderrLog],
+    ] as const) {
+      stream.on("data", (chunk) => {
+        const buffer = Buffer.from(chunk);
+        output.push(label, buffer);
+        log.write(buffer);
+      });
+    }
+    getChildFailure = monitorQaGatewayChildFailure(child, output);
+    active.checkFailure = () => throwQaGatewayChildFailure(getChildFailure, logs);
+    try {
+      if (prepared && lifetime.controller) {
+        active.identity = await lifetime.controller.accept({ child, prepared });
+        lifetime.assertOpen();
+        await lifetime.controller.signal(active.identity, "SIGCONT");
+      }
+    } catch (error) {
+      throw new Error(formatQaGatewayProcessBoundaryStartupFailure(error, logs()), {
+        cause: error,
+      });
+    }
+    lifetime.assertOpen();
+    const health = { baseUrl: launch.baseUrl, logs, child, getChildFailure, timeoutMs: 120_000 };
+    if (initial) {
+      await waitForGatewayListening(health);
+      lifetime.assertOpen();
+      await params.onListening?.({
+        attempt,
+        baseUrl: launch.baseUrl,
+        wsUrl: launch.wsUrl,
+        token: gatewayToken,
+        configPath,
+        runtimeEnv: launch.env,
+      });
+    }
+    if (!initial || !params.allowUnhealthyStartup) {
+      await waitForGatewayReady(health);
+    }
+    lifetime.assertOpen();
+    lifetime.rpcClient = await startQaGatewayRpcClient({
+      wsUrl: launch.wsUrl,
+      token: gatewayToken,
+      logs,
+    });
+    for (let rpcAttempt = 1; ; rpcAttempt += 1) {
+      lifetime.assertOpen();
+      try {
+        await lifetime.rpcClient.request("config.get", {}, { timeoutMs: 30_000 });
+        break;
+      } catch (error) {
+        if (rpcAttempt >= 4 || !isRetryableRpcStartupError(error)) {
+          throw error;
+        }
+        await sleep(500 * rpcAttempt);
+        await waitForGatewayReady({ ...health, timeoutMs: initial ? 60_000 : 15_000 });
+      }
+    }
+    throwActiveChildFailure();
+    if (active.identity && lifetime.controller) {
+      await lifetime.controller.markReady(active.identity);
+    }
+    lifetime.assertOpen();
+    active.ready = true;
+  };
+  let migrationConvergenceRestartUsed = false;
+  let reuseStartupLaunchState = false;
+  for (let attempt = 1; attempt <= QA_GATEWAY_CHILD_STARTUP_MAX_ATTEMPTS; attempt += 1) {
+    launch = await setup.prepareAttempt(reuseStartupLaunchState);
+    const attemptLogMark = output.mark();
+    try {
+      await launchReady(true, attempt);
+      break;
+    } catch (error) {
+      const attemptLogs = output.readRedactedSince(attemptLogMark);
+      const retry = resolveQaGatewayStartupRetry({
+        attempt,
+        details: attemptLogs.trim() ? attemptLogs : formatErrorMessage(error),
+        migrationConvergenceRestartUsed,
+      });
+      const retryableRpcStartup =
+        attempt < QA_GATEWAY_CHILD_STARTUP_MAX_ATTEMPTS &&
+        !retry &&
+        isRetryableRpcStartupError(error);
+      if (!retry && !retryableRpcStartup) {
+        throw error;
+      }
+      await stopAttempt(error);
+      lifetime.assertOpen();
+      migrationConvergenceRestartUsed =
+        retry?.migrationConvergenceRestartUsed ?? migrationConvergenceRestartUsed;
+      reuseStartupLaunchState = retry?.reuseLaunchState ?? false;
+      const retryMessage =
+        retry?.kind === "migration-convergence-restart"
+          ? `[qa-lab] gateway child startup attempt ${attempt}/${QA_GATEWAY_CHILD_STARTUP_MAX_ATTEMPTS} completed plugin migration convergence; restarting once with the same state, config, and port ${launch.gatewayPort}\n`
+          : `[qa-lab] gateway child startup attempt ${attempt}/${QA_GATEWAY_CHILD_STARTUP_MAX_ATTEMPTS} hit a transient startup race on port ${launch.gatewayPort}; retrying with a new port\n`;
+      const retryBuffer = Buffer.from(retryMessage);
+      output.push("internal", retryBuffer);
+      stdoutLog.write(retryBuffer);
+    }
   }
+  const { cfg, baseUrl, wsUrl, env: runningEnv } = launch;
+  const signalActiveProcess = async (signal: NodeJS.Signals) => {
+    if (active.identity && lifetime.controller) {
+      if (signal !== "SIGUSR2" && signal !== "SIGQUIT") {
+        throw new Error(`unsupported verified gateway signal: ${signal}`);
+      }
+      await lifetime.controller.signal(active.identity, signal);
+      return;
+    }
+    if (!active.child.pid) {
+      throw new Error("qa gateway child has no pid");
+    }
+    process.kill(active.child.pid, signal);
+  };
 
   return {
     cfg,
     baseUrl,
     wsUrl,
+    get evidenceIdentity() {
+      return lifetime.rpcClient?.evidenceIdentity ?? null;
+    },
+    get pid() {
+      return active.identity?.pid ?? active.child.pid ?? null;
+    },
+    getProcessCpuMs: () => readProcessTreeCpuMs(active.identity?.pid ?? active.child.pid ?? null),
+    getProcessRssBytes: () =>
+      readProcessTreeRssBytes(active.identity?.pid ?? active.child.pid ?? null),
     token: gatewayToken,
     workspaceDir,
     tempRoot,
     configPath,
-    runtimeEnv: env,
+    runtimeEnv: runningEnv,
+    // Keep companion CLI calls inside the same packaged/runtime wrapper as the Gateway.
+    // Process-boundary launchers also own the isolated runtime UID and state permissions.
+    cliCommand: params.command
+      ? { executablePath: nodeExecPath, argsPrefix: [...cliArgsPrefix], cwd: gatewayCwd }
+      : undefined,
     logs,
+    ...createQaGatewayChildLogAccess(output),
+    runCli(args: readonly string[]) {
+      throwActiveChildFailure();
+      return runQaGatewayCliCommand({
+        lifetime,
+        executablePath: nodeExecPath,
+        argsPrefix: cliArgsPrefix,
+        args,
+        cwd: gatewayCwd,
+        env: runningEnv,
+      });
+    },
+    async signalProcess(signal: NodeJS.Signals) {
+      throwActiveChildFailure();
+      await signalActiveProcess(signal);
+    },
+    async restart(signal: NodeJS.Signals = "SIGUSR2") {
+      throwActiveChildFailure();
+      const restartLogMark = output.mark();
+      await signalActiveProcess(signal);
+      if (signal === "SIGUSR2") {
+        await waitForQaGatewayRestartBoundary({
+          readLogsSince: (mark) => output.readSince(mark),
+          mark: restartLogMark,
+        });
+        await waitForGatewayReady({
+          baseUrl,
+          logs,
+          child: active.child,
+          getChildFailure,
+          timeoutMs: 120_000,
+        });
+      }
+    },
+    restartAfterStateMutation(
+      mutateState: (context: QaGatewayChildStateMutationContext) => Promise<void>,
+    ) {
+      return lifetime.run(async () => {
+        throwActiveChildFailure();
+        await stopAttempt();
+        await mutateState({ configPath, runtimeEnv: runningEnv, stateDir, tempRoot });
+        // Mutation can reopen parent stores; release them before child startup maintenance.
+        await closeQaRuntimeStores(tempRoot);
+        const replacementLogMark = output.mark();
+        try {
+          await launchReady(false);
+        } catch (error) {
+          const retry = resolveQaGatewayStartupRetry({
+            attempt: 1,
+            details: [output.readRedactedSince(replacementLogMark), formatErrorMessage(error)].join(
+              "\n",
+            ),
+            migrationConvergenceRestartUsed: false,
+          });
+          if (retry?.kind !== "migration-convergence-restart") {
+            throw error;
+          }
+          await stopAttempt(error);
+          const retryBuffer = Buffer.from(
+            "[qa-lab] replacement gateway completed plugin migration convergence; restarting once with the same state, config, and port\n",
+          );
+          output.push("internal", retryBuffer);
+          stdoutLog.write(retryBuffer);
+          await launchReady(false);
+        }
+      });
+    },
     async call(
       method: string,
       rpcParams?: unknown,
-      opts?: { expectFinal?: boolean; timeoutMs?: number },
+      opts?: { deadlineMs?: number; expectFinal?: boolean; timeoutMs?: number },
     ) {
-      return await runCliJson({
-        cwd: params.repoRoot,
-        env,
-        args: [
-          "dist/index.js",
-          "gateway",
-          "call",
-          method,
-          "--url",
-          wsUrl,
-          "--token",
-          gatewayToken,
-          "--json",
-          "--timeout",
-          String(opts?.timeoutMs ?? 20_000),
-          ...(opts?.expectFinal ? ["--expect-final"] : []),
-          "--params",
-          JSON.stringify(rpcParams ?? {}),
-        ],
-      }).catch((error) => {
-        const details = error instanceof Error ? error.message : String(error);
-        throw new Error(`${details}\nGateway logs:\n${logs()}`);
-      });
-    },
-    async stop(opts?: { keepTemp?: boolean }) {
-      if (!child.killed) {
-        child.kill("SIGTERM");
-        await Promise.race([
-          new Promise<void>((resolve) => child.once("exit", () => resolve())),
-          sleep(5_000).then(() => {
-            if (!child.killed) {
-              child.kill("SIGKILL");
-            }
-          }),
-        ]);
+      throwActiveChildFailure();
+      try {
+        // The RPC client owns unsent reconnects; replaying a sent call can repeat committed work.
+        return await requireRpcClient().request(method, rpcParams, opts);
+      } catch (error) {
+        throwActiveChildFailure();
+        throw error;
       }
-      if (!(opts?.keepTemp ?? keepTemp)) {
-        await fs.rm(tempRoot, { recursive: true, force: true });
+    },
+    async stop(opts?: QaGatewayStopOptions) {
+      const result = await lifetime.stop(opts);
+      if (result.errors.length) {
+        throw new AggregateError(
+          result.errors,
+          `qa gateway child cleanup failed: ${result.errors.map(formatErrorMessage).join("; ")}`,
+        );
       }
     },
   };

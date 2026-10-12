@@ -1,8 +1,11 @@
-import { resolveManifestProviderApiKeyChoice } from "../plugins/provider-auth-choices.js";
-import { normalizeTokenProviderInput } from "./auth-choice.apply-helpers.js";
-import type { ApplyAuthChoiceParams, ApplyAuthChoiceResult } from "./auth-choice.apply.js";
+// Token-provider normalization hooks for provider-backed auth choices.
+import { normalizeOptionalLowercaseString } from "@openclaw/normalization-core/string-coerce";
+import { resolveProviderMatch } from "../plugins/provider-auth-choice-helpers.js";
+import { resolvePluginProviders } from "../plugins/provider-auth-choice.runtime.js";
+import type { ApplyAuthChoiceParams } from "./auth-choice.apply.types.js";
 import type { AuthChoice } from "./onboard-types.js";
 
+/** Translate generic api-key/token choices to provider-specific auth choices when possible. */
 export function normalizeApiKeyTokenProviderAuthChoice(params: {
   authChoice: AuthChoice;
   tokenProvider?: string;
@@ -10,34 +13,29 @@ export function normalizeApiKeyTokenProviderAuthChoice(params: {
   workspaceDir?: string;
   env?: NodeJS.ProcessEnv;
 }): AuthChoice {
-  if (!params.tokenProvider) {
-    return params.authChoice;
-  }
-  const normalizedTokenProvider = normalizeTokenProviderInput(params.tokenProvider);
+  const normalizedTokenProvider = normalizeOptionalLowercaseString(params.tokenProvider);
   if (!normalizedTokenProvider) {
     return params.authChoice;
   }
-  if (
-    (params.authChoice === "token" || params.authChoice === "setup-token") &&
-    normalizedTokenProvider === "anthropic"
-  ) {
-    return "setup-token";
-  }
-  if (params.authChoice !== "apiKey") {
+  const kind =
+    params.authChoice === "apiKey"
+      ? "api_key"
+      : params.authChoice === "token" || params.authChoice === "setup-token"
+        ? "token"
+        : undefined;
+  if (!kind) {
     return params.authChoice;
   }
-  return (
-    (resolveManifestProviderApiKeyChoice({
-      providerId: normalizedTokenProvider,
+  const provider = resolveProviderMatch(
+    resolvePluginProviders({
       config: params.config,
       workspaceDir: params.workspaceDir,
       env: params.env,
-    })?.choiceId as AuthChoice | undefined) ?? params.authChoice
+      mode: "setup",
+    }),
+    normalizedTokenProvider,
   );
-}
-
-export async function applyAuthChoiceApiProviders(
-  _params: ApplyAuthChoiceParams,
-): Promise<ApplyAuthChoiceResult | null> {
-  return null;
+  return (
+    provider?.auth.find((method) => method.kind === kind)?.wizard?.choiceId ?? params.authChoice
+  );
 }

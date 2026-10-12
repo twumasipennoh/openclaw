@@ -1,31 +1,13 @@
-import type { MsgContext } from "../auto-reply/templating.js";
-import type { GroupKeyResolution, SessionEntry } from "../config/sessions/types.js";
+// Inbound channel session recorder and last-route updater.
+import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
+import { normalizeSessionKeyPreservingOpaquePeerIds } from "../sessions/session-key-utils.js";
+import { createLazyRuntimeModule } from "../shared/lazy-runtime.js";
+import type { InboundLastRouteUpdate, RecordInboundSession } from "./session.types.js";
 
-let inboundSessionRuntimePromise: Promise<
-  typeof import("../config/sessions/inbound.runtime.js")
-> | null = null;
-
-function loadInboundSessionRuntime() {
-  inboundSessionRuntimePromise ??= import("../config/sessions/inbound.runtime.js");
-  return inboundSessionRuntimePromise;
-}
-
-function normalizeSessionStoreKey(sessionKey: string): string {
-  return sessionKey.trim().toLowerCase();
-}
-
-export type InboundLastRouteUpdate = {
-  sessionKey: string;
-  channel: SessionEntry["lastChannel"];
-  to: string;
-  accountId?: string;
-  threadId?: string | number;
-  mainDmOwnerPin?: {
-    ownerRecipient: string;
-    senderRecipient: string;
-    onSkip?: (params: { ownerRecipient: string; senderRecipient: string }) => void;
-  };
-};
+// Keep session persistence lazy so channel SDK type paths do not load disk writers.
+const loadInboundSessionRuntime = createLazyRuntimeModule(
+  () => import("../config/sessions/inbound.runtime.js"),
+);
 
 function shouldSkipPinnedMainDmRouteUpdate(
   pin: InboundLastRouteUpdate["mainDmOwnerPin"] | undefined,
@@ -33,8 +15,8 @@ function shouldSkipPinnedMainDmRouteUpdate(
   if (!pin) {
     return false;
   }
-  const owner = pin.ownerRecipient.trim().toLowerCase();
-  const sender = pin.senderRecipient.trim().toLowerCase();
+  const owner = normalizeLowercaseStringOrEmpty(pin.ownerRecipient);
+  const sender = normalizeLowercaseStringOrEmpty(pin.senderRecipient);
   if (!owner || !sender || owner === sender) {
     return false;
   }
@@ -42,27 +24,30 @@ function shouldSkipPinnedMainDmRouteUpdate(
   return true;
 }
 
-export async function recordInboundSession(params: {
-  storePath: string;
-  sessionKey: string;
-  ctx: MsgContext;
-  groupResolution?: GroupKeyResolution | null;
-  createIfMissing?: boolean;
-  updateLastRoute?: InboundLastRouteUpdate;
-  onRecordError: (err: unknown) => void;
-}): Promise<void> {
+export async function recordInboundSession(
+  params: Parameters<RecordInboundSession>[0],
+): Promise<void> {
+  // Session keys may contain opaque peer ids; preserve case-sensitive payloads while normalizing shape.
   const { storePath, sessionKey, ctx, groupResolution, createIfMissing } = params;
-  const canonicalSessionKey = normalizeSessionStoreKey(sessionKey);
+  const canonicalSessionKey = normalizeSessionKeyPreservingOpaquePeerIds(sessionKey);
   const runtime = await loadInboundSessionRuntime();
-  void runtime
-    .recordSessionMetaFromInbound({
-      storePath,
-      sessionKey: canonicalSessionKey,
-      ctx,
-      groupResolution,
-      createIfMissing,
-    })
-    .catch(params.onRecordError);
+  const write = runtime.recordInboundSessionMeta({
+    storePath,
+    sessionKey: canonicalSessionKey,
+    ctx,
+    groupResolution,
+    createIfMissing,
+  });
+  const metaTask = write.catch(async (err: unknown) => {
+    try {
+      await Promise.resolve(params.onRecordError(err));
+    } catch {
+      // Error reporting must not reject the tracked metadata task.
+    }
+  });
+  params.trackSessionMetaTask?.(metaTask);
+  // Dispatch needs the writer settled, but best-effort reporting stays with its tracker.
+  await write.catch(() => undefined);
 
   const update = params.updateLastRoute;
   if (!update) {
@@ -71,10 +56,11 @@ export async function recordInboundSession(params: {
   if (shouldSkipPinnedMainDmRouteUpdate(update.mainDmOwnerPin)) {
     return;
   }
-  const targetSessionKey = normalizeSessionStoreKey(update.sessionKey);
-  await runtime.updateLastRoute({
+  const targetSessionKey = normalizeSessionKeyPreservingOpaquePeerIds(update.sessionKey);
+  await runtime.updateSessionLastRoute({
     storePath,
     sessionKey: targetSessionKey,
+    route: update.route,
     deliveryContext: {
       channel: update.channel,
       to: update.to,
@@ -84,5 +70,6 @@ export async function recordInboundSession(params: {
     // Avoid leaking inbound origin metadata into a different target session.
     ctx: targetSessionKey === canonicalSessionKey ? ctx : undefined,
     groupResolution,
+    createIfMissing,
   });
 }

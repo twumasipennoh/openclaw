@@ -1,39 +1,32 @@
-import { hasMeaningfulChannelConfig } from "../channels/config-presence.js";
+// Determines whether a channel is configured from bootstrap and plugin state.
 import { getBootstrapChannelPlugin } from "../channels/plugins/bootstrap-registry.js";
-import { hasBundledChannelConfiguredState } from "../channels/plugins/configured-state.js";
-import { hasBundledChannelPersistedAuthState } from "../channels/plugins/persisted-auth-state.js";
-import { isRecord } from "../utils.js";
-import type { OpenClawConfig } from "./config.js";
+import {
+  hasBundledChannelPackageState,
+  listBundledChannelIdsForPackageState,
+} from "../channels/plugins/package-state-probes.js";
+import {
+  hasMeaningfulChannelConfigShallow,
+  resolveChannelConfigRecord,
+} from "./channel-config-activation.js";
+import type { OpenClawConfig } from "./types.openclaw.js";
 
-function resolveChannelConfig(
-  cfg: OpenClawConfig,
-  channelId: string,
-): Record<string, unknown> | null {
-  const channels = cfg.channels as Record<string, unknown> | undefined;
-  const entry = channels?.[channelId];
-  return isRecord(entry) ? entry : null;
-}
-
-function isGenericChannelConfigured(cfg: OpenClawConfig, channelId: string): boolean {
-  const entry = resolveChannelConfig(cfg, channelId);
-  return hasMeaningfulChannelConfig(entry);
-}
-
+/** Resolves whether a channel has enough config, env, or plugin state to be considered setup. */
 export function isChannelConfigured(
   cfg: OpenClawConfig,
   channelId: string,
   env: NodeJS.ProcessEnv = process.env,
 ): boolean {
-  if (hasBundledChannelConfiguredState({ channelId, cfg, env })) {
+  // Treat explicit persisted config as configured before consulting channel-specific env/state
+  // probes; user-authored config should win over inferred setup state.
+  if (hasMeaningfulChannelConfigShallow(resolveChannelConfigRecord(cfg, channelId), channelId)) {
     return true;
   }
-  const pluginPersistedAuthState = hasBundledChannelPersistedAuthState({ channelId, cfg, env });
-  if (pluginPersistedAuthState) {
-    return true;
+  // Declared bootstrap metadata owns negative results too. Runtime credential
+  // hooks must not turn saved auth or a different ambient env into activation intent.
+  if (listBundledChannelIdsForPackageState("configuredState").includes(channelId.trim())) {
+    return hasBundledChannelPackageState({ metadataKey: "configuredState", channelId, cfg, env });
   }
-  if (isGenericChannelConfigured(cfg, channelId)) {
-    return true;
-  }
+  // Bootstrap plugins cover channels that are available before full plugin registry loading.
   const plugin = getBootstrapChannelPlugin(channelId);
   return Boolean(plugin?.config?.hasConfiguredState?.({ cfg, env }));
 }

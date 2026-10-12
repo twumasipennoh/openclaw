@@ -1,29 +1,9 @@
 import { describe, expect, it } from "vitest";
-import {
-  getAccountConfig,
-  listAccountIds,
-  resolveDefaultTwitchAccountId,
-  resolveTwitchAccountContext,
-} from "./config.js";
+import { getAccountConfig, resolveTwitchAccountContext, twitchConfigAdapter } from "./config.js";
+
+const { listAccountIds } = twitchConfigAdapter;
 
 describe("getAccountConfig", () => {
-  const mockMultiAccountConfig = {
-    channels: {
-      twitch: {
-        accounts: {
-          default: {
-            username: "testbot",
-            accessToken: "oauth:test123",
-          },
-          secondary: {
-            username: "secondbot",
-            accessToken: "oauth:secondary",
-          },
-        },
-      },
-    },
-  };
-
   const mockSimplifiedConfig = {
     channels: {
       twitch: {
@@ -33,53 +13,41 @@ describe("getAccountConfig", () => {
     },
   };
 
-  it("returns account config for valid account ID (multi-account)", () => {
-    const result = getAccountConfig(mockMultiAccountConfig, "default");
-
-    expect(result).not.toBeNull();
-    expect(result?.username).toBe("testbot");
-  });
-
   it("returns account config for default account (simplified config)", () => {
     const result = getAccountConfig(mockSimplifiedConfig, "default");
 
-    expect(result).not.toBeNull();
     expect(result?.username).toBe("testbot");
   });
 
-  it("returns non-default account from multi-account config", () => {
-    const result = getAccountConfig(mockMultiAccountConfig, "secondary");
+  it("normalizes account ids without reading inherited account properties", () => {
+    const accounts = Object.create({
+      inherited: {
+        username: "inherited-bot",
+        accessToken: "oauth:inherited",
+      },
+    }) as Record<string, unknown>;
+    accounts.Secondary = {
+      username: "secondbot",
+      accessToken: "oauth:secondary",
+    };
 
-    expect(result).not.toBeNull();
-    expect(result?.username).toBe("secondbot");
-  });
+    const cfg = {
+      channels: {
+        twitch: {
+          accounts,
+        },
+      },
+    };
 
-  it("returns null for non-existent account ID", () => {
-    const result = getAccountConfig(mockMultiAccountConfig, "nonexistent");
-
-    expect(result).toBeNull();
+    expect(getAccountConfig(cfg, "SECONDARY\r\n")).toEqual({
+      username: "secondbot",
+      accessToken: "oauth:secondary",
+    });
+    expect(getAccountConfig(cfg, "inherited")).toBeNull();
   });
 
   it("returns null when core config is null", () => {
     const result = getAccountConfig(null, "default");
-
-    expect(result).toBeNull();
-  });
-
-  it("returns null when core config is undefined", () => {
-    const result = getAccountConfig(undefined, "default");
-
-    expect(result).toBeNull();
-  });
-
-  it("returns null when channels are not defined", () => {
-    const result = getAccountConfig({}, "default");
-
-    expect(result).toBeNull();
-  });
-
-  it("returns null when twitch is not defined", () => {
-    const result = getAccountConfig({ channels: {} }, "default");
 
     expect(result).toBeNull();
   });
@@ -92,6 +60,10 @@ describe("getAccountConfig", () => {
 });
 
 describe("listAccountIds", () => {
+  it("does not invent a default account when Twitch is unconfigured", () => {
+    expect(listAccountIds({})).toEqual([]);
+  });
+
   it("includes the implicit default account from simplified config", () => {
     expect(
       listAccountIds({
@@ -120,23 +92,32 @@ describe("listAccountIds", () => {
       } as Parameters<typeof listAccountIds>[0]),
     ).toEqual(["default", "secondary"]);
   });
-});
 
-describe("resolveDefaultTwitchAccountId", () => {
-  it("prefers channels.twitch.defaultAccount when configured", () => {
+  it("normalizes configured account ids", () => {
     expect(
-      resolveDefaultTwitchAccountId({
+      listAccountIds({
         channels: {
           twitch: {
-            defaultAccount: "secondary",
             accounts: {
-              default: { username: "default" },
-              secondary: { username: "secondary" },
+              Secondary: { username: "secondbot" },
+              "Alerts\r\n\u001b[31m": { username: "alerts" },
             },
           },
         },
-      } as Parameters<typeof resolveDefaultTwitchAccountId>[0]),
-    ).toBe("secondary");
+      } as Parameters<typeof listAccountIds>[0]),
+    ).toEqual(["alerts-31m", "secondary"]);
+  });
+
+  it("preserves an explicitly present empty root credential as an implicit account", () => {
+    expect(
+      listAccountIds({
+        channels: {
+          twitch: {
+            username: "",
+          },
+        },
+      } as Parameters<typeof listAccountIds>[0]),
+    ).toEqual(["default"]);
   });
 });
 
@@ -162,5 +143,33 @@ describe("resolveTwitchAccountContext", () => {
 
     expect(context.accountId).toBe("secondary");
     expect(context.account?.username).toBe("second-bot");
+  });
+
+  it("keeps account and token lookup aligned after account id normalization", () => {
+    const context = resolveTwitchAccountContext(
+      {
+        channels: {
+          twitch: {
+            accounts: {
+              Secondary: {
+                username: "second-bot",
+                accessToken: "oauth:second-token",
+                clientId: "second-client",
+                channel: "#second",
+              },
+            },
+          },
+        },
+      } as Parameters<typeof resolveTwitchAccountContext>[0],
+      "secondary",
+    );
+
+    expect(context.accountId).toBe("secondary");
+    expect(context.account?.username).toBe("second-bot");
+    expect(context.tokenResolution).toEqual({
+      token: "oauth:second-token",
+      source: "config",
+    });
+    expect(context.configured).toBe(true);
   });
 });

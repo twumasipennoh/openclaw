@@ -1,8 +1,11 @@
-import type { Message } from "@grammyjs/types";
-import { createDedupeCache } from "openclaw/plugin-sdk/core";
+import type { Message } from "grammy/types";
+import { createDedupeCache } from "openclaw/plugin-sdk/dedupe-runtime";
+import type { TelegramAmbientTranscriptWatermark } from "./bot-message-context.types.js";
 import type { TelegramContext } from "./bot/types.js";
 
 const MEDIA_GROUP_TIMEOUT_MS = 500;
+// Starved per-member gaps reached ~1 s; Telegram albums contain at most 10 members.
+const MEDIA_GROUP_MAX_HOLD_MS = 20_000;
 const RECENT_TELEGRAM_UPDATE_TTL_MS = 5 * 60_000;
 const RECENT_TELEGRAM_UPDATE_MAX = 2000;
 
@@ -11,6 +14,8 @@ export type MediaGroupEntry = {
     msg: Message;
     ctx: TelegramContext;
   }>;
+  promptContextMinTimestampMs?: number;
+  promptContextAmbientWatermark?: TelegramAmbientTranscriptWatermark;
   timer: ReturnType<typeof setTimeout>;
 };
 
@@ -25,6 +30,7 @@ export type TelegramUpdateKeyContext = {
   update_id?: number;
   message?: Message;
   channelPost?: Message;
+  editedMessage?: Message;
   editedChannelPost?: Message;
   callbackQuery?: { id?: string; message?: Message };
 };
@@ -41,18 +47,25 @@ export const buildTelegramUpdateKey = (ctx: TelegramUpdateKeyContext) => {
   if (callbackId) {
     return `callback:${callbackId}`;
   }
+  const editedMsg =
+    ctx.editedMessage ??
+    ctx.editedChannelPost ??
+    ctx.update?.edited_message ??
+    ctx.update?.edited_channel_post;
+  const editedChatId = editedMsg?.chat?.id;
+  const editedMessageId = editedMsg?.message_id;
+  if (editedChatId !== undefined && typeof editedMessageId === "number") {
+    return `edited-message:${editedChatId}:${editedMessageId}`;
+  }
   const msg =
     ctx.message ??
     ctx.channelPost ??
-    ctx.editedChannelPost ??
     ctx.update?.message ??
-    ctx.update?.edited_message ??
     ctx.update?.channel_post ??
-    ctx.update?.edited_channel_post ??
     ctx.callbackQuery?.message;
   const chatId = msg?.chat?.id;
   const messageId = msg?.message_id;
-  if (typeof chatId !== "undefined" && typeof messageId === "number") {
+  if (chatId !== undefined && typeof messageId === "number") {
     return `message:${chatId}:${messageId}`;
   }
   return undefined;
@@ -64,4 +77,4 @@ export const createTelegramUpdateDedupe = () =>
     maxSize: RECENT_TELEGRAM_UPDATE_MAX,
   });
 
-export { MEDIA_GROUP_TIMEOUT_MS };
+export { MEDIA_GROUP_MAX_HOLD_MS, MEDIA_GROUP_TIMEOUT_MS };

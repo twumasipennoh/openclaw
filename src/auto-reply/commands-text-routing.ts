@@ -1,33 +1,13 @@
-import { listChannelPlugins } from "../channels/plugins/index.js";
-import { getActivePluginChannelRegistryVersion } from "../plugins/runtime.js";
+/** Text-command routing decisions for surfaces that may also support native commands. */
+import { normalizeOptionalLowercaseString } from "@openclaw/normalization-core/string-coerce";
+import { getLoadedChannelPluginById } from "../channels/plugins/registry-loaded.js";
 import type { ShouldHandleTextCommandsParams } from "./commands-registry.types.js";
 
-let cachedNativeCommandSurfaces: Set<string> | null = null;
-let cachedNativeCommandSurfacesVersion = -1;
-
-export function isNativeCommandSurface(surface?: string): boolean {
-  const normalized = surface?.trim().toLowerCase();
-  if (!normalized) {
-    return false;
-  }
-  const registryVersion = getActivePluginChannelRegistryVersion();
-  if (!cachedNativeCommandSurfaces || cachedNativeCommandSurfacesVersion !== registryVersion) {
-    cachedNativeCommandSurfaces = new Set(
-      listChannelPlugins()
-        .filter((plugin) => plugin.capabilities?.nativeCommands === true)
-        .map((plugin) => plugin.id),
-    );
-    cachedNativeCommandSurfacesVersion = registryVersion;
-  }
-  return cachedNativeCommandSurfaces.has(normalized);
-}
-
+/** Decides whether text slash commands remain active for the current surface/config pair. */
 export function shouldHandleTextCommands(params: ShouldHandleTextCommandsParams): boolean {
-  if (params.commandSource === "native") {
+  if (params.commandSource === "native" || params.cfg.commands?.text !== false) {
     return true;
   }
-  if (params.cfg.commands?.text !== false) {
-    return true;
-  }
-  return !isNativeCommandSurface(params.surface);
+  const surface = normalizeOptionalLowercaseString(params.surface);
+  return !surface || getLoadedChannelPluginById(surface)?.capabilities?.nativeCommands !== true;
 }

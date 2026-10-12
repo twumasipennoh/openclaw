@@ -1,43 +1,91 @@
-import { Type } from "@sinclair/typebox";
+import {
+  optionalPositiveIntegerSchema,
+  readPositiveIntegerParam,
+} from "openclaw/plugin-sdk/channel-actions";
 import type { ChannelAgentTool } from "openclaw/plugin-sdk/channel-contract";
+import type { OpenClawPluginApi, OpenClawPluginToolContext } from "openclaw/plugin-sdk/core";
+import { readNonBlankString } from "openclaw/plugin-sdk/string-coerce-runtime";
+import { textResult } from "openclaw/plugin-sdk/tool-results";
+import { Type } from "typebox";
 import { startWebLoginWithQr, waitForWebLogin } from "../login-qr-api.js";
 
-export function createWhatsAppLoginTool(): ChannelAgentTool {
+const QR_DATA_URL_MAX_LENGTH = 16_384;
+
+export function createWhatsAppLoginTool(
+  context: OpenClawPluginToolContext,
+): ChannelAgentTool | null {
+  if (context.senderIsOwner !== true) {
+    return null;
+  }
   return {
     label: "WhatsApp Login",
     name: "whatsapp_login",
-    ownerOnly: true,
     description: "Generate a WhatsApp QR code for linking, or wait for the scan to complete.",
-    // NOTE: Using Type.Unsafe for action enum instead of Type.Union([Type.Literal(...)]
-    // because Claude API on Vertex AI rejects nested anyOf schemas as invalid JSON Schema.
     parameters: Type.Object({
-      action: Type.Unsafe<"start" | "wait">({
-        type: "string",
-        enum: ["start", "wait"],
-      }),
-      timeoutMs: Type.Optional(Type.Number()),
+      action: Type.Enum(["start", "wait"], { type: "string" }),
+      timeoutMs: optionalPositiveIntegerSchema(),
       force: Type.Optional(Type.Boolean()),
+      accountId: Type.Optional(Type.String()),
+      currentQrDataUrl: Type.Optional(
+        Type.String({
+          maxLength: QR_DATA_URL_MAX_LENGTH,
+          // llama.cpp rejects a whole tool catalog when a model-facing pattern
+          // lacks either anchor; real QR images also require a nonempty payload.
+          pattern: "^data:image/png;base64,.+$",
+        }),
+      ),
     }),
-    execute: async (_toolCallId, args) => {
+    execute: async (_toolCallId, args, signal) => {
+      const beforeCredentialPersistence = async () => {
+        context.assertInvocationCurrent?.();
+        if (!signal || signal.aborted) {
+          throw new Error("WhatsApp login authority is no longer active.");
+        }
+      };
+      const renderQrReply = (params: {
+        message: string;
+        qrDataUrl: string;
+        connected?: boolean;
+      }) => {
+        const text = [
+          params.message,
+          "",
+          "Open WhatsApp → Linked Devices and scan:",
+          "",
+          `![whatsapp-qr](${params.qrDataUrl})`,
+        ].join("\n");
+        return textResult(text, {
+          connected: params.connected ?? false,
+          qr: true,
+        });
+      };
+
       const action = (args as { action?: string })?.action ?? "start";
+      const accountId = readNonBlankString((args as { accountId?: unknown }).accountId);
+      const timeoutMs = readPositiveIntegerParam(args as Record<string, unknown>, "timeoutMs");
       if (action === "wait") {
         const result = await waitForWebLogin({
-          timeoutMs:
-            typeof (args as { timeoutMs?: unknown }).timeoutMs === "number"
-              ? (args as { timeoutMs?: number }).timeoutMs
-              : undefined,
+          accountId,
+          timeoutMs,
+          currentQrDataUrl: readNonBlankString(
+            (args as { currentQrDataUrl?: unknown }).currentQrDataUrl,
+          ),
         });
-        return {
-          content: [{ type: "text", text: result.message }],
-          details: { connected: result.connected },
-        };
+        if (result.qrDataUrl) {
+          return renderQrReply({
+            message: result.message,
+            qrDataUrl: result.qrDataUrl,
+            connected: result.connected,
+          });
+        }
+        return textResult(result.message, { connected: result.connected });
       }
 
+      await beforeCredentialPersistence();
       const result = await startWebLoginWithQr({
-        timeoutMs:
-          typeof (args as { timeoutMs?: unknown }).timeoutMs === "number"
-            ? (args as { timeoutMs?: number }).timeoutMs
-            : undefined,
+        accountId,
+        timeoutMs,
+        beforeCredentialPersistence,
         force:
           typeof (args as { force?: unknown }).force === "boolean"
             ? (args as { force?: boolean }).force
@@ -45,28 +93,21 @@ export function createWhatsAppLoginTool(): ChannelAgentTool {
       });
 
       if (!result.qrDataUrl) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: result.message,
-            },
-          ],
-          details: { qr: false },
-        };
+        return textResult(result.message, { qr: false });
       }
 
-      const text = [
-        result.message,
-        "",
-        "Open WhatsApp → Linked Devices and scan:",
-        "",
-        `![whatsapp-qr](${result.qrDataUrl})`,
-      ].join("\n");
-      return {
-        content: [{ type: "text", text }],
-        details: { qr: true },
-      };
+      return renderQrReply({
+        message: result.message,
+        qrDataUrl: result.qrDataUrl,
+        connected: result.connected,
+      });
     },
   };
+}
+
+export function registerWhatsAppLoginTool(api: OpenClawPluginApi): void {
+  api.registerTool(
+    { contextVersion: 2, create: (context) => createWhatsAppLoginTool(context) },
+    { name: "whatsapp_login" },
+  );
 }

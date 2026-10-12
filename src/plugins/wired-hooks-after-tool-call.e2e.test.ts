@@ -1,8 +1,11 @@
-import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+// Exercises wired plugin hooks after tool-call completion.
+import { beforeEach, describe, expect, it, vi } from "vitest";
 /**
- * Test: after_tool_call hook wiring (pi-embedded-subscribe.handlers.tools.ts)
+ * Test: after_tool_call hook wiring (embedded-agent-subscribe.handlers.tools.ts)
  */
-import { createBaseToolHandlerState } from "../agents/pi-tool-handler-state.test-helpers.js";
+import { createBaseToolHandlerState } from "../agents/agent-tool-handler-state.test-helpers.js";
+import { handleToolExecutionStart } from "../agents/embedded-agent-subscribe.handlers.tools.js";
+import { endTool } from "../agents/embedded-agent-subscribe.handlers.tools.test-support.js";
 
 const hookMocks = vi.hoisted(() => ({
   runner: {
@@ -18,7 +21,12 @@ vi.mock("../plugins/hook-runner-global.js", () => ({
 
 // Mock agent events (used by handlers)
 vi.mock("../infra/agent-events.js", () => ({
+  emitAgentCommandOutputEvent: vi.fn(),
+  emitAgentItemEvent: vi.fn(),
   emitAgentEvent: vi.fn(),
+  getAgentEventLifecycleGeneration: () => "test-generation",
+  isAgentEventLifecycleGenerationCurrent: (generation: string) => generation === "test-generation",
+  registerAgentEventLifecycleRotationHandler: vi.fn(),
 }));
 
 function createToolHandlerCtx(params: {
@@ -41,7 +49,7 @@ function createToolHandlerCtx(params: {
     state: {
       ...createBaseToolHandlerState(),
     },
-    log: { debug: vi.fn(), warn: vi.fn() },
+    log: { debug: vi.fn(), info: vi.fn(), warn: vi.fn() },
     flushBlockReplyBuffer: vi.fn(),
     shouldEmitToolResult: () => false,
     shouldEmitToolOutput: () => false,
@@ -77,30 +85,27 @@ function getAfterToolCallCall(index = 0) {
   };
 }
 
+function requireAfterToolCallCall(index = 0) {
+  const call = getAfterToolCallCall(index);
+  if (!call.event || !call.context) {
+    throw new Error(`missing after_tool_call payload at index ${index}`);
+  }
+  return { event: call.event, context: call.context };
+}
+
 function expectAfterToolCallPayload(params: {
   index?: number;
   expectedEvent: Record<string, unknown>;
   expectedContext: Record<string, unknown>;
 }) {
-  const { event, context } = getAfterToolCallCall(params.index);
-  expect(event).toBeDefined();
-  expect(context).toBeDefined();
-  if (!event || !context) {
-    throw new Error("missing hook call payload");
-  }
-  expect(event).toEqual(expect.objectContaining(params.expectedEvent));
-  expect(context).toEqual(expect.objectContaining(params.expectedContext));
+  const { event, context } = requireAfterToolCallCall(params.index);
+  const { durationMs, ...stableEvent } = event;
+  expect(typeof durationMs).toBe("number");
+  expect(stableEvent).toEqual(params.expectedEvent);
+  expect(context).toEqual(params.expectedContext);
 }
 
-let handleToolExecutionStart: typeof import("../agents/pi-embedded-subscribe.handlers.tools.js").handleToolExecutionStart;
-let handleToolExecutionEnd: typeof import("../agents/pi-embedded-subscribe.handlers.tools.js").handleToolExecutionEnd;
-
 describe("after_tool_call hook wiring", () => {
-  beforeAll(async () => {
-    ({ handleToolExecutionStart, handleToolExecutionEnd } =
-      await import("../agents/pi-embedded-subscribe.handlers.tools.js"));
-  });
-
   beforeEach(() => {
     hookMocks.runner.hasHooks.mockClear();
     hookMocks.runner.hasHooks.mockReturnValue(false);
@@ -130,7 +135,7 @@ describe("after_tool_call hook wiring", () => {
       } as never,
     );
 
-    await handleToolExecutionEnd(
+    await endTool(
       ctx as never,
       {
         type: "tool_execution_end",
@@ -150,6 +155,7 @@ describe("after_tool_call hook wiring", () => {
         error: undefined,
         runId: "test-run-1",
         toolCallId: "wired-hook-call-1",
+        result: { content: [{ type: "text", text: "file contents" }] },
       },
       expectedContext: {
         toolName: "read",
@@ -160,7 +166,6 @@ describe("after_tool_call hook wiring", () => {
         toolCallId: "wired-hook-call-1",
       },
     });
-    expect(typeof getAfterToolCallCall().event?.durationMs).toBe("number");
   });
 
   it("includes error in after_tool_call event on tool failure", async () => {
@@ -178,7 +183,7 @@ describe("after_tool_call hook wiring", () => {
       } as never,
     );
 
-    await handleToolExecutionEnd(
+    await endTool(
       ctx as never,
       {
         type: "tool_execution_end",
@@ -190,8 +195,9 @@ describe("after_tool_call hook wiring", () => {
     );
 
     expect(hookMocks.runner.runAfterToolCall).toHaveBeenCalledTimes(1);
-    expect(getAfterToolCallCall().event?.error).toBeDefined();
-    expect(getAfterToolCallCall().context?.agentId).toBeUndefined();
+    const { event, context } = requireAfterToolCallCall();
+    expect(event.error).toBe("command failed");
+    expect(context.agentId).toBeUndefined();
   });
 
   it("does not call runAfterToolCall when no hooks registered", async () => {
@@ -199,7 +205,7 @@ describe("after_tool_call hook wiring", () => {
 
     const ctx = createToolHandlerCtx({ runId: "r" });
 
-    await handleToolExecutionEnd(
+    await endTool(
       ctx as never,
       {
         type: "tool_execution_end",
@@ -249,7 +255,7 @@ describe("after_tool_call hook wiring", () => {
       } as never,
     );
 
-    await handleToolExecutionEnd(
+    await endTool(
       ctxA as never,
       {
         type: "tool_execution_end",
@@ -259,7 +265,7 @@ describe("after_tool_call hook wiring", () => {
         result: { content: [{ type: "text", text: "done-a" }] },
       } as never,
     );
-    await handleToolExecutionEnd(
+    await endTool(
       ctxB as never,
       {
         type: "tool_execution_end",
@@ -273,13 +279,41 @@ describe("after_tool_call hook wiring", () => {
     expect(hookMocks.runner.runAfterToolCall).toHaveBeenCalledTimes(2);
     expectAfterToolCallPayload({
       index: 0,
-      expectedEvent: { runId: "run-a", params: { path: "/tmp/path-a.txt" } },
-      expectedContext: {},
+      expectedEvent: {
+        toolName: "read",
+        params: { path: "/tmp/path-a.txt" },
+        runId: "run-a",
+        toolCallId: sharedToolCallId,
+        result: { content: [{ type: "text", text: "done-a" }] },
+        error: undefined,
+      },
+      expectedContext: {
+        toolName: "read",
+        agentId: "agent-a",
+        sessionKey: "session-a",
+        sessionId: "ephemeral-a",
+        runId: "run-a",
+        toolCallId: sharedToolCallId,
+      },
     });
     expectAfterToolCallPayload({
       index: 1,
-      expectedEvent: { runId: "run-b", params: { path: "/tmp/path-b.txt" } },
-      expectedContext: {},
+      expectedEvent: {
+        toolName: "read",
+        params: { path: "/tmp/path-b.txt" },
+        runId: "run-b",
+        toolCallId: sharedToolCallId,
+        result: { content: [{ type: "text", text: "done-b" }] },
+        error: undefined,
+      },
+      expectedContext: {
+        toolName: "read",
+        agentId: "agent-b",
+        sessionKey: "session-b",
+        sessionId: "ephemeral-b",
+        runId: "run-b",
+        toolCallId: sharedToolCallId,
+      },
     });
   });
 });

@@ -1,50 +1,43 @@
+import {
+  normalizeOptionalLowercaseString,
+  normalizeOptionalString,
+} from "@openclaw/normalization-core/string-coerce";
+import { normalizeUniqueSingleOrTrimmedStringList } from "@openclaw/normalization-core/string-normalization";
+import { getRuntimeConfigSnapshot } from "../../config/runtime-snapshot.js";
 import { tryLoadActivatedBundledPluginPublicSurfaceModuleSync } from "../../plugin-sdk/facade-runtime.js";
 import {
   parseRawSessionConversationRef,
   parseThreadSessionSuffix,
   type ParsedThreadSessionSuffix,
-  type RawSessionConversationRef,
 } from "../../sessions/session-key-utils.js";
-import { normalizeChannelId as normalizeChatChannelId } from "../registry.js";
-import { getChannelPlugin, normalizeChannelId as normalizeAnyChannelId } from "./registry.js";
+import { normalizeChatChannelId } from "../registry.js";
+import { getLoadedChannelPlugin, normalizeChannelId as normalizeAnyChannelId } from "./registry.js";
+import type { ChannelMessagingAdapter } from "./types.core.js";
 
-export type ResolvedSessionConversation = {
+type ResolvedSessionConversation = {
   id: string;
   threadId: string | undefined;
   baseConversationId: string;
   parentConversationCandidates: string[];
 };
 
-export type ResolvedSessionConversationRef = {
+type ResolvedSessionConversationRef = ResolvedSessionConversation & {
   channel: string;
   kind: "group" | "channel";
   rawId: string;
-  id: string;
-  threadId: string | undefined;
   baseSessionKey: string;
-  baseConversationId: string;
-  parentConversationCandidates: string[];
 };
 
-type SessionConversationHookResult = {
-  id: string;
-  threadId?: string | null;
-  baseConversationId?: string | null;
-  parentConversationCandidates?: string[];
-};
+type SessionConversationHookResult = ReturnType<
+  NonNullable<ChannelMessagingAdapter["resolveSessionConversation"]>
+>;
 
-type SessionConversationResolverParams = {
-  kind: "group" | "channel";
-  rawId: string;
-};
-
-type BundledSessionKeyModule = {
-  resolveSessionConversation?: (
-    params: SessionConversationResolverParams,
-  ) => SessionConversationHookResult | null;
-};
+type BundledSessionKeyModule = Pick<ChannelMessagingAdapter, "resolveSessionConversation">;
 
 const SESSION_KEY_API_ARTIFACT_BASENAME = "session-key-api.js";
+type SessionConversationResolutionOptions = {
+  bundledFallback?: boolean;
+};
 
 type NormalizedSessionConversationResolution = ResolvedSessionConversation & {
   hasExplicitParentConversationCandidates: boolean;
@@ -54,34 +47,18 @@ function normalizeResolvedChannel(channel: string): string {
   return (
     normalizeAnyChannelId(channel) ??
     normalizeChatChannelId(channel) ??
-    channel.trim().toLowerCase()
+    normalizeOptionalLowercaseString(channel) ??
+    ""
   );
 }
 
-function getMessagingAdapter(channel: string) {
+function getLoadedSessionChannelPlugin(channel: string) {
   const normalizedChannel = normalizeResolvedChannel(channel);
   try {
-    return getChannelPlugin(normalizedChannel)?.messaging;
+    return getLoadedChannelPlugin(normalizedChannel);
   } catch {
     return undefined;
   }
-}
-
-function dedupeConversationIds(values: Array<string | undefined | null>): string[] {
-  const seen = new Set<string>();
-  const resolved: string[] = [];
-  for (const value of values) {
-    if (typeof value !== "string") {
-      continue;
-    }
-    const trimmed = value.trim();
-    if (!trimmed || seen.has(trimmed)) {
-      continue;
-    }
-    seen.add(trimmed);
-    resolved.push(trimmed);
-  }
-  return resolved;
 }
 
 function buildGenericConversationResolution(rawId: string): ResolvedSessionConversation | null {
@@ -91,6 +68,8 @@ function buildGenericConversationResolution(rawId: string): ResolvedSessionConve
   }
 
   const parsed = parseThreadSessionSuffix(trimmed);
+  // Generic parsing treats `:thread:*` suffixes as child thread metadata while
+  // preserving the base conversation id for parent lookups.
   const id = (parsed.baseSessionKey ?? trimmed).trim();
   if (!id) {
     return null;
@@ -100,7 +79,7 @@ function buildGenericConversationResolution(rawId: string): ResolvedSessionConve
     id,
     threadId: parsed.threadId,
     baseConversationId: id,
-    parentConversationCandidates: dedupeConversationIds(
+    parentConversationCandidates: normalizeUniqueSingleOrTrimmedStringList(
       parsed.threadId ? [parsed.baseSessionKey] : [],
     ),
   };
@@ -113,16 +92,19 @@ function normalizeSessionConversationResolution(
     return null;
   }
 
+  const parentConversationCandidates = normalizeUniqueSingleOrTrimmedStringList(
+    resolved.parentConversationCandidates ?? [],
+  );
   return {
     id: resolved.id.trim(),
-    threadId: resolved.threadId?.trim() || undefined,
+    threadId: normalizeOptionalString(resolved.threadId),
+    // When plugins omit an explicit base id, prefer the last declared parent
+    // candidate so nested topic/thread routes still collapse to their parent.
     baseConversationId:
-      resolved.baseConversationId?.trim() ||
-      dedupeConversationIds(resolved.parentConversationCandidates ?? []).at(-1) ||
+      normalizeOptionalString(resolved.baseConversationId) ??
+      parentConversationCandidates.at(-1) ??
       resolved.id.trim(),
-    parentConversationCandidates: dedupeConversationIds(
-      resolved.parentConversationCandidates ?? [],
-    ),
+    parentConversationCandidates,
     hasExplicitParentConversationCandidates: Object.hasOwn(
       resolved,
       "parentConversationCandidates",
@@ -135,97 +117,111 @@ function resolveBundledSessionConversationFallback(params: {
   kind: "group" | "channel";
   rawId: string;
 }): NormalizedSessionConversationResolution | null {
-  const dirName = normalizeResolvedChannel(params.channel);
-  let resolveSessionConversation: BundledSessionKeyModule["resolveSessionConversation"];
-  try {
-    resolveSessionConversation =
-      tryLoadActivatedBundledPluginPublicSurfaceModuleSync<BundledSessionKeyModule>({
-        dirName,
-        artifactBasename: SESSION_KEY_API_ARTIFACT_BASENAME,
-      })?.resolveSessionConversation;
-  } catch {
+  if (isBundledSessionConversationFallbackDisabled(params.channel)) {
     return null;
   }
-  if (typeof resolveSessionConversation !== "function") {
+  const dirName = normalizeResolvedChannel(params.channel);
+  let loaded: BundledSessionKeyModule | null;
+  try {
+    loaded = tryLoadActivatedBundledPluginPublicSurfaceModuleSync<BundledSessionKeyModule>({
+      dirName,
+      artifactBasename: SESSION_KEY_API_ARTIFACT_BASENAME,
+    });
+  } catch {
+    // Missing or inactive bundled artifacts are optional; callers still have
+    // plugin hooks and generic `:thread:` parsing as fallbacks.
+    return null;
+  }
+  const resolveSessionConversationLocal = loaded?.resolveSessionConversation;
+  if (typeof resolveSessionConversationLocal !== "function") {
     return null;
   }
 
   return normalizeSessionConversationResolution(
-    resolveSessionConversation({
+    resolveSessionConversationLocal({
       kind: params.kind,
       rawId: params.rawId,
     }),
   );
 }
 
-function resolveSessionConversationResolution(params: {
-  channel: string;
-  kind: "group" | "channel";
-  rawId: string;
-}): ResolvedSessionConversation | null {
-  const rawId = params.rawId.trim();
-  if (!rawId) {
-    return null;
+function isBundledSessionConversationFallbackDisabled(channel: string): boolean {
+  const snapshot = getRuntimeConfigSnapshot();
+  if (!snapshot?.plugins) {
+    return false;
   }
-
-  const messaging = getMessagingAdapter(params.channel);
-  const pluginResolved = normalizeSessionConversationResolution(
-    messaging?.resolveSessionConversation?.({
-      kind: params.kind,
-      rawId,
-    }),
-  );
-  const resolved =
-    pluginResolved ??
-    resolveBundledSessionConversationFallback({
-      channel: params.channel,
-      kind: params.kind,
-      rawId,
-    }) ??
-    buildGenericConversationResolution(rawId);
-  if (!resolved) {
-    return null;
+  if (snapshot.plugins.enabled === false) {
+    return true;
   }
-
-  const parentConversationCandidates = dedupeConversationIds(
-    pluginResolved?.hasExplicitParentConversationCandidates
-      ? resolved.parentConversationCandidates
-      : (messaging?.resolveParentConversationCandidates?.({
-          kind: params.kind,
-          rawId,
-        }) ?? resolved.parentConversationCandidates),
-  );
-  const baseConversationId =
-    parentConversationCandidates.at(-1) ?? resolved.baseConversationId ?? resolved.id;
-
-  return {
-    ...resolved,
-    baseConversationId,
-    parentConversationCandidates,
-  };
+  const entry = snapshot.plugins.entries?.[normalizeResolvedChannel(channel)];
+  return Boolean(entry) && typeof entry === "object" && entry.enabled === false;
 }
 
 export function resolveSessionConversation(params: {
   channel: string;
   kind: "group" | "channel";
   rawId: string;
+  bundledFallback?: boolean;
 }): ResolvedSessionConversation | null {
-  return resolveSessionConversationResolution(params);
-}
+  const rawId = params.rawId.trim();
+  if (!rawId) {
+    return null;
+  }
 
-function buildBaseSessionKey(raw: RawSessionConversationRef, id: string): string {
-  return `${raw.prefix}:${id}`;
+  const channelPlugin = getLoadedSessionChannelPlugin(params.channel);
+  const messaging = channelPlugin?.messaging;
+  const pluginResolved = normalizeSessionConversationResolution(
+    messaging?.resolveSessionConversation?.({
+      kind: params.kind,
+      rawId,
+    }),
+  );
+  const shouldTryBundledFallback =
+    params.bundledFallback !== false && !channelPlugin && rawId.includes(":");
+  // Loaded plugins own their grammar even when they omit messaging. Only absent
+  // registrations may borrow a pre-bootstrap artifact before generic parsing.
+  const resolved =
+    pluginResolved ??
+    (shouldTryBundledFallback
+      ? resolveBundledSessionConversationFallback({
+          channel: params.channel,
+          kind: params.kind,
+          rawId,
+        })
+      : null) ??
+    buildGenericConversationResolution(rawId);
+  if (!resolved) {
+    return null;
+  }
+
+  if (!pluginResolved?.hasExplicitParentConversationCandidates) {
+    const legacyParents = messaging?.resolveParentConversationCandidates?.({
+      kind: params.kind,
+      rawId,
+    });
+    if (legacyParents != null) {
+      resolved.parentConversationCandidates =
+        normalizeUniqueSingleOrTrimmedStringList(legacyParents);
+    }
+  }
+  resolved.baseConversationId =
+    resolved.parentConversationCandidates.at(-1) ?? resolved.baseConversationId ?? resolved.id;
+  return resolved;
 }
 
 export function resolveSessionConversationRef(
   sessionKey: string | undefined | null,
+  opts: SessionConversationResolutionOptions = {},
 ): ResolvedSessionConversationRef | null {
   const raw = parseRawSessionConversationRef(sessionKey);
   if (!raw) {
     return null;
   }
 
-  const resolved = resolveSessionConversation(raw);
+  const resolved = resolveSessionConversation({
+    ...raw,
+    bundledFallback: opts.bundledFallback,
+  });
   if (!resolved) {
     return null;
   }
@@ -236,7 +232,7 @@ export function resolveSessionConversationRef(
     rawId: raw.rawId,
     id: resolved.id,
     threadId: resolved.threadId,
-    baseSessionKey: buildBaseSessionKey(raw, resolved.id),
+    baseSessionKey: `${raw.prefix}:${resolved.id}`,
     baseConversationId: resolved.baseConversationId,
     parentConversationCandidates: resolved.parentConversationCandidates,
   };
@@ -244,14 +240,17 @@ export function resolveSessionConversationRef(
 
 export function resolveSessionThreadInfo(
   sessionKey: string | undefined | null,
+  opts: SessionConversationResolutionOptions = {},
 ): ParsedThreadSessionSuffix {
-  const resolved = resolveSessionConversationRef(sessionKey);
+  const resolved = resolveSessionConversationRef(sessionKey, opts);
   if (!resolved) {
     return parseThreadSessionSuffix(sessionKey);
   }
 
   return {
-    baseSessionKey: resolved.threadId ? resolved.baseSessionKey : sessionKey?.trim() || undefined,
+    baseSessionKey: resolved.threadId
+      ? resolved.baseSessionKey
+      : normalizeOptionalString(sessionKey),
     threadId: resolved.threadId,
   };
 }

@@ -1,141 +1,98 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import { createRuntimeEnv } from "../../../test/helpers/plugins/runtime-env.js";
-import type { OpenClawConfig, PluginRuntime, ResolvedLineAccount } from "../api.js";
-import { linePlugin } from "./channel.js";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { createPluginRuntimeMock } from "openclaw/plugin-sdk/channel-test-helpers";
+import { createRuntimeEnv } from "openclaw/plugin-sdk/plugin-test-runtime";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { OpenClawConfig } from "../api.js";
+import { resolveLineAccount } from "./accounts.js";
+import { lineGatewayAdapter } from "./gateway.js";
 import { setLineRuntime } from "./runtime.js";
 
-const DEFAULT_ACCOUNT_ID = "default";
-
-type LineRuntimeMocks = {
-  writeConfigFile: ReturnType<typeof vi.fn>;
-  resolveLineAccount: ReturnType<typeof vi.fn>;
-};
-
-function createRuntime(): { runtime: PluginRuntime; mocks: LineRuntimeMocks } {
-  const writeConfigFile = vi.fn(async () => {});
-  const resolveLineAccount = vi.fn(
-    ({ cfg, accountId }: { cfg: OpenClawConfig; accountId?: string }) => {
-      const lineConfig = (cfg.channels?.line ?? {}) as {
-        tokenFile?: string;
-        secretFile?: string;
-        channelAccessToken?: string;
-        channelSecret?: string;
-        accounts?: Record<string, Record<string, unknown>>;
-      };
-      const entry =
-        accountId && accountId !== DEFAULT_ACCOUNT_ID
-          ? (lineConfig.accounts?.[accountId] ?? {})
-          : lineConfig;
-      const hasToken =
-        // oxlint-disable-next-line typescript/no-explicit-any
-        Boolean((entry as any).channelAccessToken) || Boolean((entry as any).tokenFile);
-      // oxlint-disable-next-line typescript/no-explicit-any
-      const hasSecret = Boolean((entry as any).channelSecret) || Boolean((entry as any).secretFile);
-      return { tokenSource: hasToken && hasSecret ? "config" : "none" };
-    },
-  );
-
-  const runtime = {
-    config: { writeConfigFile },
-  } as unknown as PluginRuntime;
-
-  return { runtime, mocks: { writeConfigFile, resolveLineAccount } };
-}
-
-function resolveAccount(
-  resolveLineAccount: LineRuntimeMocks["resolveLineAccount"],
-  cfg: OpenClawConfig,
-  accountId: string,
-): ResolvedLineAccount {
-  const resolver = resolveLineAccount as unknown as (params: {
-    cfg: OpenClawConfig;
-    accountId?: string;
-  }) => ResolvedLineAccount;
-  return resolver({ cfg, accountId });
-}
-
-async function runLogoutScenario(params: { cfg: OpenClawConfig; accountId: string }): Promise<{
-  result: Awaited<ReturnType<NonNullable<NonNullable<typeof linePlugin.gateway>["logoutAccount"]>>>;
-  mocks: LineRuntimeMocks;
-}> {
-  const { runtime, mocks } = createRuntime();
+let tempDir: string;
+async function logout(cfg: OpenClawConfig, accountId = "default") {
+  const original = structuredClone(cfg);
+  const runtime = createPluginRuntimeMock();
   setLineRuntime(runtime);
-  const account = resolveAccount(mocks.resolveLineAccount, params.cfg, params.accountId);
-  const result = await linePlugin.gateway!.logoutAccount!({
-    accountId: params.accountId,
-    cfg: params.cfg,
-    account,
+  const result = await lineGatewayAdapter.logoutAccount!({
+    accountId,
+    cfg,
+    account: resolveLineAccount({ cfg, accountId }),
     runtime: createRuntimeEnv(),
   });
-  return { result, mocks };
+  expect(cfg).toEqual(original);
+  return { result, replace: vi.mocked(runtime.config.replaceConfigFile) };
 }
 
-describe("linePlugin gateway.logoutAccount", () => {
-  beforeEach(() => {
-    setLineRuntime(createRuntime().runtime);
+describe("LINE account logout", () => {
+  beforeEach(async () => {
+    vi.stubEnv("LINE_CHANNEL_ACCESS_TOKEN", "");
+    vi.stubEnv("LINE_CHANNEL_SECRET", "");
+    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-line-logout-"));
+  });
+  afterEach(async () => {
+    vi.unstubAllEnvs();
+    await fs.rm(tempDir, { recursive: true, force: true });
   });
 
-  it("clears tokenFile/secretFile on default account logout", async () => {
-    const cfg: OpenClawConfig = {
+  it("clears default file credentials and prunes the empty channel", async () => {
+    const { result, replace } = await logout({
       channels: {
         line: {
-          tokenFile: "/tmp/token",
-          secretFile: "/tmp/secret",
+          channelAccessToken: "",
+          channelSecret: "",
+          tokenFile: path.join(tempDir, "token"),
+          secretFile: path.join(tempDir, "secret"),
         },
       },
-    };
-    const { result, mocks } = await runLogoutScenario({
-      cfg,
-      accountId: DEFAULT_ACCOUNT_ID,
     });
-
-    expect(result.cleared).toBe(true);
-    expect(result.loggedOut).toBe(true);
-    expect(mocks.writeConfigFile).toHaveBeenCalledWith({});
+    expect(result).toEqual({ cleared: true, envToken: false, loggedOut: true });
+    expect(replace).toHaveBeenCalledWith({ nextConfig: {}, afterWrite: { mode: "auto" } });
   });
 
-  it("clears tokenFile/secretFile on account logout", async () => {
-    const cfg: OpenClawConfig = {
-      channels: {
-        line: {
-          accounts: {
-            primary: {
-              tokenFile: "/tmp/token",
-              secretFile: "/tmp/secret",
-            },
+  it("does not write when the account has no credential fields", async () => {
+    const { result, replace } = await logout(
+      {
+        channels: {
+          line: {
+            accounts: { primary: { name: "Primary" } },
           },
         },
       },
-    };
-    const { result, mocks } = await runLogoutScenario({
-      cfg,
-      accountId: "primary",
-    });
-
-    expect(result.cleared).toBe(true);
-    expect(result.loggedOut).toBe(true);
-    expect(mocks.writeConfigFile).toHaveBeenCalledWith({});
+      "primary",
+    );
+    expect(result).toEqual({ cleared: false, envToken: false, loggedOut: true });
+    expect(replace).not.toHaveBeenCalled();
   });
 
-  it("does not write config when account has no token/secret fields", async () => {
-    const cfg: OpenClawConfig = {
-      channels: {
-        line: {
-          accounts: {
-            primary: {
-              name: "Primary",
+  it("clears empty named credential fields and preserves sibling config", async () => {
+    const sibling = { channelAccessToken: "keep-token", name: "Other" };
+    const line = { name: "LINE", accounts: { primary: { name: "Primary" }, other: sibling } };
+    const { result, replace } = await logout(
+      {
+        channels: {
+          line: {
+            ...line,
+            accounts: {
+              ...line.accounts,
+              primary: {
+                ...line.accounts.primary,
+                channelAccessToken: "",
+                channelSecret: "",
+                tokenFile: "",
+                secretFile: "",
+              },
             },
           },
+          telegram: { enabled: false },
         },
       },
-    };
-    const { result, mocks } = await runLogoutScenario({
-      cfg,
-      accountId: "primary",
+      "primary",
+    );
+    expect(result).toEqual({ cleared: true, envToken: false, loggedOut: true });
+    expect(replace).toHaveBeenCalledExactlyOnceWith({
+      nextConfig: { channels: { line, telegram: { enabled: false } } },
+      afterWrite: { mode: "auto" },
     });
-
-    expect(result.cleared).toBe(false);
-    expect(result.loggedOut).toBe(true);
-    expect(mocks.writeConfigFile).not.toHaveBeenCalled();
   });
 });

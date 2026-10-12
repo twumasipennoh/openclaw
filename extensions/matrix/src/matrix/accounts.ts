@@ -1,18 +1,25 @@
 import { DEFAULT_ACCOUNT_ID, normalizeAccountId } from "openclaw/plugin-sdk/account-id";
 import { hasConfiguredSecretInput } from "openclaw/plugin-sdk/secret-input";
+import { normalizeOptionalString } from "openclaw/plugin-sdk/string-coerce-runtime";
 import {
   resolveConfiguredMatrixAccountIds,
   resolveMatrixDefaultOrOnlyAccountId,
 } from "../account-selection.js";
 import { resolveMatrixAccountStringValues } from "../auth-precedence.js";
-import { getMatrixScopedEnvVarNames } from "../env-vars.js";
 import type { CoreConfig, MatrixConfig } from "../types.js";
 import {
   findMatrixAccountConfig,
   resolveMatrixAccountConfig,
   resolveMatrixBaseConfig,
 } from "./account-config.js";
-import { credentialsMatchConfig, loadMatrixCredentials } from "./credentials-read.js";
+import { resolveGlobalMatrixEnvConfig, resolveScopedMatrixEnvConfig } from "./client/env-auth.js";
+import {
+  captureMatrixCredentialsEnv,
+  credentialsMatchConfig,
+  loadMatrixCredentials,
+  loadMatrixCredentialsAsync,
+} from "./credentials-read.js";
+import type { MatrixStoredCredentials } from "./credentials-state.js";
 
 export type ResolvedMatrixAccount = {
   accountId: string;
@@ -24,40 +31,8 @@ export type ResolvedMatrixAccount = {
   config: MatrixConfig;
 };
 
-type MatrixEnvConfig = {
-  homeserver: string;
-  userId: string;
-  accessToken?: string;
-  password?: string;
-  deviceId?: string;
-  deviceName?: string;
-};
-
 function clean(value: unknown): string {
-  return typeof value === "string" ? value.trim() : "";
-}
-
-function resolveGlobalMatrixEnvConfig(env: NodeJS.ProcessEnv): MatrixEnvConfig {
-  return {
-    homeserver: clean(env.MATRIX_HOMESERVER),
-    userId: clean(env.MATRIX_USER_ID),
-    accessToken: clean(env.MATRIX_ACCESS_TOKEN) || undefined,
-    password: clean(env.MATRIX_PASSWORD) || undefined,
-    deviceId: clean(env.MATRIX_DEVICE_ID) || undefined,
-    deviceName: clean(env.MATRIX_DEVICE_NAME) || undefined,
-  };
-}
-
-function resolveScopedMatrixEnvConfig(accountId: string, env: NodeJS.ProcessEnv): MatrixEnvConfig {
-  const keys = getMatrixScopedEnvVarNames(accountId);
-  return {
-    homeserver: clean(env[keys.homeserver]),
-    userId: clean(env[keys.userId]),
-    accessToken: clean(env[keys.accessToken]) || undefined,
-    password: clean(env[keys.password]) || undefined,
-    deviceId: clean(env[keys.deviceId]) || undefined,
-    deviceName: clean(env[keys.deviceName]) || undefined,
-  };
+  return normalizeOptionalString(value) ?? "";
 }
 
 function resolveMatrixAccountAuthView(params: {
@@ -102,23 +77,14 @@ function resolveMatrixAccountAuthView(params: {
   };
 }
 
-function resolveMatrixAccountUserId(params: {
-  cfg: CoreConfig;
-  accountId: string;
-  env?: NodeJS.ProcessEnv;
-}): string | null {
-  const env = params.env ?? process.env;
-  const authView = resolveMatrixAccountAuthView({
-    cfg: params.cfg,
-    accountId: params.accountId,
-    env,
-  });
+function resolveMatrixAccountUserId(
+  authView: ReturnType<typeof resolveMatrixAccountAuthView>,
+  stored: MatrixStoredCredentials | null,
+): string | null {
   const configuredUserId = authView.userId.trim();
   if (configuredUserId) {
     return configuredUserId;
   }
-
-  const stored = loadMatrixCredentials(env, params.accountId);
   if (!stored) {
     return null;
   }
@@ -136,51 +102,58 @@ export function listMatrixAccountIds(cfg: CoreConfig): string[] {
   return ids.length > 0 ? ids : [DEFAULT_ACCOUNT_ID];
 }
 
-export function resolveDefaultMatrixAccountId(cfg: CoreConfig): string {
-  return normalizeAccountId(resolveMatrixDefaultOrOnlyAccountId(cfg));
+export function resolveDefaultMatrixAccountId(
+  cfg: CoreConfig,
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  return normalizeAccountId(resolveMatrixDefaultOrOnlyAccountId(cfg, env));
 }
 
-export function resolveConfiguredMatrixBotUserIds(params: {
+export async function resolveConfiguredMatrixBotUserIds(params: {
   cfg: CoreConfig;
   accountId?: string | null;
   env?: NodeJS.ProcessEnv;
-}): Set<string> {
+  abortSignal?: AbortSignal;
+}): Promise<Set<string>> {
   const env = params.env ?? process.env;
   const currentAccountId = normalizeAccountId(params.accountId);
-  const accountIds = new Set(resolveConfiguredMatrixAccountIds(params.cfg, env));
-  if (resolveMatrixAccount({ cfg: params.cfg, accountId: DEFAULT_ACCOUNT_ID, env }).configured) {
-    accountIds.add(DEFAULT_ACCOUNT_ID);
-  }
+  const accountIds = new Set([
+    ...resolveConfiguredMatrixAccountIds(params.cfg, env),
+    DEFAULT_ACCOUNT_ID,
+  ]);
+  // Capture config/env facts before storage yields; each identity uses one credential observation.
+  const accounts = [...accountIds]
+    .filter((accountId) => normalizeAccountId(accountId) !== currentAccountId)
+    .map((accountId) => prepareMatrixAccount({ cfg: params.cfg, accountId, env }));
   const ids = new Set<string>();
-
-  for (const accountId of accountIds) {
-    if (normalizeAccountId(accountId) === currentAccountId) {
+  if (accounts.length === 0 || params.abortSignal?.aborted) {
+    return ids;
+  }
+  const credentialsEnv = captureMatrixCredentialsEnv(env);
+  for (const prepared of accounts) {
+    if (params.abortSignal?.aborted) {
+      break;
+    }
+    const stored = await loadMatrixCredentialsAsync(credentialsEnv, prepared.account.accountId);
+    if (!isMatrixAccountConfigured(prepared, stored)) {
       continue;
     }
-    if (!resolveMatrixAccount({ cfg: params.cfg, accountId, env }).configured) {
-      continue;
-    }
-    const userId = resolveMatrixAccountUserId({
-      cfg: params.cfg,
-      accountId,
-      env,
-    });
+    const userId = resolveMatrixAccountUserId(prepared.authView, stored);
     if (userId) {
       ids.add(userId);
     }
   }
-
   return ids;
 }
 
-export function resolveMatrixAccount(params: {
+function prepareMatrixAccount(params: {
   cfg: CoreConfig;
   accountId?: string | null;
   env?: NodeJS.ProcessEnv;
-}): ResolvedMatrixAccount {
+}) {
   const env = params.env ?? process.env;
   const accountId = normalizeAccountId(
-    params.accountId ?? resolveDefaultMatrixAccountId(params.cfg),
+    params.accountId ?? resolveDefaultMatrixAccountId(params.cfg, env),
   );
   const matrixBase = resolveMatrixBaseConfig(params.cfg);
   const base = resolveMatrixAccountConfig({ cfg: params.cfg, accountId, env });
@@ -202,7 +175,26 @@ export function resolveMatrixAccount(params: {
   const hasPassword = Boolean(authView.password);
   const hasPasswordAuth =
     hasUserId && (hasPassword || hasConfiguredSecretInput(explicitAuthConfig.password));
-  const stored = loadMatrixCredentials(env, accountId);
+  return {
+    authView,
+    hasHomeserver,
+    hasConfiguredAuth: hasAccessToken || hasPasswordAuth,
+    account: {
+      accountId,
+      enabled,
+      name: normalizeOptionalString(base.name),
+      homeserver: authView.homeserver || undefined,
+      userId: authView.userId || undefined,
+      config: base,
+    },
+  };
+}
+
+function isMatrixAccountConfigured(
+  prepared: ReturnType<typeof prepareMatrixAccount>,
+  stored: MatrixStoredCredentials | null,
+): boolean {
+  const { authView } = prepared;
   const hasStored =
     stored && authView.homeserver
       ? credentialsMatchConfig(stored, {
@@ -210,16 +202,36 @@ export function resolveMatrixAccount(params: {
           userId: authView.userId || "",
         })
       : false;
-  const configured = hasHomeserver && (hasAccessToken || hasPasswordAuth || Boolean(hasStored));
-  return {
-    accountId,
-    enabled,
-    name: base.name?.trim() || undefined,
-    configured,
-    homeserver: authView.homeserver || undefined,
-    userId: authView.userId || undefined,
-    config: base,
-  };
+  return prepared.hasHomeserver && (prepared.hasConfiguredAuth || hasStored);
+}
+
+export function resolveMatrixAccount(params: {
+  cfg: CoreConfig;
+  accountId?: string | null;
+  env?: NodeJS.ProcessEnv;
+}): ResolvedMatrixAccount {
+  const prepared = prepareMatrixAccount(params);
+  const stored =
+    prepared.hasHomeserver && !prepared.hasConfiguredAuth
+      ? loadMatrixCredentials(params.env ?? process.env, prepared.account.accountId)
+      : null;
+  return { ...prepared.account, configured: isMatrixAccountConfigured(prepared, stored) };
+}
+
+export async function resolveMatrixAccountAsync(params: {
+  cfg: CoreConfig;
+  accountId?: string | null;
+  env?: NodeJS.ProcessEnv;
+}): Promise<ResolvedMatrixAccount> {
+  const prepared = prepareMatrixAccount(params);
+  const stored =
+    prepared.hasHomeserver && !prepared.hasConfiguredAuth
+      ? await loadMatrixCredentialsAsync(
+          captureMatrixCredentialsEnv(params.env ?? process.env),
+          prepared.account.accountId,
+        )
+      : null;
+  return { ...prepared.account, configured: isMatrixAccountConfigured(prepared, stored) };
 }
 
 export { resolveMatrixAccountConfig } from "./account-config.js";

@@ -1,26 +1,30 @@
-import { ChannelType } from "@buape/carbon";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { installDiscordIngressTestRuntime } from "../test-support/ingress-runtime.js";
+
+installDiscordIngressTestRuntime();
+// Discord tests cover acp bind here.integration plugin behavior.
+import { beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
+import { ChannelType } from "../internal/discord.js";
 
 const loadConfigMock = vi.hoisted(() => vi.fn());
 
-vi.mock("openclaw/plugin-sdk/config-runtime", async () => {
-  const actual = await vi.importActual<typeof import("openclaw/plugin-sdk/config-runtime")>(
-    "openclaw/plugin-sdk/config-runtime",
-  );
+vi.mock("openclaw/plugin-sdk/runtime-config-snapshot", async () => {
+  const actual = await vi.importActual<
+    typeof import("openclaw/plugin-sdk/runtime-config-snapshot")
+  >("openclaw/plugin-sdk/runtime-config-snapshot");
   return {
     ...actual,
-    loadConfig: () => loadConfigMock(),
+    getRuntimeConfig: () => loadConfigMock(),
   };
 });
 
-import type { OpenClawConfig } from "openclaw/plugin-sdk/config-runtime";
+import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import {
   getSessionBindingService,
   registerSessionBindingAdapter,
   type SessionBindingBindInput,
   type SessionBindingRecord,
+  testing as sessionBindingTesting,
 } from "openclaw/plugin-sdk/conversation-runtime";
-import { __testing as sessionBindingTesting } from "openclaw/plugin-sdk/conversation-runtime";
 import { preflightDiscordMessage } from "./message-handler.preflight.js";
 import {
   createDiscordMessage,
@@ -29,11 +33,15 @@ import {
   type DiscordConfig,
   type DiscordMessageEvent,
 } from "./message-handler.preflight.test-helpers.js";
+import { createNoopThreadBindingManager } from "./thread-bindings.js";
 
 const baseCfg = {
   session: {
     mainKey: "main",
     scope: "per-sender",
+    threadBindings: {
+      enabled: true,
+    },
   },
   acp: {
     enabled: true,
@@ -41,13 +49,6 @@ const baseCfg = {
       enabled: true,
     },
     backend: "acpx",
-  },
-  channels: {
-    discord: {
-      threadBindings: {
-        enabled: true,
-      },
-    },
   },
 } satisfies OpenClawConfig;
 
@@ -137,7 +138,9 @@ describe("Discord ACP bind here end-to-end flow", () => {
   });
 
   it("routes the next Discord DM turn to an existing ACP session binding", async () => {
-    const adapter = createInMemoryDiscordBindingAdapter();
+    const threadBindings = createNoopThreadBindingManager("default");
+    onTestFinished(() => threadBindings.stop());
+    createInMemoryDiscordBindingAdapter();
     const binding = await getSessionBindingService().bind({
       targetSessionKey: "agent:codex:acp:test-session",
       targetKind: "session",
@@ -153,26 +156,6 @@ describe("Discord ACP bind here end-to-end flow", () => {
         agentId: "codex",
         label: "codex",
       },
-    });
-
-    expect(adapter.bindings).toHaveLength(1);
-    expect(binding).toMatchObject({
-      targetSessionKey: "agent:codex:acp:test-session",
-      conversation: {
-        channel: "discord",
-        accountId: "default",
-        conversationId: "user:user-1",
-        parentConversationId: "user:user-1",
-      },
-    });
-    expect(
-      getSessionBindingService().resolveByConversation({
-        channel: "discord",
-        accountId: "default",
-        conversationId: "user:user-1",
-      }),
-    )?.toMatchObject({
-      targetSessionKey: binding.targetSessionKey,
     });
 
     const message = createDiscordMessage({
@@ -199,12 +182,15 @@ describe("Discord ACP bind here end-to-end flow", () => {
         } as DiscordMessageEvent,
         client: createDmClient("dm-1"),
         botUserId: "bot-1",
+        threadBindings,
       }),
+      allowFrom: ["*"],
     });
 
-    expect(preflight).not.toBeNull();
     expect(preflight?.boundSessionKey).toBe(binding.targetSessionKey);
+    expect(preflight?.boundAgentId).toBe("codex");
     expect(preflight?.route.sessionKey).toBe(binding.targetSessionKey);
     expect(preflight?.route.agentId).toBe("codex");
+    expect(preflight?.threadBinding).toEqual(binding);
   });
 });

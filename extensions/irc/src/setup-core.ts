@@ -1,5 +1,10 @@
-import type { ChannelSetupAdapter, ChannelSetupInput } from "openclaw/plugin-sdk/channel-setup";
-import type { DmPolicy } from "openclaw/plugin-sdk/config-runtime";
+import {
+  defineChannelSetupContract,
+  type ChannelSetupAdapter,
+  type ChannelSetupInput,
+} from "openclaw/plugin-sdk/channel-setup";
+import type { DmPolicy } from "openclaw/plugin-sdk/config-contracts";
+import { parseTcpPort } from "openclaw/plugin-sdk/number-runtime";
 import { normalizeAccountId } from "openclaw/plugin-sdk/routing";
 import {
   applyAccountNameToChannelSection,
@@ -17,6 +22,12 @@ const setIrcTopLevelDmPolicy = createTopLevelChannelDmPolicySetter({
 const setIrcTopLevelAllowFrom = createTopLevelChannelAllowFromSetter({
   channel,
 });
+const validateIrcRequiredSetupInput = createSetupInputPresenceValidator({
+  whenNotUseEnv: [
+    { someOf: ["host"], message: "IRC requires host." },
+    { someOf: ["nick"], message: "IRC requires nick." },
+  ],
+});
 
 type IrcSetupInput = ChannelSetupInput & {
   host?: string;
@@ -29,16 +40,12 @@ type IrcSetupInput = ChannelSetupInput & {
   password?: string;
 };
 
-export function parsePort(raw: string, fallback: number): number {
-  const trimmed = raw.trim();
-  if (!trimmed) {
-    return fallback;
+function validateIrcPortInput(input: ChannelSetupInput): string | null {
+  const raw = (input as IrcSetupInput).port;
+  if (raw === undefined || raw === null || raw === "") {
+    return null;
   }
-  const parsed = Number.parseInt(trimmed, 10);
-  if (!Number.isFinite(parsed) || parsed < 1 || parsed > 65535) {
-    return fallback;
-  }
-  return parsed;
+  return parseTcpPort(String(raw)) !== null ? null : "IRC port must be between 1 and 65535.";
 }
 
 export function updateIrcAccountConfig(
@@ -83,7 +90,7 @@ export function setIrcGroupAccess(
     return updateIrcAccountConfig(cfg, accountId, { enabled: true, groupPolicy: policy });
   }
   const normalizedEntries = [
-    ...new Set(entries.map((entry) => normalizeGroupEntry(entry)).filter(Boolean)),
+    ...new Set(entries.flatMap((entry) => normalizeGroupEntry(entry) ?? [])),
   ];
   const groups = Object.fromEntries(normalizedEntries.map((entry) => [entry, {}]));
   return updateIrcAccountConfig(cfg, accountId, {
@@ -94,6 +101,7 @@ export function setIrcGroupAccess(
 }
 
 export const ircSetupAdapter: ChannelSetupAdapter = {
+  singleAccountKeysToMove: ["password"],
   resolveAccountId: ({ accountId }) => normalizeAccountId(accountId),
   applyAccountName: ({ cfg, accountId, name }) =>
     applyAccountNameToChannelSection({
@@ -102,12 +110,8 @@ export const ircSetupAdapter: ChannelSetupAdapter = {
       accountId,
       name,
     }),
-  validateInput: createSetupInputPresenceValidator({
-    whenNotUseEnv: [
-      { someOf: ["host"], message: "IRC requires host." },
-      { someOf: ["nick"], message: "IRC requires nick." },
-    ],
-  }),
+  validateInput: (params) =>
+    validateIrcRequiredSetupInput(params) ?? validateIrcPortInput(params.input),
   applyAccountConfig: ({ cfg, accountId, input }) => {
     const setupInput = input as IrcSetupInput;
     const namedConfig = applyAccountNameToChannelSection({
@@ -117,11 +121,13 @@ export const ircSetupAdapter: ChannelSetupAdapter = {
       name: setupInput.name,
     });
     const portInput =
-      typeof setupInput.port === "number" ? String(setupInput.port) : String(setupInput.port ?? "");
+      typeof setupInput.port === "number" ? String(setupInput.port) : (setupInput.port ?? "");
     const patch: Partial<IrcAccountConfig> = {
       enabled: true,
       host: setupInput.host?.trim(),
-      port: portInput ? parsePort(portInput, setupInput.tls === false ? 6667 : 6697) : undefined,
+      port: portInput
+        ? (parseTcpPort(portInput) ?? (setupInput.tls === false ? 6667 : 6697))
+        : undefined,
       tls: setupInput.tls,
       nick: setupInput.nick?.trim(),
       username: setupInput.username?.trim(),
@@ -137,3 +143,29 @@ export const ircSetupAdapter: ChannelSetupAdapter = {
     }) as CoreConfig;
   },
 };
+
+export const ircSetupContract = defineChannelSetupContract({
+  fields: {
+    host: { kind: "string", cli: { flags: "--host <host>", description: "IRC server host" } },
+    port: { kind: "string", cli: { flags: "--port <port>", description: "IRC server port" } },
+    tls: { kind: "boolean", cli: { flags: "--tls", description: "Use TLS for IRC" } },
+    nick: { kind: "string", cli: { flags: "--nick <nick>", description: "IRC nickname" } },
+    username: { kind: "string", cli: { flags: "--username <name>", description: "IRC username" } },
+    realname: { kind: "string", cli: { flags: "--realname <name>", description: "IRC real name" } },
+    channels: {
+      kind: "string-list",
+      cli: { flags: "--channels <names>", description: "IRC channels" },
+    },
+    password: {
+      kind: "string",
+      sensitive: true,
+      cli: { flags: "--password <password>", description: "IRC server password" },
+    },
+    useEnv: {
+      kind: "boolean",
+      cli: { flags: "--use-env", description: "Use IRC environment configuration" },
+      envVars: ["IRC_HOST", "IRC_NICK"],
+    },
+  },
+  legacyAdapter: ircSetupAdapter,
+});

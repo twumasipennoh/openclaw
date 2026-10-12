@@ -1,95 +1,78 @@
+import { resolveBasicAllowFromEntries } from "openclaw/plugin-sdk/allow-from";
 import {
+  createSetupTranslator,
+  patchChannelConfigForAccount,
+  promptResolvedAllowFrom,
+  resolveEntriesWithOptionalToken,
+  resolveSetupAccountId,
+  splitSetupEntries,
+  type ChannelSetupWizard,
   type OpenClawConfig,
   type WizardPrompter,
-  type ChannelSetupWizard,
 } from "openclaw/plugin-sdk/setup-runtime";
 import { formatDocsLink } from "openclaw/plugin-sdk/setup-tools";
+import { resolveDefaultDiscordAccountId, resolveDiscordAccountAllowFrom } from "./accounts.js";
 import { resolveDiscordChannelAllowlist } from "./resolve-channels.js";
 import { resolveDiscordUserAllowlist } from "./resolve-users.js";
-import {
-  resolveDefaultDiscordSetupAccountId,
-  resolveDiscordSetupAccountConfig,
-} from "./setup-account-state.js";
-import {
-  createDiscordSetupWizardBase,
-  DISCORD_TOKEN_HELP_LINES,
-  parseDiscordAllowFromId,
-  setDiscordGuildChannelAllowlist,
-} from "./setup-core.js";
-import {
-  promptLegacyChannelAllowFromForAccount,
-  resolveEntriesWithOptionalToken,
-} from "./setup-runtime-helpers.js";
+import { resolveDiscordSetupAccountConfig } from "./setup-account-state.js";
+import { createDiscordSetupWizardBase, parseDiscordAllowFromId } from "./setup-core.js";
 import { resolveDiscordToken } from "./token.js";
 
-const channel = "discord" as const;
+const t = createSetupTranslator();
 
-async function resolveDiscordAllowFromEntries(params: { token?: string; entries: string[] }) {
-  return await resolveEntriesWithOptionalToken({
-    token: params.token,
-    entries: params.entries,
-    buildWithoutToken: (input) => ({
-      input,
-      resolved: false,
-      id: null,
-    }),
-    resolveEntries: async ({ token, entries }) =>
-      (
-        await resolveDiscordUserAllowlist({
-          token,
-          entries,
-        })
-      ).map((entry) => ({
-        input: entry.input,
-        resolved: entry.resolved,
-        id: entry.id ?? null,
-      })),
-  });
-}
+const channel = "discord" as const;
 
 async function promptDiscordAllowFrom(params: {
   cfg: OpenClawConfig;
   prompter: WizardPrompter;
   accountId?: string;
 }): Promise<OpenClawConfig> {
-  return await promptLegacyChannelAllowFromForAccount({
-    cfg: params.cfg,
-    channel,
-    prompter: params.prompter,
+  const accountId = resolveSetupAccountId({
     accountId: params.accountId,
-    defaultAccountId: resolveDefaultDiscordSetupAccountId(params.cfg),
-    resolveAccount: (cfg, accountId) => resolveDiscordSetupAccountConfig({ cfg, accountId }),
-    noteTitle: "Discord allowlist",
-    noteLines: [
-      "Allowlist Discord DMs by username (we resolve to user ids).",
-      "Examples:",
+    defaultAccountId: resolveDefaultDiscordAccountId(params.cfg),
+  });
+  const account = resolveDiscordSetupAccountConfig({ cfg: params.cfg, accountId });
+  const noteTitle = t("wizard.discord.allowlistTitle");
+  await params.prompter.note(
+    [
+      t("wizard.discord.allowlistIntro"),
+      t("wizard.discord.examples"),
       "- 123456789012345678",
       "- @alice",
       "- alice#1234",
-      "Multiple entries: comma-separated.",
-      `Docs: ${formatDocsLink("/discord", "discord")}`,
-    ],
-    message: "Discord allowFrom (usernames or ids)",
+      t("wizard.discord.multipleEntries"),
+      t("wizard.channels.docs", { link: formatDocsLink("/discord", "discord") }),
+    ].join("\n"),
+    noteTitle,
+  );
+  const allowFrom = await promptResolvedAllowFrom({
+    prompter: params.prompter,
+    existing: resolveDiscordAccountAllowFrom({ cfg: params.cfg, accountId }) ?? [],
+    token: resolveDiscordToken(params.cfg, { accountId }).token,
+    message: t("wizard.discord.allowFromPrompt"),
     placeholder: "@alice, 123456789012345678",
+    label: noteTitle,
+    parseInputs: splitSetupEntries,
     parseId: parseDiscordAllowFromId,
-    invalidWithoutTokenNote: "Bot token missing; use numeric user ids (or mention form) only.",
-    resolveExisting: (account) => {
-      const config = account.config;
-      return config.allowFrom ?? config.dm?.allowFrom ?? [];
-    },
-    resolveToken: (account) =>
-      resolveDiscordToken(params.cfg, { accountId: account.accountId }).token,
+    invalidWithoutTokenNote: t("wizard.discord.allowFromInvalidWithoutToken"),
     resolveEntries: async ({ token, entries }) =>
-      (
-        await resolveDiscordUserAllowlist({
-          token,
-          entries,
-        })
-      ).map((entry) => ({
-        input: entry.input,
-        resolved: entry.resolved,
-        id: entry.id ?? null,
-      })),
+      await resolveBasicAllowFromEntries({
+        token,
+        entries,
+        resolveEntries: resolveDiscordUserAllowlist,
+      }),
+  });
+  return patchChannelConfigForAccount({
+    cfg: params.cfg,
+    channel,
+    accountId: account.accountId,
+    patch: {
+      allowFrom,
+      dm: {
+        ...account.config.dm,
+        enabled: typeof account.config.dm?.enabled === "boolean" ? account.config.dm.enabled : true,
+      },
+    },
   });
 }
 
@@ -108,28 +91,19 @@ async function resolveDiscordGroupAllowlist(params: {
       input,
       resolved: false,
     }),
-    resolveEntries: async ({ token, entries }) =>
-      await resolveDiscordChannelAllowlist({
-        token,
-        entries,
-      }),
+    resolveEntries: resolveDiscordChannelAllowlist,
   });
 }
 
 export const discordSetupWizard: ChannelSetupWizard = createDiscordSetupWizardBase({
   promptAllowFrom: promptDiscordAllowFrom,
   resolveAllowFromEntries: async ({ cfg, accountId, credentialValues, entries }) =>
-    await resolveDiscordAllowFromEntries({
+    await resolveBasicAllowFromEntries({
       token:
         resolveDiscordToken(cfg, { accountId }).token ||
         (typeof credentialValues.token === "string" ? credentialValues.token : ""),
       entries,
+      resolveEntries: resolveDiscordUserAllowlist,
     }),
-  resolveGroupAllowlist: async ({ cfg, accountId, credentialValues, entries }) =>
-    await resolveDiscordGroupAllowlist({
-      cfg,
-      accountId,
-      credentialValues,
-      entries,
-    }),
+  resolveGroupAllowlist: resolveDiscordGroupAllowlist,
 });

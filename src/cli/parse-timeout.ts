@@ -1,29 +1,29 @@
+// Shared CLI timeout parsers for millisecond flags and config-backed fallbacks.
+import { parseStrictPositiveInteger } from "@openclaw/normalization-core/number-coercion";
+
+/** Parse a positive millisecond timeout, returning undefined for absent or invalid input. */
 export function parseTimeoutMs(raw: unknown): number | undefined {
-  if (raw === undefined || raw === null) {
-    return undefined;
-  }
-  let value = Number.NaN;
-  if (typeof raw === "number") {
-    value = raw;
-  } else if (typeof raw === "bigint") {
-    value = Number(raw);
-  } else if (typeof raw === "string") {
-    const trimmed = raw.trim();
-    if (!trimmed) {
-      return undefined;
-    }
-    value = Number.parseInt(trimmed, 10);
-  }
-  return Number.isFinite(value) ? value : undefined;
+  return parseStrictPositiveInteger(typeof raw === "bigint" ? Number(raw) : raw);
 }
 
+function invalidTimeout(flagName: string, value?: string): Error {
+  const suffix = value ? ` Received: "${value}".` : "";
+  return new Error(
+    `Invalid ${flagName}. Use a positive millisecond value, e.g. ${flagName} 30000.${suffix}`,
+  );
+}
+
+/** Parse a positive timeout or return the supplied fallback for missing values. */
 export function parseTimeoutMsWithFallback(
   raw: unknown,
   fallbackMs: number,
   options: {
     invalidType?: "fallback" | "error";
+    // Each caller registers its own flag token; the rejection has to match it.
+    flagName?: string;
   } = {},
 ): number {
+  const flagName = options.flagName ?? "--timeout";
   if (raw === undefined || raw === null) {
     return fallbackMs;
   }
@@ -35,20 +35,16 @@ export function parseTimeoutMsWithFallback(
         ? String(raw)
         : null;
 
-  if (value === null) {
+  if (!value) {
     if (options.invalidType === "error") {
-      throw new Error("invalid --timeout");
+      throw invalidTimeout(flagName);
     }
     return fallbackMs;
   }
 
-  if (!value) {
-    return fallbackMs;
-  }
-
-  const parsed = Number.parseInt(value, 10);
-  if (!Number.isFinite(parsed) || parsed <= 0) {
-    throw new Error(`invalid --timeout: ${value}`);
+  const parsed = parseStrictPositiveInteger(value);
+  if (parsed === undefined) {
+    throw invalidTimeout(flagName, value);
   }
   return parsed;
 }

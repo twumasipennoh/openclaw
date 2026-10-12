@@ -1,15 +1,21 @@
-import { describe, expect, it } from "vitest";
-import entry from "./index.js";
-import setupEntry from "./setup-entry.js";
+import { expect, it, vi } from "vitest";
 
-describe("discord bundled entries", () => {
-  it("loads the channel plugin without importing the broad api barrel", () => {
-    const plugin = entry.loadChannelPlugin();
-    expect(plugin.id).toBe("discord");
-  });
+// mock-isolation: Import failure proves inspection never loads the activity runtime.
+vi.mock("./activities-api.js", () => {
+  throw new Error("activity runtime must not load during account inspection");
+});
+// mock-isolation: Import failure proves inspection never loads the voice runtime.
+vi.mock("./transcripts-source-api.js", () => {
+  throw new Error("voice runtime must not load during account inspection");
+});
 
-  it("loads the setup plugin without importing the broad api barrel", () => {
-    const plugin = setupEntry.loadSetupPlugin();
-    expect(plugin.id).toBe("discord");
+it("inspects account configuration without activity or voice runtime availability", async () => {
+  const { default: entry } = await import("./index.js");
+  const inspect = entry.loadChannelAccountInspector;
+  expect(inspect).toBeDefined();
+  expect(inspect?.()({ channels: { discord: { token: "inspection-only-token" } } })).toMatchObject({
+    accountId: "default",
+    configured: true,
+    tokenSource: "config",
   });
 });

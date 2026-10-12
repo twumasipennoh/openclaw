@@ -1,32 +1,16 @@
-import type { OpenClawConfig } from "openclaw/plugin-sdk/config-runtime";
+// Whatsapp tests cover reaction level plugin behavior.
+import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import { describe, expect, it } from "vitest";
 import { resolveWhatsAppReactionLevel } from "./reaction-level.js";
 
-type ReactionResolution = ReturnType<typeof resolveWhatsAppReactionLevel>;
-
 describe("resolveWhatsAppReactionLevel", () => {
-  const expectReactionFlags = (
-    result: ReactionResolution,
-    expected: {
-      level: "off" | "ack" | "minimal" | "extensive";
-      ackEnabled: boolean;
-      agentReactionsEnabled: boolean;
-      agentReactionGuidance?: "minimal" | "extensive";
-    },
-  ) => {
-    expect(result.level).toBe(expected.level);
-    expect(result.ackEnabled).toBe(expected.ackEnabled);
-    expect(result.agentReactionsEnabled).toBe(expected.agentReactionsEnabled);
-    expect(result.agentReactionGuidance).toBe(expected.agentReactionGuidance);
-  };
-
   it("defaults to minimal level when reactionLevel is not set", () => {
     const cfg: OpenClawConfig = {
       channels: { whatsapp: {} },
     };
 
     const result = resolveWhatsAppReactionLevel({ cfg });
-    expectReactionFlags(result, {
+    expect(result).toEqual({
       level: "minimal",
       ackEnabled: false,
       agentReactionsEnabled: true,
@@ -40,7 +24,7 @@ describe("resolveWhatsAppReactionLevel", () => {
     };
 
     const result = resolveWhatsAppReactionLevel({ cfg });
-    expectReactionFlags(result, {
+    expect(result).toEqual({
       level: "off",
       ackEnabled: false,
       agentReactionsEnabled: false,
@@ -53,38 +37,10 @@ describe("resolveWhatsAppReactionLevel", () => {
     };
 
     const result = resolveWhatsAppReactionLevel({ cfg });
-    expectReactionFlags(result, {
+    expect(result).toEqual({
       level: "ack",
       ackEnabled: true,
       agentReactionsEnabled: false,
-    });
-  });
-
-  it("returns minimal level with agent reactions enabled and minimal guidance", () => {
-    const cfg: OpenClawConfig = {
-      channels: { whatsapp: { reactionLevel: "minimal" } },
-    };
-
-    const result = resolveWhatsAppReactionLevel({ cfg });
-    expectReactionFlags(result, {
-      level: "minimal",
-      ackEnabled: false,
-      agentReactionsEnabled: true,
-      agentReactionGuidance: "minimal",
-    });
-  });
-
-  it("returns extensive level with agent reactions enabled and extensive guidance", () => {
-    const cfg: OpenClawConfig = {
-      channels: { whatsapp: { reactionLevel: "extensive" } },
-    };
-
-    const result = resolveWhatsAppReactionLevel({ cfg });
-    expectReactionFlags(result, {
-      level: "extensive",
-      ackEnabled: false,
-      agentReactionsEnabled: true,
-      agentReactionGuidance: "extensive",
     });
   });
 
@@ -101,7 +57,7 @@ describe("resolveWhatsAppReactionLevel", () => {
     };
 
     const result = resolveWhatsAppReactionLevel({ cfg, accountId: "work" });
-    expectReactionFlags(result, {
+    expect(result).toEqual({
       level: "extensive",
       ackEnabled: false,
       agentReactionsEnabled: true,

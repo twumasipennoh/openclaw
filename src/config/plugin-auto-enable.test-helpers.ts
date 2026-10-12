@@ -1,23 +1,37 @@
-import fs from "node:fs";
 import path from "node:path";
-import { clearPluginDiscoveryCache } from "../plugins/discovery.js";
-import {
-  clearPluginManifestRegistryCache,
-  type PluginManifestRegistry,
-} from "../plugins/manifest-registry.js";
-import { clearPluginSetupRegistryCache } from "../plugins/setup-registry.js";
-import {
-  cleanupTrackedTempDirs,
-  makeTrackedTempDir,
-  mkdirSafeDir,
-} from "../plugins/test-helpers/fs-fixtures.js";
+import type { PluginCandidate } from "../plugins/discovery.js";
+import { resolveInstalledPluginIndexPolicyHash } from "../plugins/installed-plugin-index-policy.js";
+import type { PluginManifestRegistry } from "../plugins/manifest-registry.js";
+import { clearPluginMetadataLifecycleCaches } from "../plugins/plugin-metadata-lifecycle.js";
+// Provides fixtures for plugin auto-enable config tests.
+import { buildPluginMetadataProviderFacts } from "../plugins/plugin-metadata-provider-facts.js";
+import type { PluginMetadataSnapshot } from "../plugins/plugin-metadata-snapshot.js";
+import type { PluginOrigin } from "../plugins/plugin-origin.types.js";
+import { buildDeclaredProviderOwnerIndex } from "../plugins/provider-owner-index.js";
+import { cleanupTrackedTempDirs, makeTrackedTempDir } from "../plugins/test-helpers/fs-fixtures.js";
+import type { OpenClawConfig } from "./types.openclaw.js";
 
 const tempDirs: string[] = [];
 
+export function makeBundledChannelCandidate(params: {
+  pluginId: string;
+  channelId: string;
+}): PluginCandidate {
+  return {
+    idHint: params.pluginId,
+    source: `/fake/${params.pluginId}/index.js`,
+    rootDir: `/fake/${params.pluginId}`,
+    origin: "bundled",
+    packageManifest: {
+      plugin: { id: params.pluginId },
+      channel: { id: params.channelId },
+    },
+  };
+}
+
+/** Clears auto-enable plugin caches and temp dirs between tests. */
 export function resetPluginAutoEnableTestState(): void {
-  clearPluginDiscoveryCache();
-  clearPluginManifestRegistryCache();
-  clearPluginSetupRegistryCache();
+  clearPluginMetadataLifecycleCaches();
   cleanupTrackedTempDirs(tempDirs);
 }
 
@@ -29,55 +43,54 @@ export function makeIsolatedEnv(overrides: NodeJS.ProcessEnv = {}): NodeJS.Proce
   const rootDir = makeTempDir();
   return {
     OPENCLAW_STATE_DIR: path.join(rootDir, "state"),
+    OPENCLAW_BUNDLED_PLUGINS_DIR: path.join(process.cwd(), "extensions"),
+    OPENCLAW_TEST_TRUST_BUNDLED_PLUGINS_DIR: "1",
+    VITEST: "true",
     ...overrides,
   };
-}
-
-export function writePluginManifestFixture(params: {
-  rootDir: string;
-  id: string;
-  channels: string[];
-}): void {
-  mkdirSafeDir(params.rootDir);
-  fs.writeFileSync(
-    path.join(params.rootDir, "openclaw.plugin.json"),
-    JSON.stringify(
-      {
-        id: params.id,
-        channels: params.channels,
-        configSchema: { type: "object" },
-      },
-      null,
-      2,
-    ),
-    "utf-8",
-  );
-  fs.writeFileSync(path.join(params.rootDir, "index.ts"), "export default {}", "utf-8");
 }
 
 export function makeRegistry(
   plugins: Array<{
     id: string;
     channels: string[];
+    activation?: { onAgentHarnesses?: string[] };
     autoEnableWhenConfiguredProviders?: string[];
     modelSupport?: { modelPrefixes?: string[]; modelPatterns?: string[] };
-    contracts?: { webSearchProviders?: string[]; webFetchProviders?: string[] };
+    contracts?: {
+      speechProviders?: string[];
+      workerProviders?: string[];
+      storageProviders?: string[];
+      decisionProviders?: string[];
+      webSearchProviders?: string[];
+      webFetchProviders?: string[];
+      tools?: string[];
+    };
     providers?: string[];
-    channelConfigs?: Record<string, { schema: Record<string, unknown>; preferOver?: string[] }>;
+    cliBackends?: string[];
+    origin?: PluginOrigin;
+    configSchema?: Record<string, unknown>;
+    channelConfigs?: Record<
+      string,
+      { schema: Record<string, unknown>; label?: string; preferOver?: string[] }
+    >;
   }>,
 ): PluginManifestRegistry {
   return {
     plugins: plugins.map((plugin) => ({
       id: plugin.id,
       channels: plugin.channels,
+      activation: plugin.activation,
       autoEnableWhenConfiguredProviders: plugin.autoEnableWhenConfiguredProviders,
       modelSupport: plugin.modelSupport,
       contracts: plugin.contracts,
+      configSchema: plugin.configSchema,
       channelConfigs: plugin.channelConfigs,
       providers: plugin.providers ?? [],
+      cliBackends: plugin.cliBackends ?? [],
       skills: [],
       hooks: [],
-      origin: "config" as const,
+      origin: plugin.origin ?? "config",
       rootDir: `/fake/${plugin.id}`,
       source: `/fake/${plugin.id}/index.js`,
       manifestPath: `/fake/${plugin.id}/openclaw.plugin.json`,
@@ -86,13 +99,59 @@ export function makeRegistry(
   };
 }
 
-export function makeApnChannelConfig() {
-  return { channels: { apn: { someKey: "value" } } };
+export function createPluginMetadataSnapshot(params: {
+  config?: OpenClawConfig;
+  manifestRegistry: PluginManifestRegistry;
+  workspaceDir?: string;
+}): PluginMetadataSnapshot {
+  const policyHash = resolveInstalledPluginIndexPolicyHash(params.config);
+  const index: PluginMetadataSnapshot["index"] = {
+    version: 1,
+    hostContractVersion: "test",
+    compatRegistryVersion: "test",
+    migrationVersion: 1,
+    policyHash,
+    generatedAtMs: 1,
+    installRecords: {},
+    plugins: [],
+    diagnostics: [],
+  };
+  return {
+    policyHash,
+    ...(params.workspaceDir ? { workspaceDir: params.workspaceDir } : {}),
+    index,
+    registryIndex: index,
+    registryDiagnostics: [],
+    manifestRegistry: params.manifestRegistry,
+    plugins: params.manifestRegistry.plugins,
+    diagnostics: params.manifestRegistry.diagnostics,
+    byPluginId: new Map(params.manifestRegistry.plugins.map((plugin) => [plugin.id, plugin])),
+    normalizePluginId: (pluginId) => pluginId,
+    declaredProviderOwners: buildDeclaredProviderOwnerIndex(params.manifestRegistry.plugins),
+    owners: {
+      channels: new Map(),
+      channelConfigs: new Map(),
+      providers: new Map(),
+      modelCatalogProviders: new Map(),
+      cliBackends: new Map(),
+      setupProviders: new Map(),
+      commandAliases: new Map(),
+      contracts: new Map(),
+      providerAuthContributions: buildPluginMetadataProviderFacts(params.manifestRegistry.plugins)
+        .providerAuthContributions,
+      modelIdNormalizationPolicies: new Map(),
+    },
+    metrics: {
+      registrySnapshotMs: 0,
+      manifestRegistryMs: 0,
+      ownerMapsMs: 0,
+      totalMs: 0,
+      indexPluginCount: 0,
+      manifestPluginCount: params.manifestRegistry.plugins.length,
+    },
+  };
 }
 
-export function makeBluebubblesAndImessageChannels() {
-  return {
-    bluebubbles: { serverUrl: "http://localhost:1234", password: "x" },
-    imessage: { cliPath: "/usr/local/bin/imsg" },
-  };
+export function makeApnChannelConfig() {
+  return { channels: { apn: { someKey: "value" } } };
 }

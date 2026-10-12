@@ -1,62 +1,92 @@
+// Node invoke approval-bypass tests protect signed node identity checks so
+// unpaired or spoofed devices cannot receive forwarded invoke requests.
 import crypto from "node:crypto";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
-import { WebSocket } from "ws";
-import {
-  deriveDeviceIdFromPublicKey,
-  type DeviceIdentity,
-  publicKeyRawBase64UrlFromPem,
-  signDevicePayload,
-} from "../infra/device-identity.js";
-import { sleep } from "../utils.js";
+import type { WebSocket } from "ws";
+import { writeConfigFile } from "../config/config.js";
+import type { DeviceIdentity } from "../infra/device-identity.js";
 import { GATEWAY_CLIENT_MODES, GATEWAY_CLIENT_NAMES } from "../utils/message-channel.js";
-import { GatewayClient } from "./client.js";
-import { buildDeviceAuthPayload } from "./device-auth.js";
+import type { GatewayClient } from "./client.js";
+import {
+  issueOperatorToken,
+  loadDeviceIdentity,
+  openTrackedWs,
+} from "./device-authz.test-helpers.js";
+import { connectGatewayClient } from "./test-helpers.e2e.js";
 import {
   connectReq,
   installGatewayTestHooks,
-  onceMessage,
   rpcReq,
   startServerWithClient,
-  trackConnectChallengeNonce,
 } from "./test-helpers.js";
+import {
+  acknowledgeNodeInvokeRequestForTest,
+  getConnectedNodeIdForTest,
+} from "./test-helpers.node-invoke.js";
 
 installGatewayTestHooks({ scope: "suite" });
-const NODE_CONNECT_TIMEOUT_MS = 3_000;
+const NODE_CONNECT_TIMEOUT_MS = 10_000;
 const CONNECT_REQ_TIMEOUT_MS = 2_000;
 
 function createDeviceIdentity(): DeviceIdentity {
-  const { publicKey, privateKey } = crypto.generateKeyPairSync("ed25519");
-  const publicKeyPem = publicKey.export({ type: "spki", format: "pem" }).toString();
-  const privateKeyPem = privateKey.export({ type: "pkcs8", format: "pem" }).toString();
-  const publicKeyRaw = publicKeyRawBase64UrlFromPem(publicKeyPem);
-  const deviceId = deriveDeviceIdFromPublicKey(publicKeyRaw);
-  if (!deviceId) {
-    throw new Error("failed to create test device identity");
-  }
-  return {
-    deviceId,
-    publicKeyPem,
-    privateKeyPem,
-  };
+  return loadDeviceIdentity(`invoke-node-${crypto.randomUUID()}`).identity;
 }
 
 async function expectNoForwardedInvoke(hasInvoke: () => boolean): Promise<void> {
   // Yield a couple of macrotasks so any accidental async forwarding would fire.
-  await new Promise<void>((resolve) => setImmediate(resolve));
-  await new Promise<void>((resolve) => setImmediate(resolve));
+  await new Promise<void>((resolve) => {
+    setImmediate(resolve);
+  });
+  await new Promise<void>((resolve) => {
+    setImmediate(resolve);
+  });
   expect(hasInvoke()).toBe(false);
 }
 
-async function getConnectedNodeId(ws: WebSocket): Promise<string> {
-  const nodes = await rpcReq<{ nodes?: Array<{ nodeId: string; connected?: boolean }> }>(
-    ws,
-    "node.list",
-    {},
-  );
-  expect(nodes.ok).toBe(true);
-  const nodeId = nodes.payload?.nodes?.find((n) => n.connected)?.nodeId ?? "";
-  expect(nodeId).toBeTruthy();
-  return nodeId;
+function parseInvokeParamsJSON(payload: unknown): Record<string, unknown> | null {
+  const obj = payload as { paramsJSON?: unknown };
+  const raw = typeof obj?.paramsJSON === "string" ? obj.paramsJSON : "";
+  return raw ? (JSON.parse(raw) as Record<string, unknown>) : null;
+}
+
+function createInvokeParamCapture() {
+  let invokeCount = 0;
+  let lastInvokeParams: Record<string, unknown> | null = null;
+  return {
+    count: () => invokeCount,
+    onInvoke: (payload: unknown) => {
+      invokeCount += 1;
+      lastInvokeParams = parseInvokeParamsJSON(payload);
+    },
+    params: () => requireRecord(lastInvokeParams, "forwarded invoke params"),
+  };
+}
+
+function expectForwardedApprovedParams(params: {
+  invokeCapture: ReturnType<typeof createInvokeParamCapture>;
+  absentKey: string;
+}): void {
+  const forwardedParams = params.invokeCapture.params();
+  expect(forwardedParams["approved"]).toBe(true);
+  expect(forwardedParams["approvalDecision"]).toBe("allow-once");
+  expect(forwardedParams[params.absentKey]).toBeUndefined();
+}
+
+function requireNonEmptyString(value: string | null | undefined, label: string): string {
+  if (!value) {
+    throw new Error(`expected ${label}`);
+  }
+  return value;
+}
+
+function requireRecord(
+  value: Record<string, unknown> | null | undefined,
+  label: string,
+): Record<string, unknown> {
+  if (!value) {
+    throw new Error(`expected ${label}`);
+  }
+  return value;
 }
 
 async function getConnectedNodeIds(ws: WebSocket): Promise<string[]> {
@@ -66,17 +96,24 @@ async function getConnectedNodeIds(ws: WebSocket): Promise<string[]> {
     {},
   );
   expect(nodes.ok).toBe(true);
-  return (nodes.payload?.nodes ?? []).filter((n) => n.connected).map((n) => n.nodeId);
+  const nodeIds: string[] = [];
+  for (const node of nodes.payload?.nodes ?? []) {
+    if (node.connected) {
+      nodeIds.push(node.nodeId);
+    }
+  }
+  return nodeIds;
 }
 
 async function requestAllowOnceApproval(
   ws: WebSocket,
   command: string,
   nodeId: string,
+  context?: ChatApprovalContext,
 ): Promise<string> {
   const approvalId = crypto.randomUUID();
   const commandArgv = command.split(/\s+/).filter((part) => part.length > 0);
-  const requestP = rpcReq(ws, "exec.approval.request", {
+  const requested = await rpcReq(ws, "exec.approval.request", {
     id: approvalId,
     command,
     commandArgv,
@@ -84,26 +121,94 @@ async function requestAllowOnceApproval(
       argv: commandArgv,
       cwd: null,
       commandText: command,
-      agentId: null,
-      sessionKey: null,
+      agentId: context?.agentId ?? null,
+      sessionKey: context?.sessionKey ?? null,
     },
     nodeId,
     cwd: null,
     host: "node",
+    ...context,
+    requireDeliveryRoute: false,
+    twoPhase: true,
     timeoutMs: 30_000,
   });
-  await rpcReq(ws, "exec.approval.resolve", { id: approvalId, decision: "allow-once" });
-  const requested = await requestP;
   expect(requested.ok).toBe(true);
+  expect(
+    (
+      await rpcReq(ws, "exec.approval.resolve", {
+        id: approvalId,
+        decision: "allow-once",
+      })
+    ).ok,
+  ).toBe(true);
   return approvalId;
 }
+
+function approvedSystemRunParams(
+  command: string[],
+  rawCommand: string,
+  runId: string,
+  extra: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return {
+    command,
+    rawCommand,
+    runId,
+    approved: true,
+    approvalDecision: "allow-once",
+    ...extra,
+  };
+}
+
+function approvedChatSystemRunParams(
+  context: ChatApprovalContext,
+  runId: string,
+  extra: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return approvedSystemRunParams(["echo", "chat"], "echo chat", runId, {
+    agentId: context.agentId,
+    sessionKey: context.sessionKey,
+    turnSourceChannel: context.turnSourceChannel,
+    turnSourceTo: context.turnSourceTo,
+    turnSourceAccountId: context.turnSourceAccountId,
+    turnSourceThreadId: context.turnSourceThreadId,
+    ...extra,
+  });
+}
+
+type ChatApprovalContext = {
+  agentId: string;
+  sessionKey: string;
+  turnSourceChannel: string;
+  turnSourceTo: string;
+  turnSourceAccountId?: string;
+  turnSourceThreadId?: string | number;
+};
 
 describe("node.invoke approval bypass", () => {
   let server: Awaited<ReturnType<typeof startServerWithClient>>["server"];
   let port: number;
 
   beforeAll(async () => {
-    const started = await startServerWithClient("secret", { controlUiEnabled: true });
+    await writeConfigFile({
+      gateway: {
+        nodes: {
+          pairing: { autoApproveCidrs: ["127.0.0.1/32", "::1/128"] },
+          commands: {
+            allow: [
+              "system.run",
+              "system.run.prepare",
+              "system.which",
+              "browser.proxy",
+              "fs.listDir",
+            ],
+          },
+        },
+      },
+    });
+    const started = await startServerWithClient("secret", {
+      controlUiEnabled: true,
+    });
     server = started.server;
     port = started.port;
     started.ws.close();
@@ -114,44 +219,46 @@ describe("node.invoke approval bypass", () => {
   });
 
   const approveAllPendingPairings = async () => {
-    const { approveDevicePairing, listDevicePairing } = await import("../infra/device-pairing.js");
-    const list = await listDevicePairing();
-    for (const pending of list.pending) {
+    const { approveDevicePairing } = await import("../infra/device-pairing-approval.js");
+    const { listDevicePairing } = await import("../infra/device-pairing.js");
+    const { approveNodePairing, listNodePairing } = await import("../infra/device-pairing-node.js");
+    const deviceList = await listDevicePairing();
+    for (const pending of deviceList.pending) {
       await approveDevicePairing(pending.requestId, {
         callerScopes: pending.scopes ?? ["operator.admin"],
       });
     }
+    const nodeList = await listNodePairing();
+    for (const pending of nodeList.pending) {
+      await approveNodePairing(pending.requestId, {
+        callerScopes: ["operator.admin"],
+      });
+    }
   };
 
-  const connectOperatorWithRetry = async (
-    scopes: string[],
-    resolveDevice?: (nonce: string) => NonNullable<Parameters<typeof connectReq>[1]>["device"],
-  ) => {
+  const approvePendingNodePairings = async (nodeId: string) => {
+    const { approveNodePairing, listNodePairing } = await import("../infra/device-pairing-node.js");
+    const list = await listNodePairing();
+    let approved = false;
+    for (const pending of list.pending) {
+      if (pending.nodeId !== nodeId) {
+        continue;
+      }
+      const result = await approveNodePairing(pending.requestId, {
+        callerScopes: ["operator.pairing", "operator.write", "operator.admin"],
+      });
+      approved ||= Boolean(result && "node" in result);
+    }
+    return approved;
+  };
+
+  const connectOperatorWithRetry = async (scopes: string[], deviceIdentityPath?: string) => {
     const connectOnce = async () => {
-      const ws = new WebSocket(`ws://127.0.0.1:${port}`);
-      trackConnectChallengeNonce(ws);
-      const challengePromise = resolveDevice
-        ? onceMessage<{
-            type?: string;
-            event?: string;
-            payload?: Record<string, unknown> | null;
-          }>(ws, (o) => o.type === "event" && o.event === "connect.challenge")
-        : null;
-      await new Promise<void>((resolve) => ws.once("open", resolve));
-      const nonce = (() => {
-        if (!challengePromise) {
-          return Promise.resolve("");
-        }
-        return challengePromise.then((challenge) => {
-          const value = (challenge.payload as { nonce?: unknown } | undefined)?.nonce;
-          expect(typeof value).toBe("string");
-          return String(value);
-        });
-      })();
+      const ws = await openTrackedWs(port);
       const res = await connectReq(ws, {
         token: "secret",
         scopes,
-        ...(resolveDevice ? { device: resolveDevice(await nonce) } : {}),
+        deviceIdentityPath,
         timeoutMs: CONNECT_REQ_TIMEOUT_MS,
       });
       return { ws, res };
@@ -175,89 +282,82 @@ describe("node.invoke approval bypass", () => {
     return await connectOperatorWithRetry(scopes);
   };
 
-  const connectOperatorWithNewDevice = async (scopes: string[]) => {
-    const { publicKey, privateKey } = crypto.generateKeyPairSync("ed25519");
-    const publicKeyPem = publicKey.export({ type: "spki", format: "pem" }).toString();
-    const privateKeyPem = privateKey.export({ type: "pkcs8", format: "pem" }).toString();
-    const publicKeyRaw = publicKeyRawBase64UrlFromPem(publicKeyPem);
-    const deviceId = deriveDeviceIdFromPublicKey(publicKeyRaw);
-    expect(deviceId).toBeTruthy();
-    return await connectOperatorWithRetry(scopes, (nonce) => {
-      const signedAtMs = Date.now();
-      const payload = buildDeviceAuthPayload({
-        deviceId: deviceId!,
-        clientId: GATEWAY_CLIENT_NAMES.TEST,
-        clientMode: GATEWAY_CLIENT_MODES.TEST,
-        role: "operator",
-        scopes,
-        signedAtMs,
-        token: "secret",
-        nonce,
-      });
-      return {
-        id: deviceId!,
-        publicKey: publicKeyRaw,
-        signature: signDevicePayload(privateKeyPem, payload),
-        signedAt: signedAtMs,
-        nonce,
-      };
+  const connectTrustedBackend = async (scopes: string[]) => {
+    const ws = await openTrackedWs(port);
+    const res = await connectReq(ws, {
+      token: "secret",
+      scopes,
+      device: null,
+      client: {
+        id: GATEWAY_CLIENT_NAMES.GATEWAY_CLIENT,
+        displayName: "agent",
+        version: "1.0.0",
+        platform: "test",
+        mode: GATEWAY_CLIENT_MODES.BACKEND,
+      },
+      timeoutMs: CONNECT_REQ_TIMEOUT_MS,
     });
+    expect(res.ok).toBe(true);
+    return ws;
+  };
+
+  const connectOperatorWithNewDevice = async (scopes: string[]) =>
+    connectOperatorWithRetry(
+      scopes,
+      loadDeviceIdentity(`operator-${crypto.randomUUID()}`).identityPath,
+    );
+
+  const connectDeviceTokenOperator = async (scopes: string[]) => {
+    const issued = await issueOperatorToken({
+      name: `browser-proxy-scope-${crypto.randomUUID()}`,
+      approvedScopes: scopes,
+      clientId: GATEWAY_CLIENT_NAMES.TEST,
+      clientMode: GATEWAY_CLIENT_MODES.TEST,
+    });
+    const ws = await openTrackedWs(port);
+    const res = await connectReq(ws, {
+      skipDefaultAuth: true,
+      deviceIdentityPath: issued.identityPath,
+      deviceToken: issued.token,
+      scopes,
+      timeoutMs: CONNECT_REQ_TIMEOUT_MS,
+    });
+    expect(res.ok).toBe(true);
+    return ws;
   };
 
   const connectLinuxNode = async (
     onInvoke: (payload: unknown) => void,
     deviceIdentity?: DeviceIdentity,
+    commands: string[] = ["system.run"],
   ) => {
-    let readyResolve: (() => void) | null = null;
-    const ready = new Promise<void>((resolve) => {
-      readyResolve = resolve;
-    });
-
     const resolvedDeviceIdentity = deviceIdentity ?? createDeviceIdentity();
-    const client = new GatewayClient({
-      url: `ws://127.0.0.1:${port}`,
-      // Keep challenge timeout realistic in tests; 0 maps to a 250ms timeout and can
-      // trigger reconnect backoff loops under load.
-      connectChallengeTimeoutMs: 2_000,
-      token: "secret",
-      role: "node",
-      clientName: GATEWAY_CLIENT_NAMES.NODE_HOST,
-      clientVersion: "1.0.0",
-      platform: "linux",
-      mode: GATEWAY_CLIENT_MODES.NODE,
-      scopes: [],
-      commands: ["system.run"],
-      deviceIdentity: resolvedDeviceIdentity,
-      onHelloOk: () => readyResolve?.(),
-      onEvent: (evt) => {
-        if (evt.event !== "node.invoke.request") {
-          return;
-        }
-        onInvoke(evt.payload);
-        const payload = evt.payload as {
-          id?: string;
-          nodeId?: string;
-        };
-        const id = typeof payload?.id === "string" ? payload.id : "";
-        const nodeId = typeof payload?.nodeId === "string" ? payload.nodeId : "";
-        if (!id || !nodeId) {
-          return;
-        }
-        void client.request("node.invoke.result", {
-          id,
-          nodeId,
-          ok: true,
-          payloadJSON: JSON.stringify({ ok: true }),
-        });
-      },
-    });
-    client.start();
-    await Promise.race([
-      ready,
-      sleep(NODE_CONNECT_TIMEOUT_MS).then(() => {
-        throw new Error("timeout waiting for node to connect");
-      }),
-    ]);
+
+    const startNodeClient = async () => {
+      const client: GatewayClient = await connectGatewayClient({
+        url: `ws://127.0.0.1:${port}`,
+        connectChallengeTimeoutMs: 2_000,
+        timeoutMs: NODE_CONNECT_TIMEOUT_MS,
+        token: "secret",
+        role: "node",
+        clientName: GATEWAY_CLIENT_NAMES.NODE_HOST,
+        clientVersion: "1.0.0",
+        platform: "linux",
+        mode: GATEWAY_CLIENT_MODES.NODE,
+        scopes: [],
+        caps: ["system"],
+        commands,
+        deviceIdentity: resolvedDeviceIdentity,
+        onEvent: (event) => acknowledgeNodeInvokeRequestForTest({ client, event, onInvoke }),
+      });
+      return client;
+    };
+
+    let client = await startNodeClient();
+    if (await approvePendingNodePairings(resolvedDeviceIdentity.deviceId)) {
+      client.stop();
+      client = await startNodeClient();
+    }
     return client;
   };
 
@@ -268,7 +368,7 @@ describe("node.invoke approval bypass", () => {
     });
     const ws = await connectOperator(["operator.write"]);
     try {
-      const nodeId = await getConnectedNodeId(ws);
+      const nodeId = await getConnectedNodeIdForTest(ws);
       const cases = [
         {
           name: "rawCommand mismatch",
@@ -322,69 +422,207 @@ describe("node.invoke approval bypass", () => {
     }
   });
 
+  test("rejects persistent browser profile mutations before forwarding", async () => {
+    const command = "browser.proxy";
+    let sawInvoke = false;
+    const node = await connectLinuxNode(
+      () => {
+        sawInvoke = true;
+      },
+      undefined,
+      [command],
+    );
+    const ws = await connectOperator(["operator.write"]);
+    try {
+      const nodeId = await getConnectedNodeIdForTest(ws);
+      const res = await rpcReq(ws, "node.invoke", {
+        nodeId,
+        command,
+        params: {
+          method: "POST",
+          path: "/profiles/create",
+          body: { name: "poc", cdpUrl: "http://127.0.0.1:9222" },
+        },
+        idempotencyKey: crypto.randomUUID(),
+      });
+      expect(res.ok).toBe(false);
+      expect(res.error?.message ?? "").toContain(
+        `node.invoke cannot mutate persistent browser profiles via ${command}`,
+      );
+      await expectNoForwardedInvoke(() => sawInvoke);
+    } finally {
+      ws.close();
+      node.stop();
+    }
+  });
+
+  test("requires admin scope for direct browser.proxy node.invoke", async () => {
+    let sawInvoke = false;
+    const nodeIdentity = createDeviceIdentity();
+    const node = await connectLinuxNode(
+      () => {
+        sawInvoke = true;
+      },
+      nodeIdentity,
+      ["browser.proxy"],
+    );
+    const ws = await connectDeviceTokenOperator(["operator.write"]);
+    try {
+      const browserRequest = await rpcReq(ws, "browser.request", {
+        method: "GET",
+        path: "/profiles",
+      });
+      expect(browserRequest.ok).toBe(false);
+      expect(browserRequest.error?.message ?? "").toContain("missing scope: operator.admin");
+
+      const directProxy = await rpcReq(ws, "node.invoke", {
+        nodeId: nodeIdentity.deviceId,
+        command: "browser.proxy",
+        params: {
+          method: "GET",
+          path: "/profiles",
+        },
+        idempotencyKey: crypto.randomUUID(),
+      });
+      expect(directProxy.ok).toBe(false);
+      expect(directProxy.error).toMatchObject({
+        code: "FORBIDDEN",
+        message: "missing scope: operator.admin",
+        details: {
+          code: "MISSING_SCOPE",
+          missingScope: "operator.admin",
+          requiredScopes: ["operator.admin"],
+        },
+      });
+      await expectNoForwardedInvoke(() => sawInvoke);
+    } finally {
+      ws.close();
+      node.stop();
+    }
+  });
+
+  test("allows direct browser.proxy node.invoke for admin-scoped operators", async () => {
+    let sawInvoke = false;
+    const nodeIdentity = createDeviceIdentity();
+    const node = await connectLinuxNode(
+      () => {
+        sawInvoke = true;
+      },
+      nodeIdentity,
+      ["browser.proxy"],
+    );
+    const ws = await connectDeviceTokenOperator(["operator.admin"]);
+    try {
+      const directProxy = await rpcReq(ws, "node.invoke", {
+        nodeId: nodeIdentity.deviceId,
+        command: "browser.proxy",
+        params: {
+          method: "GET",
+          path: "/profiles",
+        },
+        idempotencyKey: crypto.randomUUID(),
+      });
+      expect(directProxy.ok, JSON.stringify(directProxy.error)).toBe(true);
+      expect(sawInvoke).toBe(true);
+    } finally {
+      ws.close();
+      node.stop();
+    }
+  });
+
   test("binds approvals to decision/device and blocks cross-device replay", async () => {
-    let invokeCount = 0;
-    let lastInvokeParams: Record<string, unknown> | null = null;
-    const node = await connectLinuxNode((payload) => {
-      invokeCount += 1;
-      const obj = payload as { paramsJSON?: unknown };
-      const raw = typeof obj?.paramsJSON === "string" ? obj.paramsJSON : "";
-      if (!raw) {
-        lastInvokeParams = null;
-        return;
-      }
-      lastInvokeParams = JSON.parse(raw) as Record<string, unknown>;
-    });
+    const invokeCapture = createInvokeParamCapture();
+    const node = await connectLinuxNode(invokeCapture.onInvoke);
 
     const wsApprover = await connectOperator(["operator.write", "operator.approvals"]);
     const wsCaller = await connectOperator(["operator.write"]);
     const wsOtherDevice = await connectOperatorWithNewDevice(["operator.write"]);
 
     try {
-      const nodeId = await getConnectedNodeId(wsApprover);
+      const nodeId = await getConnectedNodeIdForTest(wsApprover);
 
       const approvalId = await requestAllowOnceApproval(wsApprover, "echo hi", nodeId);
       // Separate caller connection simulates per-call clients.
       const invoke = await rpcReq(wsCaller, "node.invoke", {
         nodeId,
         command: "system.run",
-        params: {
-          command: ["echo", "hi"],
-          rawCommand: "echo hi",
-          runId: approvalId,
-          approved: true,
+        params: approvedSystemRunParams(["echo", "hi"], "echo hi", approvalId, {
           approvalDecision: "allow-always",
           injected: "nope",
-        },
+        }),
         idempotencyKey: crypto.randomUUID(),
       });
-      expect(invoke.ok).toBe(true);
-      expect(lastInvokeParams).toBeTruthy();
-      expect(lastInvokeParams?.["approved"]).toBe(true);
-      expect(lastInvokeParams?.["approvalDecision"]).toBe("allow-once");
-      expect(lastInvokeParams?.["injected"]).toBeUndefined();
+      expect(invoke.ok, JSON.stringify(invoke.error)).toBe(true);
+      expectForwardedApprovedParams({ invokeCapture, absentKey: "injected" });
 
       const replayApprovalId = await requestAllowOnceApproval(wsApprover, "echo hi", nodeId);
-      const invokeCountBeforeReplay = invokeCount;
+      const invokeCountBeforeReplay = invokeCapture.count();
       const replay = await rpcReq(wsOtherDevice, "node.invoke", {
         nodeId,
         command: "system.run",
-        params: {
-          command: ["echo", "hi"],
-          rawCommand: "echo hi",
-          runId: replayApprovalId,
-          approved: true,
-          approvalDecision: "allow-once",
-        },
+        params: approvedSystemRunParams(["echo", "hi"], "echo hi", replayApprovalId),
         idempotencyKey: crypto.randomUUID(),
       });
       expect(replay.ok).toBe(false);
       expect(replay.error?.message ?? "").toContain("not valid for this device");
-      await expectNoForwardedInvoke(() => invokeCount > invokeCountBeforeReplay);
+      await expectNoForwardedInvoke(() => invokeCapture.count() > invokeCountBeforeReplay);
     } finally {
       wsApprover.close();
       wsCaller.close();
       wsOtherDevice.close();
+      node.stop();
+    }
+  });
+
+  test("bridges no-device chat approvals across backend reconnects only for the same turn source", async () => {
+    const invokeCapture = createInvokeParamCapture();
+    const node = await connectLinuxNode(invokeCapture.onInvoke);
+
+    const wsRequest = await connectTrustedBackend(["operator.write", "operator.approvals"]);
+    const wsReplay = await connectTrustedBackend(["operator.write", "operator.approvals"]);
+
+    try {
+      const nodeId = await getConnectedNodeIdForTest(wsRequest);
+      const context: ChatApprovalContext = {
+        agentId: "main",
+        sessionKey: "agent:main:telegram:direct:12345",
+        turnSourceChannel: "telegram",
+        turnSourceTo: "telegram:12345",
+        turnSourceAccountId: "work",
+        turnSourceThreadId: "42",
+      };
+
+      const approvalId = await requestAllowOnceApproval(wsRequest, "echo chat", nodeId, context);
+      const invoke = await rpcReq(wsReplay, "node.invoke", {
+        nodeId,
+        command: "system.run",
+        params: approvedChatSystemRunParams(context, approvalId),
+        idempotencyKey: crypto.randomUUID(),
+      });
+      expect(invoke.ok).toBe(true);
+      expectForwardedApprovedParams({ invokeCapture, absentKey: "turnSourceTo" });
+
+      const mismatchApprovalId = await requestAllowOnceApproval(
+        wsRequest,
+        "echo chat",
+        nodeId,
+        context,
+      );
+      const invokeCountBeforeMismatch = invokeCapture.count();
+      const mismatch = await rpcReq(wsReplay, "node.invoke", {
+        nodeId,
+        command: "system.run",
+        params: approvedChatSystemRunParams(context, mismatchApprovalId, {
+          turnSourceTo: "telegram:67890",
+        }),
+        idempotencyKey: crypto.randomUUID(),
+      });
+      expect(mismatch.ok).toBe(false);
+      expect(mismatch.error?.message ?? "").toContain("not valid for this client");
+      await expectNoForwardedInvoke(() => invokeCapture.count() > invokeCountBeforeMismatch);
+    } finally {
+      wsRequest.close();
+      wsReplay.close();
       node.stop();
     }
   });
@@ -413,10 +651,11 @@ describe("node.invoke approval bypass", () => {
         })
         .toBeGreaterThanOrEqual(2);
       const connectedNodeIds = await getConnectedNodeIds(wsApprover);
-      const approvedNodeId = connectedNodeIds[0] ?? "";
-      const replayNodeId = connectedNodeIds.find((id) => id !== approvedNodeId) ?? "";
-      expect(approvedNodeId).toBeTruthy();
-      expect(replayNodeId).toBeTruthy();
+      const approvedNodeId = requireNonEmptyString(connectedNodeIds[0], "approved node id");
+      const replayNodeId = requireNonEmptyString(
+        connectedNodeIds.find((id) => id !== approvedNodeId),
+        "replay node id",
+      );
 
       const approvalId = await requestAllowOnceApproval(wsApprover, "echo hi", approvedNodeId);
       const beforeReplayApprovedNode = invokeCounts.get(approvedNodeId) ?? 0;

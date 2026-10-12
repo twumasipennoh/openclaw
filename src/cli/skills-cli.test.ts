@@ -1,318 +1,277 @@
-import { describe, expect, it, vi } from "vitest";
-import type { SkillStatusEntry, SkillStatusReport } from "../agents/skills-status.js";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import type { SkillStatusEntry, SkillStatusReport } from "../skills/discovery/status.js";
 import { createEmptyInstallChecks } from "./requirements-test-fixtures.js";
 import { formatSkillInfo, formatSkillsCheck, formatSkillsList } from "./skills-cli.format.js";
 
-// Unit tests: don't pay the runtime cost of loading/parsing the real skills loader.
-vi.mock("@mariozechner/pi-coding-agent", () => ({
+vi.mock("openclaw/plugin-sdk/agent-sessions", () => ({
   loadSkillsFromDir: () => ({ skills: [] }),
   formatSkillsForPrompt: () => "",
 }));
-
-function createMockSkill(overrides: Partial<SkillStatusEntry> = {}): SkillStatusEntry {
-  return {
-    name: "test-skill",
+function skill(name: string, overrides: Partial<SkillStatusEntry> = {}): SkillStatusEntry {
+  const entry: SkillStatusEntry = {
+    name,
+    skillKey: name,
     description: "A test skill",
     source: "bundled",
     bundled: false,
     filePath: "/path/to/SKILL.md",
     baseDir: "/path/to",
-    skillKey: "test-skill",
     emoji: "🧪",
     homepage: "https://example.com",
     always: false,
     disabled: false,
     blockedByAllowlist: false,
+    blockedByAgentFilter: false,
     eligible: true,
+    platformIncompatible: false,
+    modelVisible: true,
+    userInvocable: true,
+    commandVisible: true,
     ...createEmptyInstallChecks(),
     ...overrides,
   };
+  entry.modelVisible = overrides.modelVisible ?? (entry.eligible && !entry.blockedByAgentFilter);
+  entry.commandVisible =
+    overrides.commandVisible ??
+    (entry.eligible && !entry.blockedByAgentFilter && entry.userInvocable);
+  return entry;
 }
-
-function createMockReport(skills: SkillStatusEntry[]): SkillStatusReport {
-  return {
-    workspaceDir: "/workspace",
-    managedSkillsDir: "/managed",
-    skills,
-  };
+function report(skills: SkillStatusEntry[]): SkillStatusReport {
+  return { workspaceDir: "/workspace", managedSkillsDir: "/managed", skills };
 }
+const missing = { bins: ["missing-tool"], anyBins: [], env: [], config: [], os: [] };
 
-describe("skills-cli", () => {
-  describe("formatSkillsList", () => {
-    it("formats empty skills list", () => {
-      const report = createMockReport([]);
-      const output = formatSkillsList(report, {});
-      expect(output).toContain("No skills found");
-      expect(output).toContain("openclaw skills search");
-    });
+describe("skills formatting", () => {
+  afterEach(() => vi.unstubAllEnvs());
 
-    it("formats skills list with eligible skill", () => {
-      const report = createMockReport([
-        createMockSkill({
-          name: "peekaboo",
-          description: "Capture UI screenshots",
-          emoji: "📸",
-          eligible: true,
-        }),
-      ]);
-      const output = formatSkillsList(report, {});
-      expect(output).toContain("peekaboo");
-      expect(output).toContain("📸");
-      expect(output).toContain("✓");
-    });
+  it("preserves the named profile on every human ClawHub hint", () => {
+    vi.stubEnv("OPENCLAW_PROFILE", "work");
+    vi.stubEnv("OPENCLAW_CONTAINER_HINT", "");
+    const empty = report([]);
+    for (const output of [
+      formatSkillsList(empty, {}),
+      formatSkillInfo(empty, "missing", {}),
+      formatSkillsCheck(empty, {}),
+    ]) {
+      for (const action of ["search", "install", "update"]) {
+        expect(output).toContain(`openclaw --profile work skills ${action}`);
+      }
+    }
+  });
 
-    it("formats skills list with disabled skill", () => {
-      const report = createMockReport([
-        createMockSkill({
-          name: "disabled-skill",
+  it("renders readiness and filters agent-excluded skills out of the eligible list", () => {
+    const mixed = report([
+      skill("ready", { emoji: "📸" }),
+      skill("agent-excluded", {
+        blockedByAgentFilter: true,
+        homepage: undefined,
+        emoji: undefined,
+      }),
+      skill("disabled-skill", { disabled: true, eligible: false }),
+      skill("needs-stuff", {
+        eligible: false,
+        missing: { ...missing, anyBins: ["rg", "grep"], env: ["API_KEY"], os: ["darwin"] },
+      }),
+    ]);
+    const output = formatSkillsList(mixed, { verbose: true });
+    for (const text of [
+      "1/4 ready",
+      "📸",
+      "✓",
+      "excluded",
+      "disabled",
+      "needs setup",
+      "anyBins",
+      "os:",
+    ]) {
+      expect(output).toContain(text);
+    }
+    const info = formatSkillInfo(mixed, "agent-excluded", {});
+    expect(info).toContain("Excluded by agent allowlist");
+    expect(info).toContain("excludes this skill");
+    const eligible = formatSkillsList(mixed, { eligible: true });
+    expect(eligible).toContain("ready");
+    for (const name of ["agent-excluded", "disabled-skill", "needs-stuff"]) {
+      expect(eligible).not.toContain(name);
+    }
+  });
+
+  it.each(["Excel-XLSX", "excel_xlsx"])("resolves unambiguous skill key %s", (skillKey) => {
+    expect(
+      formatSkillInfo(
+        report([skill("Excel XLSX", { skillKey, description: "Spreadsheet helpers" })]),
+        "excel-xlsx",
+        {},
+      ),
+    ).toContain("Spreadsheet helpers");
+  });
+
+  it("prefers an exact skill name over another skill's key in either discovery order", () => {
+    const alias = skill("another-skill", { skillKey: "requested-skill" });
+    const target = skill("requested-skill", { skillKey: "target-key" });
+    for (const entries of [
+      [alias, target],
+      [target, alias],
+    ]) {
+      expect(
+        JSON.parse(formatSkillInfo(report(entries), "requested-skill", { json: true })).name,
+      ).toBe("requested-skill");
+    }
+  });
+
+  it.each([
+    {
+      name: "exact key",
+      query: "shared-key",
+      skills: [
+        skill("first", { skillKey: "shared-key" }),
+        skill("second", { skillKey: "shared-key" }),
+      ],
+    },
+    {
+      name: "case-insensitive",
+      query: "EXCEL-XLSX",
+      skills: [
+        skill("first", { skillKey: "Excel-XLSX" }),
+        skill("second", { skillKey: "excel-xlsx" }),
+      ],
+    },
+    {
+      name: "normalized",
+      query: "excel-xlsx",
+      skills: [
+        skill("Excel/XLSX", { skillKey: "slash" }),
+        skill("Excel_XLSX", { skillKey: "underscore" }),
+      ],
+    },
+  ])("rejects ambiguous $name selectors regardless of discovery order", ({ query, skills }) => {
+    for (const entries of [skills, skills.toReversed()]) {
+      expect(JSON.parse(formatSkillInfo(report(entries), query, { json: true }))).toMatchObject({
+        ok: false,
+        skill: query,
+      });
+    }
+  });
+
+  it("reports readiness, model visibility and command access independently", () => {
+    const mixed = {
+      ...report([
+        skill("ready", { emoji: "🎛\uFE0E" }),
+        skill("prompt-hidden", { modelVisible: false }),
+        skill("slash-hidden", { userInvocable: false }),
+        skill("agent-filtered", { blockedByAgentFilter: true }),
+        skill("excluded-missing", { eligible: false, blockedByAgentFilter: true, missing }),
+        skill("missing-bin", { eligible: false, missing, emoji: "🎙\uFE0E" }),
+        skill("disabled", {
+          eligible: false,
           disabled: true,
-          eligible: false,
+          blockedByAllowlist: true,
+          blockedByAgentFilter: true,
+          missing,
         }),
-      ]);
-      const output = formatSkillsList(report, {});
-      expect(output).toContain("disabled-skill");
-      expect(output).toContain("disabled");
-    });
-
-    it("formats skills list with missing requirements", () => {
-      const report = createMockReport([
-        createMockSkill({
-          name: "needs-stuff",
+        skill("blocked-bundled", {
           eligible: false,
-          missing: {
-            bins: ["ffmpeg"],
-            anyBins: ["rg", "grep"],
-            env: ["API_KEY"],
-            config: [],
-            os: ["darwin"],
-          },
+          blockedByAllowlist: true,
+          blockedByAgentFilter: true,
+          missing,
         }),
-      ]);
-      const output = formatSkillsList(report, { verbose: true });
-      expect(output).toContain("needs-stuff");
-      expect(output).toContain("needs setup");
-      expect(output).toContain("anyBins");
-      expect(output).toContain("os:");
+      ]),
+      agentId: "specialist",
+      agentSkillFilter: ["ready", "prompt-hidden", "slash-hidden", "missing-bin"],
+    };
+    const parsed = JSON.parse(formatSkillsCheck(mixed, { json: true }));
+    expect(parsed.summary).toEqual({
+      total: 8,
+      eligible: 4,
+      modelVisible: 2,
+      commandVisible: 2,
+      disabled: 1,
+      blocked: 1,
+      agentFiltered: 4,
+      notInjected: 1,
+      missingRequirements: 2,
     });
-
-    it("filters to eligible only with --eligible flag", () => {
-      const report = createMockReport([
-        createMockSkill({ name: "eligible-one", eligible: true }),
-        createMockSkill({
-          name: "not-eligible",
-          eligible: false,
-          disabled: true,
-        }),
-      ]);
-      const output = formatSkillsList(report, { eligible: true });
-      expect(output).toContain("eligible-one");
-      expect(output).not.toContain("not-eligible");
-    });
+    expect(parsed.modelVisible).toEqual(["ready", "slash-hidden"]);
+    expect(parsed.commandVisible).toEqual(["ready", "prompt-hidden"]);
+    expect(parsed.agentFiltered).toEqual([
+      "agent-filtered",
+      "excluded-missing",
+      "disabled",
+      "blocked-bundled",
+    ]);
+    expect(parsed.disabled).toEqual(["disabled"]);
+    expect(parsed.blocked).toEqual(["blocked-bundled"]);
+    expect(parsed.notInjected).toEqual([
+      { name: "prompt-hidden", reason: "disable-model-invocation" },
+    ]);
+    expect(parsed.missingRequirements.map((entry: { name: string }) => entry.name)).toEqual([
+      "excluded-missing",
+      "missing-bin",
+    ]);
+    const human = formatSkillsCheck(mixed, {});
+    for (const text of [
+      "specialist",
+      "🎛️ ready",
+      "🎙️ missing-bin",
+      "excluded-missing (bins: missing-tool)",
+      "prompt-hidden (skill hides its instructions from the model; commands/cron may still use it)",
+    ]) {
+      expect(human).toContain(text);
+    }
+    for (const name of parsed.agentFiltered) {
+      expect(human).toContain(`${name} (loaded, but this agent is not allowed to see/use it)`);
+    }
   });
 
-  describe("formatSkillInfo", () => {
-    it("returns not found message for unknown skill", () => {
-      const report = createMockReport([]);
-      const output = formatSkillInfo(report, "unknown-skill", {});
-      expect(output).toContain("not found");
-      expect(output).toContain("openclaw skills install");
-    });
-
-    it("shows detailed info for a skill", () => {
-      const report = createMockReport([
-        createMockSkill({
-          name: "detailed-skill",
-          description: "A detailed description",
-          homepage: "https://example.com",
-          requirements: {
-            bins: ["node"],
-            anyBins: ["rg", "grep"],
-            env: ["API_KEY"],
-            config: [],
-            os: [],
-          },
-          missing: {
-            bins: [],
-            anyBins: [],
-            env: ["API_KEY"],
-            config: [],
-            os: [],
-          },
+  it.each([false, true])("explains standalone skill visibility (hidden: %s)", (hidden) => {
+    vi.stubEnv("TERM", "dumb");
+    const output = formatSkillsCheck(
+      report([
+        skill("standalone", {
+          modelVisible: !hidden,
+          userInvocable: !hidden,
+          emoji: undefined,
         }),
-      ]);
-      const output = formatSkillInfo(report, "detailed-skill", {});
-      expect(output).toContain("detailed-skill");
-      expect(output).toContain("A detailed description");
-      expect(output).toContain("https://example.com");
-      expect(output).toContain("node");
-      expect(output).toContain("Any binaries");
-      expect(output).toContain("API_KEY");
-    });
-
-    it("shows API key storage guidance for the active config path", () => {
-      const report = createMockReport([
-        createMockSkill({
-          name: "env-aware-skill",
-          skillKey: "env-aware-skill",
-          primaryEnv: "API_KEY",
-          eligible: false,
-          requirements: {
-            bins: [],
-            anyBins: [],
-            env: ["API_KEY"],
-            config: [],
-            os: [],
-          },
-          missing: {
-            bins: [],
-            anyBins: [],
-            env: ["API_KEY"],
-            config: [],
-            os: [],
-          },
-        }),
-      ]);
-
-      const output = formatSkillInfo(report, "env-aware-skill", {});
-      expect(output).toContain("OPENCLAW_CONFIG_PATH");
-      expect(output).toContain("default: ~/.openclaw/openclaw.json");
-      expect(output).toContain("skills.entries.env-aware-skill.apiKey");
-    });
-
-    it("normalizes text-presentation emoji selectors in info output", () => {
-      const report = createMockReport([
-        createMockSkill({
-          name: "info-emoji",
-          emoji: "🎛\uFE0E",
-        }),
-      ]);
-
-      const output = formatSkillInfo(report, "info-emoji", {});
-      expect(output).toContain("🎛️");
-    });
+      ]),
+      {},
+    );
+    expect(output).toContain("\n  standalone");
+    expect(output).toContain(
+      hidden ? "is not exposed as a command" : "Ready and visible to model:",
+    );
+    expect(output).not.toContain(
+      hidden ? "commands/cron may still use it" : "Hidden from model prompt:",
+    );
   });
 
-  describe("formatSkillsCheck", () => {
-    it("shows summary of skill status", () => {
-      const report = createMockReport([
-        createMockSkill({ name: "ready-1", eligible: true }),
-        createMockSkill({ name: "ready-2", eligible: true }),
-        createMockSkill({
-          name: "not-ready",
-          eligible: false,
-          missing: { bins: ["go"], anyBins: [], env: [], config: [], os: [] },
-        }),
-        createMockSkill({ name: "disabled", eligible: false, disabled: true }),
-      ]);
-      const output = formatSkillsCheck(report, {});
-      expect(output).toContain("2"); // eligible count
-      expect(output).toContain("ready-1");
-      expect(output).toContain("ready-2");
-      expect(output).toContain("not-ready");
-      expect(output).toContain("go"); // missing binary
-      expect(output).toContain("openclaw skills update");
-    });
-
-    it("normalizes text-presentation emoji selectors in check output", () => {
-      const report = createMockReport([
-        createMockSkill({ name: "ready-emoji", emoji: "🎛\uFE0E", eligible: true }),
-        createMockSkill({
-          name: "missing-emoji",
-          emoji: "🎙\uFE0E",
-          eligible: false,
-          missing: { bins: ["ffmpeg"], anyBins: [], env: [], config: [], os: [] },
-        }),
-      ]);
-
-      const output = formatSkillsCheck(report, {});
-      expect(output).toContain("🎛️ ready-emoji");
-      expect(output).toContain("🎙️ missing-emoji");
-    });
-  });
-
-  describe("JSON output", () => {
-    it.each([
-      {
-        formatter: "list",
-        output: formatSkillsList(createMockReport([createMockSkill({ name: "json-skill" })]), {
-          json: true,
-        }),
-        assert: (parsed: Record<string, unknown>) => {
-          const skills = parsed.skills as Array<Record<string, unknown>>;
-          expect(skills).toHaveLength(1);
-          expect(skills[0]?.name).toBe("json-skill");
-        },
-      },
-      {
-        formatter: "info",
-        output: formatSkillInfo(
-          createMockReport([createMockSkill({ name: "info-skill" })]),
-          "info-skill",
-          { json: true },
-        ),
-        assert: (parsed: Record<string, unknown>) => {
-          expect(parsed.name).toBe("info-skill");
-        },
-      },
-      {
-        formatter: "check",
-        output: formatSkillsCheck(
-          createMockReport([
-            createMockSkill({ name: "skill-1", eligible: true }),
-            createMockSkill({ name: "skill-2", eligible: false }),
-          ]),
-          { json: true },
-        ),
-        assert: (parsed: Record<string, unknown>) => {
-          const summary = parsed.summary as Record<string, unknown>;
-          expect(summary.eligible).toBe(1);
-          expect(summary.total).toBe(2);
-        },
-      },
-    ])("outputs JSON with --json flag for $formatter", ({ output, assert }) => {
-      const parsed = JSON.parse(output) as Record<string, unknown>;
-      assert(parsed);
-    });
-
-    it("sanitizes ANSI and C1 controls in skills list JSON output", () => {
-      const report = createMockReport([
-        createMockSkill({
-          name: "json-skill",
+  it("sanitizes ANSI and C1 controls in JSON fields", () => {
+    const output = formatSkillsList(
+      report([
+        skill("json-skill", {
           emoji: "\u001b[31m📧\u001b[0m\u009f",
           description: "desc\u0093\u001b[2J\u001b[33m colored\u001b[0m",
         }),
-      ]);
-
-      const output = formatSkillsList(report, { json: true });
-      const parsed = JSON.parse(output) as {
-        skills: Array<{ emoji: string; description: string }>;
-      };
-
-      expect(parsed.skills[0]?.emoji).toBe("📧");
-      expect(parsed.skills[0]?.description).toBe("desc colored");
-      expect(output).not.toContain("\\u001b");
+      ]),
+      { json: true },
+    );
+    expect(JSON.parse(output).skills[0]).toMatchObject({
+      emoji: "📧",
+      description: "desc colored",
     });
+    expect(output).not.toContain("\\u001b");
+  });
 
-    it("sanitizes skills info JSON output", () => {
-      const report = createMockReport([
-        createMockSkill({
-          name: "info-json",
-          emoji: "\u001b[31m🎙\u001b[0m\u009f",
-          description: "hi\u0091",
-          homepage: "https://example.com/\u0092docs",
-        }),
-      ]);
-
-      const output = formatSkillInfo(report, "info-json", { json: true });
-      const parsed = JSON.parse(output) as {
-        emoji: string;
-        description: string;
-        homepage: string;
-      };
-
-      expect(parsed.emoji).toBe("🎙");
-      expect(parsed.description).toBe("hi");
-      expect(parsed.homepage).toBe("https://example.com/docs");
-    });
+  it.each([false, true])("sanitizes the user-supplied not-found name (json: %s)", (json) => {
+    const output = formatSkillInfo(report([]), "evil\u001b[31m\u009f", { json });
+    if (json) {
+      expect(JSON.parse(output)).toEqual({
+        ok: false,
+        error: { type: "cli_error", message: 'Skill "evil" not found.' },
+        skill: "evil",
+      });
+    } else {
+      expect(output).toContain('Skill "evil" not found');
+    }
+    expect(output).not.toContain("\u001b");
   });
 });

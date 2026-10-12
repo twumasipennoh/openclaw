@@ -1,3 +1,6 @@
+// Speech test helpers provide stub speech providers and fetch-backed audio
+// synthesis fixtures for gateway Talk and media suites.
+import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import type { SpeechProviderPlugin } from "../plugins/types.js";
 import {
   TALK_TEST_PROVIDER_ID,
@@ -13,14 +16,6 @@ type StubSpeechProviderOptions = {
   synthesize?: SpeechProviderPlugin["synthesize"];
 };
 
-function trimString(value: unknown): string | undefined {
-  if (typeof value !== "string") {
-    return undefined;
-  }
-  const trimmed = value.trim();
-  return trimmed.length > 0 ? trimmed : undefined;
-}
-
 function asNumber(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
@@ -33,9 +28,9 @@ async function fetchStubSpeechAudio(
   const withTimeout = async <T>(label: string, run: Promise<T>): Promise<T> =>
     await Promise.race([
       run,
-      new Promise<T>((_, reject) =>
-        setTimeout(() => reject(new Error(`${providerId} stub ${label} timed out`)), 5_000),
-      ),
+      new Promise<T>((_, reject) => {
+        setTimeout(() => reject(new Error(`${providerId} stub ${label} timed out`)), 5_000);
+      }),
     ]);
   const response = await withTimeout("fetch", globalThis.fetch(url, init));
   const arrayBuffer = await withTimeout("read", response.arrayBuffer());
@@ -74,8 +69,12 @@ export function createDefaultGatewayTestSpeechProviders() {
         label: "OpenAI",
         voices: ["alloy", "nova"],
         resolveTalkOverrides: ({ params }) => ({
-          ...(trimString(params.voiceId) == null ? {} : { voice: trimString(params.voiceId) }),
-          ...(trimString(params.modelId) == null ? {} : { model: trimString(params.modelId) }),
+          ...(normalizeOptionalString(params.voiceId) == null
+            ? {}
+            : { voice: normalizeOptionalString(params.voiceId) }),
+          ...(normalizeOptionalString(params.modelId) == null
+            ? {}
+            : { model: normalizeOptionalString(params.modelId) }),
           ...(asNumber(params.speed) == null ? {} : { speed: asNumber(params.speed) }),
         }),
         synthesize: async (req) => {
@@ -83,8 +82,14 @@ export function createDefaultGatewayTestSpeechProviders() {
           const overrides = (req.providerOverrides ?? {}) as Record<string, unknown>;
           const body = JSON.stringify({
             input: req.text,
-            model: trimString(overrides.model) ?? trimString(config.modelId) ?? "gpt-4o-mini-tts",
-            voice: trimString(overrides.voice) ?? trimString(config.voiceId) ?? "alloy",
+            model:
+              normalizeOptionalString(overrides.model) ??
+              normalizeOptionalString(config.modelId) ??
+              "gpt-4o-mini-tts",
+            voice:
+              normalizeOptionalString(overrides.voice) ??
+              normalizeOptionalString(config.voiceId) ??
+              "alloy",
             ...(asNumber(overrides.speed) == null ? {} : { speed: asNumber(overrides.speed) }),
           });
           const audioBuffer = await fetchStubSpeechAudio(
@@ -113,11 +118,15 @@ export function createDefaultGatewayTestSpeechProviders() {
         label: TALK_TEST_PROVIDER_LABEL,
         voices: ["stub-default-voice", "stub-alt-voice"],
         resolveTalkOverrides: ({ params }) => ({
-          ...(trimString(params.voiceId) == null ? {} : { voiceId: trimString(params.voiceId) }),
-          ...(trimString(params.modelId) == null ? {} : { modelId: trimString(params.modelId) }),
-          ...(trimString(params.outputFormat) == null
+          ...(normalizeOptionalString(params.voiceId) == null
             ? {}
-            : { outputFormat: trimString(params.outputFormat) }),
+            : { voiceId: normalizeOptionalString(params.voiceId) }),
+          ...(normalizeOptionalString(params.modelId) == null
+            ? {}
+            : { modelId: normalizeOptionalString(params.modelId) }),
+          ...(normalizeOptionalString(params.outputFormat) == null
+            ? {}
+            : { outputFormat: normalizeOptionalString(params.outputFormat) }),
           ...(asNumber(params.latencyTier) == null
             ? {}
             : { latencyTier: asNumber(params.latencyTier) }),

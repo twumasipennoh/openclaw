@@ -1,19 +1,13 @@
-import { describe, expect, it } from "vitest";
 import {
   createRequestCaptureJsonFetch,
   installPinnedHostnameTestHooks,
-} from "../../src/media-understanding/audio.test-helpers.ts";
+} from "openclaw/plugin-sdk/test-media-understanding";
+import { describe, expect, it } from "vitest";
 import { mistralMediaUnderstandingProvider } from "./media-understanding-provider.js";
 
 installPinnedHostnameTestHooks();
 
 describe("mistralMediaUnderstandingProvider", () => {
-  it("has expected provider metadata", () => {
-    expect(mistralMediaUnderstandingProvider.id).toBe("mistral");
-    expect(mistralMediaUnderstandingProvider.capabilities).toEqual(["audio"]);
-    expect(mistralMediaUnderstandingProvider.transcribeAudio).toBeDefined();
-  });
-
   it("uses Mistral base URL by default", async () => {
     const { fetchFn, getRequest } = createRequestCaptureJsonFetch({ text: "bonjour" });
 

@@ -1,7 +1,11 @@
+import { resolveTimerTimeoutMs } from "openclaw/plugin-sdk/number-runtime";
+import { sleepWithAbort } from "openclaw/plugin-sdk/runtime-env";
+import { raceWithTimeout } from "openclaw/plugin-sdk/time-runtime";
+
 const RACE_TIMEOUT = Symbol("race-timeout");
 const RACE_ABORT = Symbol("race-abort");
 
-export type RaceWithTimeoutAndAbortResult<T> =
+type RaceWithTimeoutAndAbortResult<T> =
   | { status: "resolved"; value: T }
   | { status: "timeout" }
   | { status: "aborted" };
@@ -21,17 +25,8 @@ export async function raceWithTimeoutAndAbort<T>(
     return { status: "resolved", value: await promise };
   }
 
-  let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
   let abortHandler: (() => void) | undefined;
-  const contenders: Array<Promise<T | typeof RACE_TIMEOUT | typeof RACE_ABORT>> = [promise];
-
-  if (options.timeoutMs !== undefined) {
-    contenders.push(
-      new Promise((resolve) => {
-        timeoutHandle = setTimeout(() => resolve(RACE_TIMEOUT), options.timeoutMs);
-      }),
-    );
-  }
+  const contenders: Array<Promise<T | typeof RACE_ABORT>> = [promise];
 
   if (options.abortSignal) {
     contenders.push(
@@ -43,7 +38,15 @@ export async function raceWithTimeoutAndAbort<T>(
   }
 
   try {
-    const result = await Promise.race(contenders);
+    const settled = Promise.race(contenders);
+    const result =
+      options.timeoutMs === undefined
+        ? await settled
+        : await raceWithTimeout(
+            settled,
+            resolveTimerTimeoutMs(options.timeoutMs, 1),
+            (): typeof RACE_TIMEOUT => RACE_TIMEOUT,
+          );
     if (result === RACE_TIMEOUT) {
       return { status: "timeout" };
     }
@@ -52,9 +55,6 @@ export async function raceWithTimeoutAndAbort<T>(
     }
     return { status: "resolved", value: result };
   } finally {
-    if (timeoutHandle) {
-      clearTimeout(timeoutHandle);
-    }
     if (abortHandler) {
       options.abortSignal?.removeEventListener("abort", abortHandler);
     }
@@ -69,18 +69,13 @@ export function waitForAbortableDelay(
     return Promise.resolve(false);
   }
 
-  return new Promise((resolve) => {
-    const handleAbort = () => {
-      clearTimeout(timer);
-      resolve(false);
-    };
-
-    const timer = setTimeout(() => {
-      abortSignal?.removeEventListener("abort", handleAbort);
-      resolve(true);
-    }, delayMs);
-    timer.unref?.();
-
-    abortSignal?.addEventListener("abort", handleAbort, { once: true });
-  });
+  return sleepWithAbort(resolveTimerTimeoutMs(delayMs, 1), abortSignal, { ref: false }).then(
+    () => true,
+    (error: unknown) => {
+      if (error instanceof Error && error.name === "AbortError") {
+        return false;
+      }
+      throw error;
+    },
+  );
 }

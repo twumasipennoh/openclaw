@@ -1,173 +1,216 @@
 import fs from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
-import type {
-  MemorySearchConfig,
-  OpenClawConfig,
+import { DatabaseSync } from "node:sqlite";
+import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
+import {
+  resolveMemorySearchConfig,
+  type OpenClawConfig,
 } from "openclaw/plugin-sdk/memory-core-host-engine-foundation";
+import { MEMORY_INDEX_CHUNKS_TABLE } from "openclaw/plugin-sdk/memory-core-host-engine-storage";
+import { createOpenClawTestState } from "openclaw/plugin-sdk/test-state";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { MemoryIndexManager } from "./index.js";
-import { registerBuiltInMemoryEmbeddingProviders } from "./provider-adapters.js";
+import {
+  configureMemoryCoreDreamingStateForTests,
+  resetMemoryCoreDreamingStateForTests,
+} from "../test-helpers.js";
+import { runInMemoryTestBackgroundContext } from "./background-context.test-support.js";
+import { MemoryIndexManager } from "./manager.js";
+import * as settling from "./watch-settle.js";
 
-const { watchMock } = vi.hoisted(() => ({
-  watchMock: vi.fn(() => ({
-    on: vi.fn(),
-    close: vi.fn(async () => undefined),
-  })),
+vi.mock("./watch-settle.js", async (original) => ({
+  ...(await original<typeof import("./watch-settle.js")>()),
 }));
 
-vi.mock("chokidar", () => ({
-  default: { watch: watchMock },
-  watch: watchMock,
+const observer = await vi.hoisted(async () => {
+  const { createMemoryObservationHarness } = await import("./watcher-test-support.js");
+  return createMemoryObservationHarness();
+});
+vi.mock("openclaw/plugin-sdk/file-access-runtime", async (original) => ({
+  ...(await original<typeof import("openclaw/plugin-sdk/file-access-runtime")>()),
+  watch: observer.watch,
 }));
 
-vi.mock("./sqlite-vec.js", () => ({
-  loadSqliteVecExtension: async () => ({ ok: false, error: "sqlite-vec disabled in tests" }),
-}));
-
-vi.mock("./embeddings.js", () => ({
-  createEmbeddingProvider: async () => ({
-    requestedProvider: "openai",
-    provider: {
-      id: "mock",
-      model: "mock-embed",
-      embedQuery: async () => [1, 0],
-      embedBatch: async (texts: string[]) => texts.map(() => [1, 0]),
-    },
-  }),
-}));
-
-type MemoryIndexModule = typeof import("./index.js");
-type MemoryEmbeddingProvidersModule =
-  typeof import("../../../../src/plugins/memory-embedding-providers.js");
-
-let getMemorySearchManager: MemoryIndexModule["getMemorySearchManager"];
-let closeAllMemorySearchManagers: MemoryIndexModule["closeAllMemorySearchManagers"];
-let clearRegistry: MemoryEmbeddingProvidersModule["clearMemoryEmbeddingProviders"];
-let registerAdapter: MemoryEmbeddingProvidersModule["registerMemoryEmbeddingProvider"];
-
-describe("memory watcher config", () => {
+describe("Memory watch configuration", () => {
+  let state: Awaited<ReturnType<typeof createOpenClawTestState>>;
   let manager: MemoryIndexManager | null = null;
-  let workspaceDir = "";
-  let extraDir = "";
-
   beforeEach(async () => {
-    vi.resetModules();
-    ({ getMemorySearchManager, closeAllMemorySearchManagers } = await import("./index.js"));
-    ({
-      clearMemoryEmbeddingProviders: clearRegistry,
-      registerMemoryEmbeddingProvider: registerAdapter,
-    } = await import("../../../../src/plugins/memory-embedding-providers.js"));
-    vi.clearAllMocks();
-    clearRegistry();
-    registerBuiltInMemoryEmbeddingProviders({ registerMemoryEmbeddingProvider: registerAdapter });
+    observer.reset();
+    vi.stubEnv("CHOKIDAR_USEPOLLING", "false");
+    vi.stubEnv("CHOKIDAR_INTERVAL", undefined);
+    state = await createOpenClawTestState({ label: "memory-watch-config" });
+    await fs.mkdir(path.join(state.workspaceDir, "memory"));
+    await fs.mkdir(state.path("extra"));
   });
-
   afterEach(async () => {
-    watchMock.mockClear();
-    if (manager) {
-      await manager.close();
-      manager = null;
-    }
-    await closeAllMemorySearchManagers();
-    clearRegistry();
-    if (workspaceDir) {
-      await fs.rm(workspaceDir, { recursive: true, force: true });
-      workspaceDir = "";
-      extraDir = "";
-    }
+    await manager?.close();
+    manager = null;
+    vi.restoreAllMocks();
+    vi.useRealTimers();
+    vi.unstubAllEnvs();
+    resetMemoryCoreDreamingStateForTests();
+    await state.cleanup();
   });
-
-  async function setupWatcherWorkspace(seedFile: { name: string; contents: string }) {
-    workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-memory-watch-"));
-    extraDir = path.join(workspaceDir, "extra");
-    await fs.mkdir(path.join(workspaceDir, "memory"), { recursive: true });
-    await fs.mkdir(extraDir, { recursive: true });
-    await fs.writeFile(path.join(extraDir, seedFile.name), seedFile.contents);
-  }
-
-  function createWatcherConfig(overrides?: Partial<MemorySearchConfig>): OpenClawConfig {
-    const defaults: NonNullable<NonNullable<OpenClawConfig["agents"]>["defaults"]> = {
-      workspace: workspaceDir,
-      memorySearch: {
-        provider: "openai",
-        model: "mock-embed",
-        store: { path: path.join(workspaceDir, "index.sqlite"), vector: { enabled: false } },
-        sync: { watch: true, watchDebounceMs: 25, onSessionStart: false, onSearch: false },
-        query: { minScore: 0, hybrid: { enabled: false } },
-        extraPaths: [extraDir],
-        ...overrides,
+  function config(): OpenClawConfig {
+    return {
+      plugins: { enabled: false },
+      agents: { defaults: { workspace: state.workspaceDir }, entries: { main: {} } },
+      memory: {
+        search: {
+          provider: "none",
+          sources: ["memory"],
+          store: { vector: { enabled: false } },
+          extraPaths: [state.path("extra")],
+        },
       },
     };
-    return {
-      agents: {
-        defaults,
-        list: [{ id: "main", default: true }],
-      },
-    } as OpenClawConfig;
   }
-
-  async function expectWatcherManager(cfg: OpenClawConfig) {
-    const result = await getMemorySearchManager({ cfg, agentId: "main" });
-    expect(result.manager).not.toBeNull();
-    if (!result.manager) {
-      throw new Error("manager missing");
+  function observing(absolute: string) {
+    const result = observer.observations.find((entry) =>
+      entry.options.scopes.some(
+        (scope) => path.resolve(entry.root.rootDir, scope.path) === absolute,
+      ),
+    );
+    if (!result) {
+      throw new Error("Missing observation for " + absolute);
     }
-    manager = result.manager as unknown as MemoryIndexManager;
+    return result;
   }
 
-  it("watches markdown globs and ignores dependency directories", async () => {
-    await setupWatcherWorkspace({ name: "notes.md", contents: "hello" });
-    const cfg = createWatcherConfig();
-
-    await expectWatcherManager(cfg);
-
-    expect(watchMock).toHaveBeenCalledTimes(1);
-    const [watchedPaths, options] = watchMock.mock.calls[0] as unknown as [
-      string[],
-      Record<string, unknown>,
-    ];
-    expect(watchedPaths).toEqual(
-      expect.arrayContaining([
-        path.join(workspaceDir, "MEMORY.md"),
-        path.join(workspaceDir, "memory.md"),
-        path.join(workspaceDir, "memory", "**", "*.md"),
-        path.join(extraDir, "**", "*.md"),
-      ]),
+  it("keeps a newer selected-file dirty behind held settling before publishing the index", async () => {
+    const file = path.join(state.workspaceDir, "memory", "note.md");
+    await fs.writeFile(file, "Initial indexed text.");
+    await configureMemoryCoreDreamingStateForTests(state.env);
+    const cfg = config();
+    const debounceMs = resolveMemorySearchConfig(cfg, "main")!.sync.watchDebounceMs;
+    manager = await MemoryIndexManager.get({
+      runInBackgroundContext: runInMemoryTestBackgroundContext,
+      cfg,
+      agentId: "main",
+    });
+    if (!manager) {
+      throw new Error("memory manager unavailable");
+    }
+    await manager.sync({ reason: "test-initial-index" });
+    const indexPath = manager.status().dbPath;
+    if (!indexPath) {
+      throw new Error("memory index path unavailable");
+    }
+    const index = new DatabaseSync(indexPath, { readOnly: true });
+    const rows = index.prepare(
+      `SELECT path, text FROM ${MEMORY_INDEX_CHUNKS_TABLE} ORDER BY path, start_line`,
     );
-    expect(options.ignoreInitial).toBe(true);
-    expect(options.awaitWriteFinish).toEqual({ stabilityThreshold: 25, pollInterval: 100 });
+    const initial = [{ path: "memory/note.md", text: "Initial indexed text." }];
+    const entry = observing(path.join(state.workspaceDir, "memory"));
+    const entered = createDeferred<void>();
+    const release = createDeferred<void>();
+    const sampled = Array.from({ length: 4 }, () => createDeferred<void>());
+    const open = entry.root.open.bind(entry.root);
+    let sample = 0;
+    vi.spyOn(entry.root, "open").mockImplementation(async (...args) => {
+      const opened = await open(...args);
+      const current = sample++;
+      const dispose = opened[Symbol.asyncDispose].bind(opened);
+      vi.spyOn(opened, Symbol.asyncDispose).mockImplementation(async () => {
+        await dispose();
+        sampled[current]?.resolve();
+      });
+      if (current === 0) {
+        entered.resolve();
+        await release.promise;
+      }
+      return opened;
+    });
+    const settle = settling.settleMemoryWatchEventPaths;
+    const passes: Array<Promise<boolean>> = [];
+    vi.spyOn(settling, "settleMemoryWatchEventPaths").mockImplementation((...args) => {
+      const pass = settle(...args);
+      passes.push(pass);
+      return pass;
+    });
+    const sync = vi.spyOn(manager, "sync");
+    const dirty = () =>
+      entry.dirty([{ path: path.relative(entry.root.rootDir, file), type: "content" }]);
+    vi.useFakeTimers();
+    try {
+      expect(manager.status().dirty).toBe(false);
+      await fs.writeFile(file, "Intermediate write.");
+      dirty();
+      expect(manager.status().dirty).toBe(true);
+      expect(sync).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(debounceMs);
+      await entered.promise;
+      await fs.writeFile(file, "Newest settled indexed text.");
+      dirty();
+      await vi.advanceTimersByTimeAsync(50);
+      expect(sync).not.toHaveBeenCalled();
+      expect(rows.all()).toEqual(initial);
 
-    const ignored = options.ignored as ((watchPath: string) => boolean) | undefined;
-    expect(ignored).toBeTypeOf("function");
-    expect(ignored?.(path.join(workspaceDir, "memory", "node_modules", "pkg", "index.md"))).toBe(
-      true,
-    );
-    expect(ignored?.(path.join(workspaceDir, "memory", ".venv", "lib", "python.md"))).toBe(true);
-    expect(ignored?.(path.join(workspaceDir, "memory", "project", "notes.md"))).toBe(false);
+      // The old sample completes last. It must neither erase the newer event
+      // nor publish the intermediate generation while the file is unsettled.
+      release.resolve();
+      await sampled[0]!.promise;
+      await vi.advanceTimersByTimeAsync(0);
+      await vi.advanceTimersByTimeAsync(100);
+      await expect(passes[0]).resolves.toBe(false);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(sync).not.toHaveBeenCalled();
+      expect(rows.all()).toEqual(initial);
+
+      await vi.advanceTimersByTimeAsync(debounceMs);
+      await sampled[2]!.promise;
+      await vi.advanceTimersByTimeAsync(0);
+      expect(sync).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(100);
+      await expect(passes[1]).resolves.toBe(true);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(sync).toHaveBeenCalledExactlyOnceWith({ reason: "watch" });
+      await sync.mock.results[0]!.value;
+      expect(rows.all()).toEqual([
+        { path: "memory/note.md", text: "Newest settled indexed text." },
+      ]);
+      expect(sample).toBe(4);
+    } finally {
+      release.resolve();
+      await manager.close();
+      index.close();
+    }
   });
 
-  it("watches multimodal extensions with case-insensitive globs", async () => {
-    await setupWatcherWorkspace({ name: "PHOTO.PNG", contents: "png" });
-    const cfg = createWatcherConfig({
-      provider: "gemini",
-      model: "gemini-embedding-2-preview",
-      fallback: "none",
-      multimodal: { enabled: true, modalities: ["image", "audio"] },
+  it("refreshes every search after watch-limit without further notifications", async () => {
+    const file = path.join(state.workspaceDir, "memory", "note.md");
+    await fs.writeFile(file, "Amber lantern baseline.");
+    await configureMemoryCoreDreamingStateForTests(state.env);
+    manager = await MemoryIndexManager.get({
+      runInBackgroundContext: runInMemoryTestBackgroundContext,
+      cfg: config(),
+      agentId: "main",
     });
-
-    await expectWatcherManager(cfg);
-
-    expect(watchMock).toHaveBeenCalledTimes(1);
-    const [watchedPaths] = watchMock.mock.calls[0] as unknown as [
-      string[],
-      Record<string, unknown>,
-    ];
-    expect(watchedPaths).toEqual(
+    if (!manager) {
+      throw new Error("memory manager unavailable");
+    }
+    await manager.sync({ reason: "initial" });
+    observer.observations[0]!.health({ state: "ready", mode: "poll" });
+    expect(manager.status().custom?.watcher).toEqual(
       expect.arrayContaining([
-        path.join(extraDir, "**", "*.[pP][nN][gG]"),
-        path.join(extraDir, "**", "*.[wW][aA][vV]"),
+        expect.objectContaining({ mode: "poll", pollingFallback: true, pollIntervalMs: 30_000 }),
       ]),
     );
+    vi.useFakeTimers();
+    observer.observations[0]!.health({
+      state: "unavailable",
+      failure: { operation: "watch", code: "watch-limit", error: new Error("watch limit") },
+    });
+    const lifecycle = manager as unknown as { awaitManagerIdle: () => Promise<void> };
+    for (const text of ["Cobalt heron discovered.", "Violet badger replaced it."]) {
+      await fs.writeFile(file, text);
+      // Search schedules maintenance while serving its captured published generation.
+      await manager.search(text, { minScore: 0 });
+      await lifecycle.awaitManagerIdle();
+      expect(
+        (await manager.search(text, { minScore: 0 })).map((result) => result.snippet),
+      ).toContain(text);
+      await lifecycle.awaitManagerIdle();
+    }
+    expect(await manager.search("Cobalt heron", { minScore: 0 })).toEqual([]);
   });
 });

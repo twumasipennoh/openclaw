@@ -1,207 +1,97 @@
+/** Tests ACP prompt cwd redaction, timeout metadata, and provenance fallback. */
 import os from "node:os";
 import path from "node:path";
-import type { PromptRequest } from "@agentclientprotocol/sdk";
+import { createInMemorySessionStore } from "@openclaw/acp-core/session";
 import { describe, expect, it, vi } from "vitest";
 import type { GatewayClient } from "../gateway/client.js";
-import { createInMemorySessionStore } from "./session.js";
-import { AcpGatewayAgent } from "./translator.js";
-import { createAcpConnection, createAcpGateway } from "./translator.test-helpers.js";
+import { withEnvAsync } from "../test-utils/env.js";
+import { createPromptRequest, requireAcpObject } from "./translator.bridge-test-helpers.js";
+import {
+  createAcpConnection,
+  createAcpGateway,
+  createAcpGatewayAgent,
+} from "./translator.test-helpers.js";
 
-const TEST_SESSION_ID = "session-1";
-const TEST_SESSION_KEY = "agent:main:main";
-const TEST_PROMPT = {
-  sessionId: TEST_SESSION_ID,
-  prompt: [{ type: "text", text: "hello" }],
-  _meta: {},
-} as unknown as PromptRequest;
-
-describe("acp prompt cwd prefix", () => {
-  const createStopAfterSendSpy = () =>
-    vi.fn(async (method: string) => {
-      if (method === "chat.send") {
-        throw new Error("stop-after-send");
-      }
-      return {};
-    });
-
-  async function runPromptAndCaptureRequest(
-    options: {
-      cwd?: string;
-      prefixCwd?: boolean;
-      provenanceMode?: "meta" | "meta+receipt";
-    } = {},
-  ) {
-    const sessionStore = createInMemorySessionStore();
-    sessionStore.createSession({
-      sessionId: TEST_SESSION_ID,
-      sessionKey: TEST_SESSION_KEY,
-      cwd: options.cwd ?? path.join(os.homedir(), "openclaw-test"),
-    });
-
-    const requestSpy = createStopAfterSendSpy();
-    const agent = new AcpGatewayAgent(
-      createAcpConnection(),
-      createAcpGateway(requestSpy as unknown as GatewayClient["request"]),
-      {
-        sessionStore,
-        prefixCwd: options.prefixCwd,
-        provenanceMode: options.provenanceMode,
-      },
-    );
-
-    await expect(agent.prompt(TEST_PROMPT)).rejects.toThrow("stop-after-send");
-    return requestSpy;
-  }
-
-  async function runPromptWithCwd(cwd: string) {
-    const pinnedHome = os.homedir();
-    const previousOpenClawHome = process.env.OPENCLAW_HOME;
-    const previousHome = process.env.HOME;
-    delete process.env.OPENCLAW_HOME;
-    process.env.HOME = pinnedHome;
-
-    try {
-      return await runPromptAndCaptureRequest({ cwd, prefixCwd: true });
-    } finally {
-      if (previousOpenClawHome === undefined) {
-        delete process.env.OPENCLAW_HOME;
-      } else {
-        process.env.OPENCLAW_HOME = previousOpenClawHome;
-      }
-      if (previousHome === undefined) {
-        delete process.env.HOME;
-      } else {
-        process.env.HOME = previousHome;
-      }
+const sessionId = "session-1";
+const sessionKey = "agent:main:main";
+function fixture(provenanceMode?: "meta+receipt") {
+  const sessionStore = createInMemorySessionStore();
+  sessionStore.createSession({
+    sessionId,
+    sessionKey,
+    cwd: path.join(os.homedir(), "openclaw-test"),
+  });
+  const request = vi.fn(async (method: string) => {
+    if (method === "chat.send") {
+      throw new Error("stop-after-send");
     }
-  }
+    return {};
+  });
+  const agent = createAcpGatewayAgent(
+    createAcpConnection(),
+    createAcpGateway(request as GatewayClient["request"]),
+    { sessionStore, prefixCwd: true, provenanceMode },
+  );
+  return { agent, request };
+}
+function payload(request: { mock: { calls: unknown[][] } }, index = 0) {
+  const call = request.mock.calls[index];
+  expect(call?.[0]).toBe("chat.send");
+  expect(call?.[2]).toEqual({ timeoutMs: null });
+  return requireAcpObject(call?.[1], `chat.send payload ${index}`);
+}
 
+describe("acp prompt metadata", () => {
   it("redacts home directory in prompt prefix", async () => {
-    const requestSpy = await runPromptWithCwd(path.join(os.homedir(), "openclaw-test"));
-    expect(requestSpy).toHaveBeenCalledWith(
-      "chat.send",
-      expect.objectContaining({
-        message: expect.stringMatching(/\[Working directory: ~[\\/]openclaw-test\]/),
-      }),
-      { timeoutMs: null },
-    );
+    await withEnvAsync({ OPENCLAW_HOME: undefined, HOME: os.homedir() }, async () => {
+      const { agent, request } = fixture();
+      await expect(agent.prompt(createPromptRequest(sessionId, "hello"))).rejects.toThrow(
+        "stop-after-send",
+      );
+      expect(payload(request).message).toMatch(/\[Working directory: ~[\\/]openclaw-test\]/);
+    });
   });
 
-  it("keeps backslash separators when cwd uses them", async () => {
-    const requestSpy = await runPromptWithCwd(`${os.homedir()}\\openclaw-test`);
-    expect(requestSpy).toHaveBeenCalledWith(
-      "chat.send",
-      expect.objectContaining({
-        message: expect.stringContaining("[Working directory: ~\\openclaw-test]"),
-      }),
-      { timeoutMs: null },
-    );
-  });
-
-  it("injects system provenance metadata when enabled", async () => {
-    const requestSpy = await runPromptAndCaptureRequest({ provenanceMode: "meta" });
-    expect(requestSpy).toHaveBeenCalledWith(
-      "chat.send",
-      expect.objectContaining({
-        systemInputProvenance: {
-          kind: "external_user",
-          originSessionId: TEST_SESSION_ID,
-          sourceChannel: "acp",
-          sourceTool: "openclaw_acp",
-        },
-        systemProvenanceReceipt: undefined,
-      }),
-      { timeoutMs: null },
-    );
-  });
-
-  it("injects a system provenance receipt when requested", async () => {
-    const requestSpy = await runPromptAndCaptureRequest({ provenanceMode: "meta+receipt" });
-    expect(requestSpy).toHaveBeenCalledWith(
-      "chat.send",
-      expect.objectContaining({
-        systemInputProvenance: {
-          kind: "external_user",
-          originSessionId: TEST_SESSION_ID,
-          sourceChannel: "acp",
-          sourceTool: "openclaw_acp",
-        },
-        systemProvenanceReceipt: expect.stringContaining("[Source Receipt]"),
-      }),
-      { timeoutMs: null },
-    );
-    expect(requestSpy).toHaveBeenCalledWith(
-      "chat.send",
-      expect.objectContaining({
-        systemProvenanceReceipt: expect.stringContaining("bridge=openclaw-acp"),
-      }),
-      { timeoutMs: null },
-    );
-    expect(requestSpy).toHaveBeenCalledWith(
-      "chat.send",
-      expect.objectContaining({
-        systemProvenanceReceipt: expect.stringContaining(`originSessionId=${TEST_SESSION_ID}`),
-      }),
-      { timeoutMs: null },
-    );
-    expect(requestSpy).toHaveBeenCalledWith(
-      "chat.send",
-      expect.objectContaining({
-        systemProvenanceReceipt: expect.stringContaining(`targetSession=${TEST_SESSION_KEY}`),
-      }),
-      { timeoutMs: null },
-    );
+  it("does not forward malformed prompt timeout metadata", async () => {
+    for (const timeoutMs of [-1, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
+      const { agent, request } = fixture();
+      await expect(
+        agent.prompt(createPromptRequest(sessionId, "hello", { timeoutMs })),
+      ).rejects.toThrow("stop-after-send");
+      expect(payload(request).timeoutMs).toBeUndefined();
+    }
   });
 
   it("retries without provenance when the gateway rejects admin-only provenance fields", async () => {
-    const requestSpy = vi
-      .fn()
-      .mockRejectedValueOnce(
-        Object.assign(new Error("system provenance fields require admin scope"), {
-          name: "GatewayClientRequestError",
-          gatewayCode: "INVALID_REQUEST",
-        }),
-      )
-      .mockRejectedValueOnce(new Error("stop-after-send"));
-    const sessionStore = createInMemorySessionStore();
-    sessionStore.createSession({
-      sessionId: TEST_SESSION_ID,
-      sessionKey: TEST_SESSION_KEY,
-      cwd: path.join(os.homedir(), "openclaw-test"),
+    const { agent, request } = fixture("meta+receipt");
+    request.mockRejectedValueOnce(
+      Object.assign(new Error("system provenance fields require admin scope"), {
+        name: "GatewayClientRequestError",
+        gatewayCode: "INVALID_REQUEST",
+      }),
+    );
+    await expect(agent.prompt(createPromptRequest(sessionId, "hello"))).rejects.toThrow(
+      "stop-after-send",
+    );
+    expect(request).toHaveBeenCalledTimes(2);
+    const first = payload(request);
+    expect(first.systemInputProvenance).toEqual({
+      kind: "external_user",
+      originSessionId: sessionId,
+      sourceChannel: "acp",
+      sourceTool: "openclaw_acp",
     });
-    const agent = new AcpGatewayAgent(
-      createAcpConnection(),
-      createAcpGateway(requestSpy as unknown as GatewayClient["request"]),
-      {
-        sessionStore,
-        provenanceMode: "meta+receipt",
-      },
-    );
-
-    await expect(agent.prompt(TEST_PROMPT)).rejects.toThrow("stop-after-send");
-    expect(requestSpy).toHaveBeenCalledTimes(2);
-    expect(requestSpy).toHaveBeenNthCalledWith(
-      1,
-      "chat.send",
-      expect.objectContaining({
-        systemInputProvenance: {
-          kind: "external_user",
-          originSessionId: TEST_SESSION_ID,
-          sourceChannel: "acp",
-          sourceTool: "openclaw_acp",
-        },
-        systemProvenanceReceipt: expect.stringContaining("[Source Receipt]"),
-      }),
-      { timeoutMs: null },
-    );
-    expect(requestSpy).toHaveBeenNthCalledWith(
-      2,
-      "chat.send",
-      expect.not.objectContaining({
-        systemInputProvenance: expect.anything(),
-        systemProvenanceReceipt: expect.anything(),
-      }),
-      { timeoutMs: null },
-    );
+    expect(first.systemProvenanceReceipt).toBeTypeOf("string");
+    for (const field of [
+      "[Source Receipt]",
+      "bridge=openclaw-acp",
+      `originSessionId=${sessionId}`,
+      `targetSession=${sessionKey}`,
+    ]) {
+      expect(first.systemProvenanceReceipt).toContain(field);
+    }
+    const retry = payload(request, 1);
+    expect(retry.systemInputProvenance).toBeUndefined();
+    expect(retry.systemProvenanceReceipt).toBeUndefined();
   });
 });

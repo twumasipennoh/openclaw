@@ -3,14 +3,6 @@ import Testing
 @testable import OpenClaw
 
 struct ExecApprovalHelpersTests {
-    @Test func `parse decision trims and rejects invalid`() {
-        #expect(ExecApprovalHelpers.parseDecision("allow-once") == .allowOnce)
-        #expect(ExecApprovalHelpers.parseDecision(" allow-always ") == .allowAlways)
-        #expect(ExecApprovalHelpers.parseDecision("deny") == .deny)
-        #expect(ExecApprovalHelpers.parseDecision("") == nil)
-        #expect(ExecApprovalHelpers.parseDecision("nope") == nil)
-    }
-
     @Test func `allowlist pattern prefers resolution`() {
         let resolved = ExecCommandResolution(
             rawExecutable: "rg",
@@ -30,20 +22,12 @@ struct ExecApprovalHelpersTests {
     }
 
     @Test func `validate allowlist pattern returns reasons`() {
-        #expect(ExecApprovalHelpers.isPathPattern("/usr/bin/rg"))
-        #expect(ExecApprovalHelpers.isPathPattern(" ~/bin/rg "))
-        #expect(!ExecApprovalHelpers.isPathPattern("rg"))
+        #expect(ExecApprovalHelpers.validateAllowlistPattern("rg") == .valid("rg"))
 
         if case let .invalid(reason) = ExecApprovalHelpers.validateAllowlistPattern("  ") {
             #expect(reason == .empty)
         } else {
             Issue.record("Expected empty pattern rejection")
-        }
-
-        if case let .invalid(reason) = ExecApprovalHelpers.validateAllowlistPattern("echo") {
-            #expect(reason == .missingPathComponent)
-        } else {
-            Issue.record("Expected basename pattern rejection")
         }
     }
 

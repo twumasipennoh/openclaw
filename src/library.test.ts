@@ -1,10 +1,11 @@
+// Tests library entrypoint exports and package boundary behavior.
 import { readFileSync } from "node:fs";
-import { dirname, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
-import ts from "typescript";
+import { transformSync } from "esbuild";
 import { describe, expect, it } from "vitest";
+import { collectModuleReferencesFromSource } from "../scripts/lib/guard-inventory-utils.mjs";
+import { createNativeTypeScriptParser } from "../scripts/lib/native-typescript.mts";
 
-const libraryPath = resolve(dirname(fileURLToPath(import.meta.url)), "library.ts");
+const libraryPath = new URL("./library.ts", import.meta.url);
 const lazyRuntimeSpecifiers = [
   "./auto-reply/reply.runtime.js",
   "./cli/prompt.js",
@@ -13,38 +14,47 @@ const lazyRuntimeSpecifiers = [
   "./plugins/runtime/runtime-web-channel-plugin.js",
 ] as const;
 
-function readLibraryModuleImports() {
-  const sourceText = readFileSync(libraryPath, "utf8");
-  const sourceFile = ts.createSourceFile(libraryPath, sourceText, ts.ScriptTarget.Latest, true);
+function readLibraryModuleImports(sourceText = readFileSync(libraryPath, "utf8")) {
+  const { code } = transformSync(sourceText, {
+    loader: "ts",
+    format: "esm",
+    target: "esnext",
+    tsconfigRaw: { compilerOptions: { verbatimModuleSyntax: true } },
+  });
   const staticImports = new Set<string>();
   const dynamicImports = new Set<string>();
-
-  function visit(node: ts.Node) {
-    if (
-      ts.isImportDeclaration(node) &&
-      ts.isStringLiteral(node.moduleSpecifier) &&
-      !node.importClause?.isTypeOnly
-    ) {
-      staticImports.add(node.moduleSpecifier.text);
+  const parser = createNativeTypeScriptParser();
+  try {
+    const sourceFile = parser.parseSourceFile("library.mjs", code);
+    for (const { kind, specifier } of collectModuleReferencesFromSource(sourceFile)) {
+      if (kind === "import" || kind === "export") {
+        staticImports.add(specifier);
+      } else if (kind === "dynamic-import") {
+        dynamicImports.add(specifier);
+      }
     }
-
-    if (
-      ts.isCallExpression(node) &&
-      node.expression.kind === ts.SyntaxKind.ImportKeyword &&
-      node.arguments.length === 1 &&
-      ts.isStringLiteral(node.arguments[0])
-    ) {
-      dynamicImports.add(node.arguments[0].text);
-    }
-
-    ts.forEachChild(node, visit);
+  } finally {
+    parser.close();
   }
-
-  visit(sourceFile);
   return { dynamicImports, staticImports };
 }
 
 describe("library module imports", () => {
+  it("distinguishes runtime module edges from erased types", () => {
+    const { dynamicImports, staticImports } = readLibraryModuleImports(`
+      import "./side-effect.js";
+      import type { TypeOnly } from "./type-only.js";
+      import { value } from "./value.js";
+      export { reexported } from "./reexported.js";
+      export type { ExportType } from "./export-type.js";
+      type Query = import("./type-query.js").Query;
+      const lazy = () => import("./dynamic.js");
+    `);
+
+    expect([...staticImports]).toEqual(["./side-effect.js", "./value.js", "./reexported.js"]);
+    expect([...dynamicImports]).toEqual(["./dynamic.js"]);
+  });
+
   it("keeps lazy runtime boundaries on dynamic imports", () => {
     const { dynamicImports, staticImports } = readLibraryModuleImports();
 

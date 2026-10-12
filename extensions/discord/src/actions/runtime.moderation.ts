@@ -1,34 +1,21 @@
-import type { AgentToolResult } from "@mariozechner/pi-agent-core";
-import {
-  type ActionGate,
-  jsonResult,
-  readStringParam,
-  type DiscordActionConfig,
-} from "../runtime-api.js";
-import {
-  banMemberDiscord,
-  hasAnyGuildPermissionDiscord,
-  kickMemberDiscord,
-  timeoutMemberDiscord,
-} from "../send.js";
+import type { AgentToolResult } from "openclaw/plugin-sdk/agent-core";
+import type { ActionGate } from "openclaw/plugin-sdk/channel-actions";
+import { jsonResult, readStringParam } from "openclaw/plugin-sdk/channel-actions";
+import type { DiscordActionConfig, OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
+import * as discordModerationActionRuntime from "../send.js";
 import {
   isDiscordModerationAction,
   readDiscordModerationCommand,
   requiredGuildPermissionForModerationAction,
 } from "./runtime.moderation-shared.js";
-
-export const discordModerationActionRuntime = {
-  banMemberDiscord,
-  hasAnyGuildPermissionDiscord,
-  kickMemberDiscord,
-  timeoutMemberDiscord,
-};
+import { createDiscordActionOptions } from "./runtime.shared.js";
 
 async function verifySenderModerationPermission(params: {
   guildId: string;
   senderUserId?: string;
   requiredPermission: bigint;
   accountId?: string;
+  cfg: OpenClawConfig;
 }) {
   // CLI/manual flows may not have sender context; enforce only when present.
   if (!params.senderUserId) {
@@ -38,7 +25,7 @@ async function verifySenderModerationPermission(params: {
     params.guildId,
     params.senderUserId,
     [params.requiredPermission],
-    params.accountId ? { accountId: params.accountId } : undefined,
+    createDiscordActionOptions({ cfg: params.cfg, accountId: params.accountId }),
   );
   if (!hasPermission) {
     throw new Error("Sender does not have required permissions for this moderation action.");
@@ -49,6 +36,7 @@ export async function handleDiscordModerationAction(
   action: string,
   params: Record<string, unknown>,
   isActionEnabled: ActionGate<DiscordActionConfig>,
+  cfg: OpenClawConfig,
 ): Promise<AgentToolResult<unknown>> {
   if (!isDiscordModerationAction(action)) {
     throw new Error(`Unknown action: ${action}`);
@@ -56,76 +44,39 @@ export async function handleDiscordModerationAction(
   if (!isActionEnabled("moderation", false)) {
     throw new Error("Discord moderation is disabled.");
   }
-  const command = readDiscordModerationCommand(action, params);
+  if (!cfg) {
+    throw new Error("Discord moderation actions require a resolved runtime config.");
+  }
   const accountId = readStringParam(params, "accountId");
+  const command = readDiscordModerationCommand(action, params);
   const senderUserId = readStringParam(params, "senderUserId");
+  const withOpts = () => createDiscordActionOptions({ cfg, accountId });
   await verifySenderModerationPermission({
     guildId: command.guildId,
     senderUserId,
     requiredPermission: requiredGuildPermissionForModerationAction(command.action),
     accountId,
+    cfg,
   });
-  switch (command.action) {
-    case "timeout": {
-      const member = accountId
-        ? await discordModerationActionRuntime.timeoutMemberDiscord(
-            {
-              guildId: command.guildId,
-              userId: command.userId,
-              durationMinutes: command.durationMinutes,
-              until: command.until,
-              reason: command.reason,
-            },
-            { accountId },
-          )
-        : await discordModerationActionRuntime.timeoutMemberDiscord({
-            guildId: command.guildId,
-            userId: command.userId,
-            durationMinutes: command.durationMinutes,
-            until: command.until,
-            reason: command.reason,
-          });
-      return jsonResult({ ok: true, member });
-    }
-    case "kick": {
-      if (accountId) {
-        await discordModerationActionRuntime.kickMemberDiscord(
-          {
-            guildId: command.guildId,
-            userId: command.userId,
-            reason: command.reason,
-          },
-          { accountId },
-        );
-      } else {
-        await discordModerationActionRuntime.kickMemberDiscord({
-          guildId: command.guildId,
-          userId: command.userId,
-          reason: command.reason,
-        });
-      }
-      return jsonResult({ ok: true });
-    }
-    case "ban": {
-      if (accountId) {
-        await discordModerationActionRuntime.banMemberDiscord(
-          {
-            guildId: command.guildId,
-            userId: command.userId,
-            reason: command.reason,
-            deleteMessageDays: command.deleteMessageDays,
-          },
-          { accountId },
-        );
-      } else {
-        await discordModerationActionRuntime.banMemberDiscord({
-          guildId: command.guildId,
-          userId: command.userId,
-          reason: command.reason,
-          deleteMessageDays: command.deleteMessageDays,
-        });
-      }
-      return jsonResult({ ok: true });
-    }
+  const target = { guildId: command.guildId, userId: command.userId, reason: command.reason };
+  if (command.action === "timeout") {
+    const member = await discordModerationActionRuntime.timeoutMemberDiscord(
+      {
+        ...target,
+        durationMinutes: command.durationMinutes,
+        until: command.until,
+      },
+      withOpts(),
+    );
+    return jsonResult({ ok: true, member });
   }
+  if (command.action === "kick") {
+    await discordModerationActionRuntime.kickMemberDiscord(target, withOpts());
+    return jsonResult({ ok: true });
+  }
+  await discordModerationActionRuntime.banMemberDiscord(
+    { ...target, deleteMessageDays: command.deleteMessageDays },
+    withOpts(),
+  );
+  return jsonResult({ ok: true });
 }

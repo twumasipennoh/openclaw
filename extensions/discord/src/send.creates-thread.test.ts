@@ -1,565 +1,353 @@
-import { RateLimitError } from "@buape/carbon";
 import { ChannelType, Routes } from "discord-api-types/v10";
-import { loadWebMediaRaw } from "openclaw/plugin-sdk/web-media";
-import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { makeDiscordRest } from "./send.test-harness.js";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { hasDiscordMessageCreateAmbiguity } from "./retry.js";
+import { registerSendAssetsAndRetriesTests } from "./send.assets-and-retries.test-support.js";
+import { makeDiscordRest, requestBody, requestPath } from "./send.test-harness.js";
 
 vi.mock("openclaw/plugin-sdk/web-media", async () => {
   const { discordWebMediaMockFactory } = await import("./send.test-harness.js");
   return discordWebMediaMockFactory();
 });
 
-let addRoleDiscord: typeof import("./send.js").addRoleDiscord;
-let banMemberDiscord: typeof import("./send.js").banMemberDiscord;
-let createThreadDiscord: typeof import("./send.js").createThreadDiscord;
-let listGuildEmojisDiscord: typeof import("./send.js").listGuildEmojisDiscord;
-let listThreadsDiscord: typeof import("./send.js").listThreadsDiscord;
-let reactMessageDiscord: typeof import("./send.js").reactMessageDiscord;
-let removeRoleDiscord: typeof import("./send.js").removeRoleDiscord;
-let sendMessageDiscord: typeof import("./send.js").sendMessageDiscord;
-let sendPollDiscord: typeof import("./send.js").sendPollDiscord;
-let sendStickerDiscord: typeof import("./send.js").sendStickerDiscord;
-let timeoutMemberDiscord: typeof import("./send.js").timeoutMemberDiscord;
-let uploadEmojiDiscord: typeof import("./send.js").uploadEmojiDiscord;
-let uploadStickerDiscord: typeof import("./send.js").uploadStickerDiscord;
+let send: typeof import("./send.js");
+let discordOutbound: typeof import("./outbound-adapter.js").discordOutbound;
+const cfg = { channels: { discord: { accounts: { default: {} } } } };
+const retry = { attempts: 2, minDelayMs: 0, maxDelayMs: 0, jitter: 0 };
+const multiline = Array.from({ length: 18 }, (_, index) => `line ${index + 1}`).join("\n");
+const clientOpts = (rest: ReturnType<typeof makeDiscordRest>["rest"]) => ({
+  cfg,
+  rest,
+  token: "t",
+});
 
-function createCompatRateLimitError(
-  response: Response,
-  body: { message: string; retry_after: number; global: boolean },
-  request?: Request,
-): RateLimitError {
-  const compatRequest =
-    request ??
-    new Request("https://discord.com/api/v10/channels/789/messages", {
-      method: "POST",
-    });
-  const RateLimitErrorCtor = RateLimitError as unknown as new (
-    response: Response,
-    body: { message: string; retry_after: number; global: boolean },
-    request?: Request,
-  ) => RateLimitError;
-  return new RateLimitErrorCtor(response, body, compatRequest);
+function threadHarness(type = ChannelType.GuildText) {
+  const mocks = makeDiscordRest();
+  mocks.getMock.mockResolvedValue({ type });
+  mocks.postMock.mockResolvedValue({ id: "t1", channel_id: "t1" });
+  return { ...mocks, opts: clientOpts(mocks.rest) };
+}
+
+function forumPayloadHarness() {
+  const { rest, getMock, postMock } = makeDiscordRest();
+  let messageCount = 0;
+  getMock.mockImplementation(async (path: unknown) => ({
+    id: String(path).split("/").at(-1),
+    type: path === Routes.channel("700") ? ChannelType.GuildForum : ChannelType.PublicThread,
+  }));
+  postMock.mockImplementation(async (path: unknown) =>
+    path === Routes.threads("700")
+      ? { id: "701", message: { id: "starter", channel_id: "701" } }
+      : { id: `message-${++messageCount}`, channel_id: String(path).split("/").at(-2) },
+  );
+  return {
+    postMock,
+    run: (
+      payload: { text: string; mediaUrls?: string[] },
+      options: Pick<
+        Parameters<NonNullable<typeof discordOutbound.sendPayload>>[0],
+        "threadId" | "onDeliveryResult"
+      > = {},
+    ) =>
+      discordOutbound.sendPayload?.({
+        cfg,
+        to: "channel:700",
+        text: payload.text,
+        payload,
+        ...options,
+        deps: {
+          discord: async (...[to, text, opts]: Parameters<typeof send.sendMessageDiscord>) =>
+            await send.sendMessageDiscord(to, text, { ...opts, rest, token: "t" }),
+        },
+      }),
+  };
 }
 
 beforeAll(async () => {
-  ({
-    addRoleDiscord,
-    banMemberDiscord,
-    createThreadDiscord,
-    listGuildEmojisDiscord,
-    listThreadsDiscord,
-    reactMessageDiscord,
-    removeRoleDiscord,
-    sendMessageDiscord,
-    sendPollDiscord,
-    sendStickerDiscord,
-    timeoutMemberDiscord,
-    uploadEmojiDiscord,
-    uploadStickerDiscord,
-  } = await import("./send.js"));
+  send = await import("./send.js");
+  ({ discordOutbound } = await import("./outbound-adapter.js"));
+});
+beforeEach(() => vi.clearAllMocks());
+afterEach(() => {
+  vi.useRealTimers();
+  vi.restoreAllMocks();
+});
+afterAll(() => vi.doUnmock("openclaw/plugin-sdk/web-media"));
+registerSendAssetsAndRetriesTests(() => send);
+
+describe("forum outbound delivery", () => {
+  it("keeps long text and multiple attachments in one automatically created thread", async () => {
+    const { postMock, run } = forumPayloadHarness();
+    const onDeliveryResult = vi.fn();
+    const result = await run(
+      {
+        text: "a".repeat(2001),
+        mediaUrls: ["https://example.com/first.jpg", "https://example.com/second.jpg"],
+      },
+      { onDeliveryResult },
+    );
+    expect(postMock.mock.calls.map(([path]) => path)).toEqual([
+      Routes.threads("700"),
+      Routes.channelMessages("701"),
+      Routes.channelMessages("701"),
+    ]);
+    expect(onDeliveryResult.mock.calls.map(([delivery]) => delivery.target)).toEqual([
+      { kind: "channel", id: "701" },
+      { kind: "channel", id: "701" },
+      { kind: "channel", id: "701" },
+    ]);
+    expect(result?.receipt).toMatchObject({
+      threadId: "701",
+      platformMessageIds: ["starter", "message-1", "message-2"],
+    });
+  });
+
+  it("keeps chunked replies targeted at an explicitly selected thread", async () => {
+    const { postMock, run } = forumPayloadHarness();
+    const result = await run({ text: "a".repeat(2001) }, { threadId: "701" });
+    expect(postMock.mock.calls.map(([path]) => path)).toEqual([
+      Routes.channelMessages("701"),
+      Routes.channelMessages("701"),
+    ]);
+    expect(result?.receipt?.threadId).toBeUndefined();
+    expect(result?.receipt?.platformMessageIds).toEqual(["message-2"]);
+  });
+
+  it("does not attempt a follow-up when forum creation is rejected", async () => {
+    const { postMock, run } = forumPayloadHarness();
+    postMock.mockRejectedValueOnce(new Error("missing access"));
+    await expect(run({ text: "a".repeat(2001) })).rejects.toThrow("missing access");
+    expect(postMock.mock.calls.map(([path]) => path)).toEqual([Routes.threads("700")]);
+  });
+
+  it("does not follow up when delivery bookkeeping rejects the starter", async () => {
+    const { postMock, run } = forumPayloadHarness();
+    const onDeliveryResult = vi.fn().mockRejectedValue(new Error("delivery bookkeeping failed"));
+    await expect(run({ text: "a".repeat(2001) }, { onDeliveryResult })).rejects.toThrow(
+      "delivery bookkeeping failed",
+    );
+    expect(onDeliveryResult).toHaveBeenCalledOnce();
+    expect(postMock.mock.calls.map(([path]) => path)).toEqual([Routes.threads("700")]);
+  });
 });
 
-beforeEach(() => {
-  vi.clearAllMocks();
-});
-
-describe("sendMessageDiscord", () => {
-  it("creates a thread", async () => {
-    const { rest, getMock, postMock } = makeDiscordRest();
-    postMock.mockResolvedValue({ id: "t1" });
-    await createThreadDiscord("chan1", { name: "thread", messageId: "m1" }, { rest, token: "t" });
+describe("createThreadDiscord", () => {
+  it("creates a message-attached thread with an archive override and one multiline initial message", async () => {
+    const { opts, getMock, postMock } = threadHarness();
+    await send.createThreadDiscord(
+      "chan1",
+      { name: "thread", messageId: "1", autoArchiveMinutes: 4320, content: multiline },
+      opts,
+    );
     expect(getMock).not.toHaveBeenCalled();
-    expect(postMock).toHaveBeenCalledWith(
-      Routes.threads("chan1", "m1"),
-      expect.objectContaining({ body: { name: "thread" } }),
-    );
+    expect(postMock).toHaveBeenCalledTimes(2);
+    expect(requestPath(postMock)).toBe(Routes.threads("chan1", "1"));
+    expect(requestBody(postMock)).toEqual({ name: "thread", auto_archive_duration: 4320 });
+    expect(requestPath(postMock, 1)).toBe(Routes.channelMessages("t1"));
+    expect(requestBody(postMock, 1)).toMatchObject({ content: multiline, enforce_nonce: true });
   });
 
-  it("creates forum threads with an initial message", async () => {
-    const { rest, getMock, postMock } = makeDiscordRest();
-    getMock.mockResolvedValue({ type: ChannelType.GuildForum });
-    postMock.mockResolvedValue({ id: "t1" });
-    await createThreadDiscord("chan1", { name: "thread" }, { rest, token: "t" });
-    expect(getMock).toHaveBeenCalledWith(Routes.channel("chan1"));
-    expect(postMock).toHaveBeenCalledWith(
-      Routes.threads("chan1"),
-      expect.objectContaining({
-        body: {
-          name: "thread",
-          message: { content: "thread" },
-        },
-      }),
+  it("keeps original create authority after awaited channel metadata", async () => {
+    const { opts, getMock, postMock } = threadHarness();
+    let ownerCurrent = true;
+    const options = {
+      ...opts,
+      assertCreateAllowed: () => {
+        if (!ownerCurrent) {
+          throw new Error("Command owner was revoked");
+        }
+      },
+    };
+    getMock.mockImplementationOnce(async () => {
+      ownerCurrent = false;
+      options.assertCreateAllowed = () => {};
+      return { type: ChannelType.GuildText };
+    });
+    await expect(send.createThreadDiscord("chan1", { name: "thread" }, options)).rejects.toThrow(
+      "Command owner was revoked",
     );
+    expect(postMock).not.toHaveBeenCalled();
   });
 
-  it("creates media threads with provided content", async () => {
-    const { rest, getMock, postMock } = makeDiscordRest();
-    getMock.mockResolvedValue({ type: ChannelType.GuildMedia });
-    postMock.mockResolvedValue({ id: "t1" });
-    await createThreadDiscord(
+  it("inherits forum archive defaults and uses the tagged thread name as its starter", async () => {
+    const { opts, getMock, postMock } = threadHarness(ChannelType.GuildForum);
+    getMock.mockResolvedValue({
+      type: ChannelType.GuildForum,
+      default_auto_archive_duration: 1440,
+    });
+    await send.createThreadDiscord(
       "chan1",
-      { name: "thread", content: "initial forum post" },
-      { rest, token: "t" },
+      { name: "thread", appliedTags: ["tag1", "tag2"] },
+      opts,
     );
-    expect(postMock).toHaveBeenCalledWith(
-      Routes.threads("chan1"),
-      expect.objectContaining({
-        body: {
-          name: "thread",
-          message: { content: "initial forum post" },
-        },
-      }),
-    );
+    expect(requestBody(postMock)).toEqual({
+      name: "thread",
+      auto_archive_duration: 1440,
+      message: { content: "thread" },
+      applied_tags: ["tag1", "tag2"],
+    });
   });
 
-  it("passes applied_tags for forum threads", async () => {
-    const { rest, getMock, postMock } = makeDiscordRest();
-    getMock.mockResolvedValue({ type: ChannelType.GuildForum });
-    postMock.mockResolvedValue({ id: "t1" });
-    await createThreadDiscord(
+  it("uses an archive override and keeps multiline media-channel content in one starter", async () => {
+    const { opts, getMock, postMock } = threadHarness(ChannelType.GuildMedia);
+    getMock.mockResolvedValue({
+      type: ChannelType.GuildMedia,
+      default_auto_archive_duration: 1440,
+    });
+    await send.createThreadDiscord(
       "chan1",
-      { name: "tagged post", appliedTags: ["tag1", "tag2"] },
-      { rest, token: "t" },
+      { name: "thread", content: multiline, autoArchiveMinutes: 4320 },
+      opts,
     );
-    expect(postMock).toHaveBeenCalledWith(
-      Routes.threads("chan1"),
-      expect.objectContaining({
-        body: {
-          name: "tagged post",
-          message: { content: "tagged post" },
-          applied_tags: ["tag1", "tag2"],
-        },
-      }),
-    );
+    expect(postMock).toHaveBeenCalledOnce();
+    expect(requestBody(postMock)).toEqual({
+      name: "thread",
+      auto_archive_duration: 4320,
+      message: { content: multiline },
+    });
   });
 
-  it("omits applied_tags for non-forum threads", async () => {
-    const { rest, getMock, postMock } = makeDiscordRest();
-    getMock.mockResolvedValue({ type: ChannelType.GuildText });
-    postMock.mockResolvedValue({ id: "t1" });
-    await createThreadDiscord(
-      "chan1",
-      { name: "thread", appliedTags: ["tag1"] },
-      { rest, token: "t" },
-    );
-    expect(postMock).toHaveBeenCalledWith(
-      Routes.threads("chan1"),
-      expect.objectContaining({
-        body: expect.not.objectContaining({ applied_tags: expect.anything() }),
-      }),
-    );
-  });
-
-  it("falls back when channel lookup is unavailable", async () => {
-    const { rest, getMock, postMock } = makeDiscordRest();
+  it("falls back to a public thread without forum tags when channel lookup fails", async () => {
+    const { opts, getMock, postMock } = threadHarness();
     getMock.mockRejectedValue(new Error("lookup failed"));
-    postMock.mockResolvedValue({ id: "t1" });
-    await createThreadDiscord("chan1", { name: "thread" }, { rest, token: "t" });
-    expect(postMock).toHaveBeenCalledWith(
-      Routes.threads("chan1"),
-      expect.objectContaining({
-        body: expect.objectContaining({ name: "thread", type: ChannelType.PublicThread }),
-      }),
-    );
+    await send.createThreadDiscord("chan1", { name: "thread", appliedTags: ["tag1"] }, opts);
+    expect(requestPath(postMock)).toBe(Routes.threads("chan1"));
+    expect(requestBody(postMock)).toEqual({ name: "thread", type: ChannelType.PublicThread });
   });
 
-  it("respects explicit thread type for standalone threads", async () => {
-    const { rest, getMock, postMock } = makeDiscordRest();
-    getMock.mockResolvedValue({ type: ChannelType.GuildText });
-    postMock.mockResolvedValue({ id: "t1" });
-    await createThreadDiscord(
+  it("chunks a private thread's initial message and retries with a stable nonce per chunk", async () => {
+    const { opts, getMock, postMock } = threadHarness();
+    getMock.mockResolvedValue({
+      type: ChannelType.GuildText,
+      default_auto_archive_duration: 10080,
+    });
+    postMock
+      .mockResolvedValueOnce({ id: "t1" })
+      .mockRejectedValueOnce(Object.assign(new Error("bad gateway"), { status: 502 }))
+      .mockResolvedValueOnce({ id: "msg1", channel_id: "t1" })
+      .mockResolvedValueOnce({ id: "msg2", channel_id: "t1" });
+    await send.createThreadDiscord(
       "chan1",
-      { name: "thread", type: ChannelType.PrivateThread },
-      { rest, token: "t" },
+      { name: "thread", type: ChannelType.PrivateThread, content: "a".repeat(2001) },
+      { ...opts, retry },
     );
-    expect(getMock).toHaveBeenCalledWith(Routes.channel("chan1"));
-    expect(postMock).toHaveBeenCalledWith(
-      Routes.threads("chan1"),
-      expect.objectContaining({
-        body: expect.objectContaining({ name: "thread", type: ChannelType.PrivateThread }),
-      }),
-    );
+    expect(postMock).toHaveBeenCalledTimes(4);
+    expect(requestBody(postMock)).toEqual({
+      name: "thread",
+      type: ChannelType.PrivateThread,
+      auto_archive_duration: 10080,
+    });
+    const first = requestBody(postMock, 1);
+    const next = requestBody(postMock, 3);
+    expect(first).toMatchObject({ content: "a".repeat(2000), enforce_nonce: true });
+    expect(requestBody(postMock, 2).nonce).toBe(first.nonce);
+    expect(next).toMatchObject({ content: "a", enforce_nonce: true });
+    expect(next.nonce).not.toBe(first.nonce);
+    expect(requestPath(postMock, 3)).toBe(Routes.channelMessages("t1"));
   });
 
-  it("sends initial message for non-forum threads with content", async () => {
-    const { rest, getMock, postMock } = makeDiscordRest();
-    getMock.mockResolvedValue({ type: ChannelType.GuildText });
-    postMock.mockResolvedValue({ id: "t1" });
-    await createThreadDiscord(
-      "chan1",
-      { name: "thread", content: "Hello thread!" },
-      { rest, token: "t" },
-    );
-    expect(postMock).toHaveBeenCalledTimes(2);
-    // First call: create thread
-    expect(postMock).toHaveBeenNthCalledWith(
-      1,
-      Routes.threads("chan1"),
-      expect.objectContaining({
-        body: expect.objectContaining({ name: "thread", type: ChannelType.PublicThread }),
-      }),
-    );
-    // Second call: send message to thread
-    expect(postMock).toHaveBeenNthCalledWith(
-      2,
-      Routes.channelMessages("t1"),
-      expect.objectContaining({
-        body: { content: "Hello thread!" },
-      }),
-    );
+  it("keeps created thread details when the first initial-message send fails", async () => {
+    const { opts, postMock } = threadHarness();
+    const thread = { id: "t1", name: "thread", type: ChannelType.PublicThread };
+    postMock.mockResolvedValueOnce(thread).mockRejectedValueOnce(new Error("missing access"));
+    const error = await send
+      .createThreadDiscord("chan1", { name: "thread", content: "Hello thread!" }, opts)
+      .catch((failure: unknown) => failure);
+    expect(error).toBeInstanceOf(send.DiscordThreadInitialMessageError);
+    expect(error).toMatchObject({
+      name: "DiscordThreadInitialMessageError",
+      initialMessageError: "missing access",
+      thread,
+      message: expect.stringContaining("initial message delivery could not be confirmed"),
+    });
   });
 
-  it("sends initial message for message-attached threads with content", async () => {
-    const { rest, getMock, postMock } = makeDiscordRest();
-    postMock.mockResolvedValue({ id: "t1" });
-    await createThreadDiscord(
-      "chan1",
-      { name: "thread", messageId: "m1", content: "Discussion here" },
-      { rest, token: "t" },
-    );
-    // Should not detect channel type for message-attached threads
-    expect(getMock).not.toHaveBeenCalled();
-    expect(postMock).toHaveBeenCalledTimes(2);
-    // First call: create thread from message
-    expect(postMock).toHaveBeenNthCalledWith(
-      1,
-      Routes.threads("chan1", "m1"),
-      expect.objectContaining({ body: { name: "thread" } }),
-    );
-    // Second call: send message to thread
-    expect(postMock).toHaveBeenNthCalledWith(
-      2,
-      Routes.channelMessages("t1"),
-      expect.objectContaining({
-        body: { content: "Discussion here" },
-      }),
-    );
-  });
+  it.each([
+    { type: ChannelType.GuildForum, status: 403, delivered: "not_delivered" },
+    { type: ChannelType.GuildForum, status: 502, delivered: "unknown" },
+    { type: ChannelType.GuildText, status: 403, delivered: "not_delivered" },
+  ])(
+    "reports partial initial delivery for channel $type and HTTP $status",
+    async ({ type, status, delivered }) => {
+      const { opts, postMock } = threadHarness(type);
+      const forum = type === ChannelType.GuildForum;
+      postMock.mockResolvedValueOnce({ id: "t1", message: { id: "starter1", channel_id: "t1" } });
+      if (!forum) {
+        postMock.mockResolvedValueOnce({ id: "msg1", channel_id: "t1" });
+      }
+      postMock.mockRejectedValue(Object.assign(new Error("send failed"), { status }));
+      const error = await send
+        .createThreadDiscord(
+          "chan1",
+          { name: "thread", content: "a".repeat(forum ? 2001 : 4001) },
+          { ...opts, retry },
+        )
+        .catch((failure: unknown) => failure);
+      expect(error).toBeInstanceOf(send.DiscordThreadInitialMessageError);
+      expect(hasDiscordMessageCreateAmbiguity(error)).toBe(status === 502);
+      expect(error).toMatchObject({
+        initialMessageDelivery: {
+          starterMessageDelivered: forum,
+          deliveredChunkCount: 1,
+          deliveredMessageIds: [forum ? "starter1" : "msg1"],
+          failedChunkDelivery: delivered,
+          failedChunkIndex: 1,
+          totalChunkCount: forum ? 2 : 3,
+        },
+      });
+      expect(postMock).toHaveBeenCalledTimes((forum ? 1 : 2) + (status === 502 ? 2 : 1));
+      if (forum) {
+        expect(requestBody(postMock)).toEqual({
+          name: "thread",
+          message: { content: "a".repeat(2000) },
+        });
+      }
+    },
+  );
+});
 
+describe("thread and member administration", () => {
   it("lists active threads by guild", async () => {
     const { rest, getMock } = makeDiscordRest();
     getMock.mockResolvedValue({ threads: [] });
-    await listThreadsDiscord({ guildId: "g1" }, { rest, token: "t" });
+    await send.listThreadsDiscord({ guildId: "g1" }, clientOpts(rest));
     expect(getMock).toHaveBeenCalledWith(Routes.guildActiveThreads("g1"));
   });
-
   it("times out a member", async () => {
     const { rest, patchMock } = makeDiscordRest();
     patchMock.mockResolvedValue({ id: "m1" });
-    await timeoutMemberDiscord(
+    await send.timeoutMemberDiscord(
       { guildId: "g1", userId: "u1", durationMinutes: 10 },
-      { rest, token: "t" },
+      clientOpts(rest),
     );
-    expect(patchMock).toHaveBeenCalledWith(
-      Routes.guildMember("g1", "u1"),
-      expect.objectContaining({
-        body: expect.objectContaining({
-          communication_disabled_until: expect.any(String),
-        }),
-      }),
-    );
+    expect(requestPath(patchMock)).toBe(Routes.guildMember("g1", "u1"));
+    expect(requestBody(patchMock).communication_disabled_until).toBeTypeOf("string");
   });
-
+  it("rejects timeout durations that overflow from the current clock", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(8_640_000_000_000_000));
+    const { rest, patchMock } = makeDiscordRest();
+    await expect(
+      send.timeoutMemberDiscord(
+        { guildId: "g1", userId: "u1", durationMinutes: 1 },
+        clientOpts(rest),
+      ),
+    ).rejects.toThrow("Discord timeout duration is outside the supported Date range");
+    expect(patchMock).not.toHaveBeenCalled();
+  });
   it("adds and removes roles", async () => {
     const { rest, putMock, deleteMock } = makeDiscordRest();
-    putMock.mockResolvedValue({});
-    deleteMock.mockResolvedValue({});
-    await addRoleDiscord({ guildId: "g1", userId: "u1", roleId: "r1" }, { rest, token: "t" });
-    await removeRoleDiscord({ guildId: "g1", userId: "u1", roleId: "r1" }, { rest, token: "t" });
+    await send.addRoleDiscord({ guildId: "g1", userId: "u1", roleId: "r1" }, clientOpts(rest));
+    await send.removeRoleDiscord({ guildId: "g1", userId: "u1", roleId: "r1" }, clientOpts(rest));
     expect(putMock).toHaveBeenCalledWith(Routes.guildMemberRole("g1", "u1", "r1"));
     expect(deleteMock).toHaveBeenCalledWith(Routes.guildMemberRole("g1", "u1", "r1"));
   });
-
   it("bans a member", async () => {
     const { rest, putMock } = makeDiscordRest();
-    putMock.mockResolvedValue({});
-    await banMemberDiscord(
+    await send.banMemberDiscord(
       { guildId: "g1", userId: "u1", deleteMessageDays: 2 },
-      { rest, token: "t" },
+      clientOpts(rest),
     );
-    expect(putMock).toHaveBeenCalledWith(
-      Routes.guildBan("g1", "u1"),
-      expect.objectContaining({ body: { delete_message_days: 2 } }),
-    );
-  });
-});
-
-describe("listGuildEmojisDiscord", () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-  });
-
-  it("lists emojis for a guild", async () => {
-    const { rest, getMock } = makeDiscordRest();
-    getMock.mockResolvedValue([{ id: "e1", name: "party" }]);
-    await listGuildEmojisDiscord("g1", { rest, token: "t" });
-    expect(getMock).toHaveBeenCalledWith(Routes.guildEmojis("g1"));
-  });
-});
-
-describe("uploadEmojiDiscord", () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-  });
-
-  it("uploads emoji assets", async () => {
-    const { rest, postMock } = makeDiscordRest();
-    postMock.mockResolvedValue({ id: "e1" });
-    await uploadEmojiDiscord(
-      {
-        guildId: "g1",
-        name: "party_blob",
-        mediaUrl: "file:///tmp/party.png",
-        roleIds: ["r1"],
-      },
-      { rest, token: "t" },
-    );
-    expect(postMock).toHaveBeenCalledWith(
-      Routes.guildEmojis("g1"),
-      expect.objectContaining({
-        body: {
-          name: "party_blob",
-          image: "data:image/png;base64,aW1n",
-          roles: ["r1"],
-        },
-      }),
-    );
-    expect(loadWebMediaRaw).toHaveBeenCalledWith("file:///tmp/party.png", 256 * 1024);
-  });
-});
-
-describe("uploadStickerDiscord", () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-  });
-
-  it("uploads sticker assets", async () => {
-    const { rest, postMock } = makeDiscordRest();
-    postMock.mockResolvedValue({ id: "s1" });
-    await uploadStickerDiscord(
-      {
-        guildId: "g1",
-        name: "openclaw_wave",
-        description: "OpenClaw waving",
-        tags: "👋",
-        mediaUrl: "file:///tmp/wave.png",
-      },
-      { rest, token: "t" },
-    );
-    expect(postMock).toHaveBeenCalledWith(
-      Routes.guildStickers("g1"),
-      expect.objectContaining({
-        body: {
-          name: "openclaw_wave",
-          description: "OpenClaw waving",
-          tags: "👋",
-          files: [
-            expect.objectContaining({
-              name: "asset.png",
-              contentType: "image/png",
-            }),
-          ],
-        },
-      }),
-    );
-    expect(loadWebMediaRaw).toHaveBeenCalledWith("file:///tmp/wave.png", 512 * 1024);
-  });
-});
-
-describe("sendStickerDiscord", () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-  });
-
-  it("sends sticker payloads", async () => {
-    const { rest, postMock } = makeDiscordRest();
-    postMock.mockResolvedValue({ id: "msg1", channel_id: "789" });
-    const res = await sendStickerDiscord("channel:789", ["123"], {
-      rest,
-      token: "t",
-      content: "hiya",
-    });
-    expect(res).toEqual({ messageId: "msg1", channelId: "789" });
-    expect(postMock).toHaveBeenCalledWith(
-      Routes.channelMessages("789"),
-      expect.objectContaining({
-        body: {
-          content: "hiya",
-          sticker_ids: ["123"],
-        },
-      }),
-    );
-  });
-});
-
-describe("sendPollDiscord", () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-  });
-
-  it("sends polls with answers", async () => {
-    const { rest, postMock } = makeDiscordRest();
-    postMock.mockResolvedValue({ id: "msg1", channel_id: "789" });
-    const res = await sendPollDiscord(
-      "channel:789",
-      {
-        question: "Lunch?",
-        options: ["Pizza", "Sushi"],
-      },
-      {
-        rest,
-        token: "t",
-      },
-    );
-    expect(res).toEqual({ messageId: "msg1", channelId: "789" });
-    expect(postMock).toHaveBeenCalledWith(
-      Routes.channelMessages("789"),
-      expect.objectContaining({
-        body: expect.objectContaining({
-          poll: {
-            question: { text: "Lunch?" },
-            answers: [{ poll_media: { text: "Pizza" } }, { poll_media: { text: "Sushi" } }],
-            duration: 24,
-            allow_multiselect: false,
-            layout_type: 1,
-          },
-        }),
-      }),
-    );
-  });
-});
-
-function createMockRateLimitError(retryAfter = 0.001): RateLimitError {
-  const request = new Request("https://discord.com/api/v10/channels/789/messages", {
-    method: "POST",
-  });
-  const response = new Response(null, {
-    status: 429,
-    headers: {
-      "X-RateLimit-Scope": "user",
-      "X-RateLimit-Bucket": "test-bucket",
-    },
-  });
-  return createCompatRateLimitError(
-    response,
-    {
-      message: "You are being rate limited.",
-      retry_after: retryAfter,
-      global: false,
-    },
-    request,
-  );
-}
-
-describe("retry rate limits", () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-  });
-
-  it("retries on Discord rate limits", async () => {
-    const { rest, postMock } = makeDiscordRest();
-    const rateLimitError = createMockRateLimitError(0);
-
-    postMock
-      .mockRejectedValueOnce(rateLimitError)
-      .mockResolvedValueOnce({ id: "msg1", channel_id: "789" });
-
-    const res = await sendMessageDiscord("channel:789", "hello", {
-      rest,
-      token: "t",
-      retry: { attempts: 2, minDelayMs: 0, maxDelayMs: 0, jitter: 0 },
-    });
-
-    expect(res.messageId).toBe("msg1");
-    expect(postMock).toHaveBeenCalledTimes(2);
-  });
-
-  it("uses retry_after delays when rate limited", async () => {
-    vi.useFakeTimers();
-    const setTimeoutSpy = vi.spyOn(global, "setTimeout");
-    const { rest, postMock } = makeDiscordRest();
-    const rateLimitError = createMockRateLimitError(0.5);
-
-    postMock
-      .mockRejectedValueOnce(rateLimitError)
-      .mockResolvedValueOnce({ id: "msg1", channel_id: "789" });
-
-    const promise = sendMessageDiscord("channel:789", "hello", {
-      rest,
-      token: "t",
-      retry: { attempts: 2, minDelayMs: 0, maxDelayMs: 1000, jitter: 0 },
-    });
-
-    await vi.runAllTimersAsync();
-    await expect(promise).resolves.toEqual({
-      messageId: "msg1",
-      channelId: "789",
-    });
-    expect(setTimeoutSpy.mock.calls[0]?.[1]).toBe(500);
-    setTimeoutSpy.mockRestore();
-    vi.useRealTimers();
-  });
-
-  it("stops after max retry attempts", async () => {
-    const { rest, postMock } = makeDiscordRest();
-    const rateLimitError = createMockRateLimitError(0);
-
-    postMock.mockRejectedValue(rateLimitError);
-
-    await expect(
-      sendMessageDiscord("channel:789", "hello", {
-        rest,
-        token: "t",
-        retry: { attempts: 2, minDelayMs: 0, maxDelayMs: 0, jitter: 0 },
-      }),
-    ).rejects.toBeInstanceOf(RateLimitError);
-    expect(postMock).toHaveBeenCalledTimes(2);
-  });
-
-  it("does not retry non-rate-limit errors", async () => {
-    const { rest, postMock } = makeDiscordRest();
-    postMock.mockRejectedValueOnce(new Error("network error"));
-
-    await expect(sendMessageDiscord("channel:789", "hello", { rest, token: "t" })).rejects.toThrow(
-      "network error",
-    );
-    expect(postMock).toHaveBeenCalledTimes(1);
-  });
-
-  it("retries reactions on rate limits", async () => {
-    const { rest, putMock } = makeDiscordRest();
-    const rateLimitError = createMockRateLimitError(0);
-
-    putMock.mockRejectedValueOnce(rateLimitError).mockResolvedValueOnce(undefined);
-
-    const res = await reactMessageDiscord("chan1", "msg1", "ok", {
-      rest,
-      token: "t",
-      retry: { attempts: 2, minDelayMs: 0, maxDelayMs: 0, jitter: 0 },
-    });
-
-    expect(res.ok).toBe(true);
-    expect(putMock).toHaveBeenCalledTimes(2);
-  });
-
-  it("retries media upload without duplicating overflow text", async () => {
-    const { rest, postMock } = makeDiscordRest();
-    const rateLimitError = createMockRateLimitError(0);
-    const text = "a".repeat(2005);
-
-    postMock
-      .mockRejectedValueOnce(rateLimitError)
-      .mockResolvedValueOnce({ id: "msg1", channel_id: "789" })
-      .mockResolvedValueOnce({ id: "msg2", channel_id: "789" });
-
-    const res = await sendMessageDiscord("channel:789", text, {
-      rest,
-      token: "t",
-      mediaUrl: "https://example.com/photo.jpg",
-      retry: { attempts: 2, minDelayMs: 0, maxDelayMs: 0, jitter: 0 },
-    });
-
-    expect(res.messageId).toBe("msg1");
-    expect(postMock).toHaveBeenCalledTimes(3);
+    expect(requestPath(putMock)).toBe(Routes.guildBan("g1", "u1"));
+    expect(requestBody(putMock)).toEqual({ delete_message_days: 2 });
   });
 });

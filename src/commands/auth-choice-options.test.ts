@@ -1,364 +1,140 @@
+// Auth-choice grouping tests consume prepared flow results; real metadata selection is tested separately.
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { AuthProfileStore } from "../agents/auth-profiles.js";
-import type { ProviderAuthChoiceMetadata } from "../plugins/provider-auth-choices.js";
-import type { ProviderWizardOption } from "../plugins/provider-wizard.js";
 import {
   buildAuthChoiceGroups,
-  buildAuthChoiceOptions,
   formatAuthChoiceChoicesForCli,
+  isFeaturedAuthChoiceGroup,
 } from "./auth-choice-options.js";
 import { formatStaticAuthChoiceChoicesForCli } from "./auth-choice-options.static.js";
 
-const resolveManifestProviderAuthChoices = vi.hoisted(() =>
-  vi.fn<() => ProviderAuthChoiceMetadata[]>(() => []),
-);
-const resolveProviderWizardOptions = vi.hoisted(() =>
-  vi.fn<() => ProviderWizardOption[]>(() => []),
-);
+type ResolveProviderSetupFlowContributions =
+  typeof import("../flows/provider-flow.js").resolveProviderSetupFlowContributions;
+type ProviderSetupFlowContribution = ReturnType<ResolveProviderSetupFlowContributions>[number];
 
-function includesOnboardingScope(
-  scopes: readonly ("text-inference" | "image-generation")[] | undefined,
-  scope: "text-inference" | "image-generation",
-): boolean {
-  return scopes ? scopes.includes(scope) : scope === "text-inference";
+const resolveProviderSetupFlowContributions = vi.hoisted(() =>
+  vi.fn<ResolveProviderSetupFlowContributions>(() => []),
+);
+vi.mock("../flows/provider-flow.js", () => ({ resolveProviderSetupFlowContributions }));
+
+// A consumer fixture, not a metadata resolver: keep the supplied option and order unchanged.
+function flowContribution(
+  providerId: string,
+  option: ProviderSetupFlowContribution["option"],
+): ProviderSetupFlowContribution {
+  return { providerId, option };
 }
 
-vi.mock("../flows/provider-flow.js", () => ({
-  resolveProviderSetupFlowContributions: vi.fn(
-    (params?: { scope?: "text-inference" | "image-generation" }) => {
-      const scope = params?.scope ?? "text-inference";
-      return [
-        ...resolveManifestProviderAuthChoices()
-          .filter((choice) => includesOnboardingScope(choice.onboardingScopes, scope))
-          .map((choice) => ({
-            option: {
-              value: choice.choiceId,
-              label: choice.choiceLabel,
-              ...(choice.choiceHint ? { hint: choice.choiceHint } : {}),
-              ...(choice.groupId && choice.groupLabel
-                ? {
-                    group: {
-                      id: choice.groupId,
-                      label: choice.groupLabel,
-                      ...(choice.groupHint ? { hint: choice.groupHint } : {}),
-                    },
-                  }
-                : {}),
-              ...(choice.assistantPriority !== undefined
-                ? { assistantPriority: choice.assistantPriority }
-                : {}),
-              ...(choice.assistantVisibility
-                ? { assistantVisibility: choice.assistantVisibility }
-                : {}),
-            },
-          })),
-        ...resolveProviderWizardOptions()
-          .filter((option) => includesOnboardingScope(option.onboardingScopes, scope))
-          .map((option) => ({
-            option: {
-              value: option.value,
-              label: option.label,
-              ...(option.hint ? { hint: option.hint } : {}),
-              group: {
-                id: option.groupId,
-                label: option.groupLabel,
-                ...(option.groupHint ? { hint: option.groupHint } : {}),
-              },
-              ...(option.assistantPriority !== undefined
-                ? { assistantPriority: option.assistantPriority }
-                : {}),
-              ...(option.assistantVisibility
-                ? { assistantVisibility: option.assistantVisibility }
-                : {}),
-            },
-          })),
-      ];
-    },
-  ),
-}));
-
-const EMPTY_STORE: AuthProfileStore = { version: 1, profiles: {} };
-
 function getOptions(includeSkip = false) {
-  return buildAuthChoiceOptions({
-    store: EMPTY_STORE,
+  const { groups, skipOption } = buildAuthChoiceGroups({
     includeSkip,
+    assistantVisibleOnly: false,
   });
+  return [...groups.flatMap((group) => group.options), ...(skipOption ? [skipOption] : [])];
+}
+
+function requireChoiceGroup(
+  groups: ReturnType<typeof buildAuthChoiceGroups>["groups"],
+  value: string,
+) {
+  const group = groups.find((entry) => entry.value === value);
+  if (!group) {
+    throw new Error(`expected auth choice group ${value}`);
+  }
+  return group;
 }
 
 describe("buildAuthChoiceOptions", () => {
   beforeEach(() => {
-    resolveManifestProviderAuthChoices.mockReturnValue([]);
-    resolveProviderWizardOptions.mockReturnValue([]);
+    resolveProviderSetupFlowContributions.mockReset();
   });
 
-  it("includes core and provider-specific auth choices", () => {
-    resolveManifestProviderAuthChoices.mockReturnValue([
-      {
-        pluginId: "chutes",
-        providerId: "chutes",
-        methodId: "oauth",
-        choiceId: "chutes",
-        choiceLabel: "Chutes (OAuth)",
-        groupId: "chutes",
-        groupLabel: "Chutes",
-      },
-      {
-        pluginId: "github-copilot",
-        providerId: "github-copilot",
-        methodId: "device",
-        choiceId: "github-copilot",
-        choiceLabel: "GitHub Copilot",
-        groupId: "copilot",
-        groupLabel: "Copilot",
-      },
-      {
-        pluginId: "openai",
-        providerId: "openai",
-        methodId: "api-key",
-        choiceId: "openai-api-key",
-        choiceLabel: "OpenAI API key",
-        groupId: "openai",
-        groupLabel: "OpenAI",
-      },
-      {
-        pluginId: "litellm",
-        providerId: "litellm",
-        methodId: "api-key",
-        choiceId: "litellm-api-key",
-        choiceLabel: "LiteLLM API key",
-        groupId: "litellm",
-        groupLabel: "LiteLLM",
-      },
-      {
-        pluginId: "moonshot",
-        providerId: "moonshot",
-        methodId: "api-key",
-        choiceId: "moonshot-api-key",
-        choiceLabel: "Kimi API key (.ai)",
-        groupId: "moonshot",
-        groupLabel: "Moonshot AI (Kimi K2.5)",
-      },
-      {
-        pluginId: "minimax",
-        providerId: "minimax",
-        methodId: "api-global",
-        choiceId: "minimax-global-api",
-        choiceLabel: "MiniMax API key (Global)",
-        groupId: "minimax",
-        groupLabel: "MiniMax",
-      },
-      {
-        pluginId: "zai",
-        providerId: "zai",
-        methodId: "api-key",
-        choiceId: "zai-api-key",
-        choiceLabel: "Z.AI API key",
-        groupId: "zai",
-        groupLabel: "Z.AI",
-      },
-      {
-        pluginId: "xiaomi",
-        providerId: "xiaomi",
-        methodId: "api-key",
-        choiceId: "xiaomi-api-key",
-        choiceLabel: "Xiaomi API key",
-        groupId: "xiaomi",
-        groupLabel: "Xiaomi",
-      },
-      {
-        pluginId: "together",
-        providerId: "together",
-        methodId: "api-key",
-        choiceId: "together-api-key",
-        choiceLabel: "Together AI API key",
-        groupId: "together",
-        groupLabel: "Together AI",
-      },
-      {
-        pluginId: "xai",
-        providerId: "xai",
-        methodId: "api-key",
-        choiceId: "xai-api-key",
-        choiceLabel: "xAI API key",
-        groupId: "xai",
-        groupLabel: "xAI (Grok)",
-      },
-      {
-        pluginId: "mistral",
-        providerId: "mistral",
-        methodId: "api-key",
-        choiceId: "mistral-api-key",
-        choiceLabel: "Mistral API key",
-        groupId: "mistral",
-        groupLabel: "Mistral AI",
-      },
-      {
-        pluginId: "volcengine",
-        providerId: "volcengine",
-        methodId: "api-key",
-        choiceId: "volcengine-api-key",
-        choiceLabel: "Volcano Engine API key",
-        groupId: "volcengine",
-        groupLabel: "Volcano Engine",
-      },
-      {
-        pluginId: "byteplus",
-        providerId: "byteplus",
-        methodId: "api-key",
-        choiceId: "byteplus-api-key",
-        choiceLabel: "BytePlus API key",
-        groupId: "byteplus",
-        groupLabel: "BytePlus",
-      },
-      {
-        pluginId: "opencode-go",
-        providerId: "opencode-go",
-        methodId: "api-key",
-        choiceId: "opencode-go",
-        choiceLabel: "OpenCode Go catalog",
-        groupId: "opencode",
-        groupLabel: "OpenCode",
-      },
-    ]);
-    resolveProviderWizardOptions.mockReturnValue([
-      {
+  it.each([
+    { assistantVisibleOnly: true, detected: false },
+    { assistantVisibleOnly: false, detected: false },
+    { assistantVisibleOnly: true, detected: true },
+    { assistantVisibleOnly: false, detected: true },
+  ])(
+    "offers detected-only providers only after detection ($assistantVisibleOnly, $detected)",
+    ({ assistantVisibleOnly, detected }) => {
+      resolveProviderSetupFlowContributions.mockReturnValue([
+        flowContribution("native", {
+          value: "native-local",
+          label: "Native local model",
+          assistantVisibility: "detected-only",
+          group: { id: "native", label: "Native" },
+        }),
+        flowContribution("other", {
+          value: "other-api-key",
+          label: "Other API key",
+          group: { id: "other", label: "Other" },
+        }),
+      ]);
+      const { groups } = buildAuthChoiceGroups({
+        includeSkip: false,
+        assistantVisibleOnly,
+        detectedProviderIds: new Set(detected ? ["NATIVE"] : ["other"]),
+      });
+      expect(groups.some((group) => group.value === "native")).toBe(detected);
+      expect(groups.some((group) => group.value === "other")).toBe(true);
+      expect(formatAuthChoiceChoicesForCli().split("|")).toContain("native-local");
+    },
+  );
+
+  it("builds cli help choices from the same prepared flow results", () => {
+    resolveProviderSetupFlowContributions.mockReturnValue([
+      flowContribution("chutes", {
+        value: "chutes",
+        label: "Chutes (OAuth)",
+      }),
+      flowContribution("litellm", {
+        value: "litellm-api-key",
+        label: "LiteLLM API key",
+      }),
+      flowContribution("openai", {
+        value: "openai-api-key",
+        label: "OpenAI API key",
+      }),
+      flowContribution("ollama", {
         value: "ollama",
         label: "Ollama",
         hint: "Cloud and local open models",
-        groupId: "ollama",
-        groupLabel: "Ollama",
-      },
-      {
-        value: "vllm",
-        label: "vLLM",
-        hint: "Local/self-hosted OpenAI-compatible server",
-        groupId: "vllm",
-        groupLabel: "vLLM",
-      },
-      {
-        value: "sglang",
-        label: "SGLang",
-        hint: "Fast self-hosted OpenAI-compatible server",
-        groupId: "sglang",
-        groupLabel: "SGLang",
-      },
+        group: {
+          id: "ollama",
+          label: "Ollama",
+        },
+      }),
     ]);
-    const options = getOptions();
 
-    for (const value of [
-      "github-copilot",
-      "zai-api-key",
-      "xiaomi-api-key",
-      "minimax-global-api",
-      "moonshot-api-key",
-      "together-api-key",
-      "chutes",
-      "xai-api-key",
-      "mistral-api-key",
-      "volcengine-api-key",
-      "byteplus-api-key",
-      "vllm",
-      "opencode-go",
-      "ollama",
-      "sglang",
-    ]) {
-      expect(options.some((opt) => opt.value === value)).toBe(true);
-    }
-  });
-
-  it("builds cli help choices from the same runtime catalog", () => {
-    resolveManifestProviderAuthChoices.mockReturnValue([
-      {
-        pluginId: "chutes",
-        providerId: "chutes",
-        methodId: "oauth",
-        choiceId: "chutes",
-        choiceLabel: "Chutes (OAuth)",
-      },
-      {
-        pluginId: "litellm",
-        providerId: "litellm",
-        methodId: "api-key",
-        choiceId: "litellm-api-key",
-        choiceLabel: "LiteLLM API key",
-      },
-      {
-        pluginId: "openai",
-        providerId: "openai",
-        methodId: "api-key",
-        choiceId: "openai-api-key",
-        choiceLabel: "OpenAI API key",
-      },
-    ]);
-    resolveProviderWizardOptions.mockReturnValue([
-      {
-        value: "ollama",
-        label: "Ollama",
-        hint: "Cloud and local open models",
-        groupId: "ollama",
-        groupLabel: "Ollama",
-      },
-    ]);
     const options = getOptions(true);
-    const cliChoices = formatAuthChoiceChoicesForCli({
-      includeLegacyAliases: false,
-      includeSkip: true,
-    }).split("|");
+    const cliChoices = formatAuthChoiceChoicesForCli().split("|");
 
     expect(cliChoices).toContain("openai-api-key");
     expect(cliChoices).toContain("chutes");
     expect(cliChoices).toContain("litellm-api-key");
     expect(cliChoices).toContain("custom-api-key");
     expect(cliChoices).toContain("skip");
-    expect(options.some((option) => option.value === "ollama")).toBe(true);
+    expect(options.map((option) => option.value)).toContain("ollama");
     expect(cliChoices).toContain("ollama");
   });
 
-  it("can include legacy aliases in cli help choices", () => {
-    resolveManifestProviderAuthChoices.mockReturnValue([
-      {
-        pluginId: "openai",
-        providerId: "openai-codex",
-        methodId: "oauth",
-        choiceId: "openai-codex",
-        choiceLabel: "OpenAI Codex (ChatGPT OAuth)",
-        deprecatedChoiceIds: ["codex-cli"],
-      },
-    ]);
-
-    const cliChoices = formatAuthChoiceChoicesForCli({
-      includeLegacyAliases: true,
-      includeSkip: true,
-    }).split("|");
-
-    expect(cliChoices).toContain("codex-cli");
-  });
-
   it("keeps static cli help choices off the plugin-backed catalog", () => {
-    resolveManifestProviderAuthChoices.mockReturnValue([
-      {
-        pluginId: "openai",
-        providerId: "openai",
-        methodId: "api-key",
-        choiceId: "openai-api-key",
-        choiceLabel: "OpenAI API key",
-      },
-    ]);
-    resolveProviderWizardOptions.mockReturnValue([
-      {
+    resolveProviderSetupFlowContributions.mockReturnValue([
+      flowContribution("openai", {
+        value: "openai-api-key",
+        label: "OpenAI API key",
+      }),
+      flowContribution("ollama", {
         value: "ollama",
         label: "Ollama",
         hint: "Cloud and local open models",
-        groupId: "ollama",
-        groupLabel: "Ollama",
-      },
+        group: {
+          id: "ollama",
+          label: "Ollama",
+        },
+      }),
     ]);
 
-    const cliChoices = formatStaticAuthChoiceChoicesForCli({
-      includeLegacyAliases: false,
-      includeSkip: true,
-    }).split("|");
+    const cliChoices = formatStaticAuthChoiceChoicesForCli().split("|");
 
     expect(cliChoices).not.toContain("ollama");
     expect(cliChoices).not.toContain("openai-api-key");
@@ -368,181 +144,366 @@ describe("buildAuthChoiceOptions", () => {
     expect(cliChoices).toContain("skip");
   });
 
-  it("shows Chutes in grouped provider selection", () => {
-    resolveManifestProviderAuthChoices.mockReturnValue([
-      {
-        pluginId: "chutes",
-        providerId: "chutes",
-        methodId: "oauth",
-        choiceId: "chutes",
-        choiceLabel: "Chutes (OAuth)",
-        groupId: "chutes",
-        groupLabel: "Chutes",
-      },
+  it("orders common auth provider groups before the alphabetical remainder", () => {
+    resolveProviderSetupFlowContributions.mockReturnValue([
+      flowContribution("google", {
+        value: "gemini-api-key",
+        label: "Gemini API key",
+        group: {
+          id: "google",
+          label: "Google",
+        },
+      }),
+      flowContribution("xai", {
+        value: "xai-api-key",
+        label: "xAI API key",
+        group: {
+          id: "xai",
+          label: "xAI (Grok)",
+        },
+      }),
+      flowContribution("litellm", {
+        value: "litellm-api-key",
+        label: "LiteLLM API key",
+        group: {
+          id: "litellm",
+          label: "LiteLLM",
+        },
+      }),
+      flowContribution("openai", {
+        value: "openai-api-key",
+        label: "OpenAI API key",
+        group: {
+          id: "openai",
+          label: "OpenAI",
+        },
+      }),
+      flowContribution("anthropic", {
+        value: "apiKey",
+        label: "Anthropic API key",
+        group: {
+          id: "anthropic",
+          label: "Anthropic",
+        },
+      }),
+      flowContribution("byteplus", {
+        value: "byteplus-api-key",
+        label: "BytePlus API key",
+        group: {
+          id: "byteplus",
+          label: "BytePlus",
+        },
+      }),
+      flowContribution("openrouter", {
+        value: "openrouter-oauth",
+        label: "OpenRouter OAuth",
+        group: {
+          id: "openrouter",
+          label: "OpenRouter",
+        },
+      }),
+      flowContribution("meta", {
+        value: "meta-api-key",
+        label: "Meta API key",
+        group: {
+          id: "meta",
+          label: "Meta",
+        },
+        onboardingFeatured: true,
+      }),
     ]);
+
     const { groups } = buildAuthChoiceGroups({
-      store: EMPTY_STORE,
       includeSkip: false,
     });
-    const chutesGroup = groups.find((group) => group.value === "chutes");
 
-    expect(chutesGroup).toBeDefined();
-    expect(chutesGroup?.options.some((opt) => opt.value === "chutes")).toBe(true);
-  });
-
-  it("shows LiteLLM in grouped provider selection", () => {
-    resolveManifestProviderAuthChoices.mockReturnValue([
-      {
-        pluginId: "litellm",
-        providerId: "litellm",
-        methodId: "api-key",
-        choiceId: "litellm-api-key",
-        choiceLabel: "LiteLLM API key",
-        groupId: "litellm",
-        groupLabel: "LiteLLM",
-      },
+    expect(groups.map((group) => group.label)).toEqual([
+      "OpenAI",
+      "OpenRouter",
+      "xAI (Grok)",
+      "Google",
+      "Anthropic",
+      "BytePlus",
+      "Custom Provider",
+      "LiteLLM",
+      "Meta",
     ]);
-    const { groups } = buildAuthChoiceGroups({
-      store: EMPTY_STORE,
-      includeSkip: false,
-    });
-    const litellmGroup = groups.find((group) => group.value === "litellm");
-
-    expect(litellmGroup).toBeDefined();
-    expect(litellmGroup?.options.some((opt) => opt.value === "litellm-api-key")).toBe(true);
+    expect(groups.filter(isFeaturedAuthChoiceGroup).map((group) => group.label)).toEqual([
+      "OpenAI",
+      "OpenRouter",
+      "xAI (Grok)",
+      "Google",
+      "Anthropic",
+    ]);
   });
 
-  it("sorts grouped provider options by assistant priority", () => {
-    resolveManifestProviderAuthChoices.mockReturnValue([
-      {
-        pluginId: "anthropic",
-        providerId: "anthropic",
-        methodId: "api-key",
-        choiceId: "apiKey",
-        choiceLabel: "Anthropic API key",
-        groupId: "anthropic",
-        groupLabel: "Anthropic",
-      },
-      {
-        pluginId: "anthropic",
-        providerId: "anthropic",
-        methodId: "setup-token",
-        choiceId: "setup-token",
-        choiceLabel: "Anthropic setup-token",
+  it("prefers Anthropic Claude CLI over API key in grouped selection", () => {
+    resolveProviderSetupFlowContributions.mockReturnValue([
+      flowContribution("anthropic", {
+        value: "apiKey",
+        label: "Anthropic API key",
+        group: {
+          id: "anthropic",
+          label: "Anthropic",
+        },
+      }),
+      flowContribution("anthropic", {
+        value: "anthropic-cli",
+        label: "Anthropic Claude CLI",
+        group: {
+          id: "anthropic",
+          label: "Anthropic",
+        },
         assistantPriority: -20,
-        groupId: "anthropic",
-        groupLabel: "Anthropic",
-      },
+      }),
     ]);
     const { groups } = buildAuthChoiceGroups({
-      store: EMPTY_STORE,
       includeSkip: false,
     });
-    const anthropicGroup = groups.find((group) => group.value === "anthropic");
+    const anthropicGroup = requireChoiceGroup(groups, "anthropic");
 
-    expect(anthropicGroup).toBeDefined();
-    expect(anthropicGroup?.options.map((option) => option.value)).toEqual([
-      "setup-token",
+    expect(anthropicGroup.options.map((option) => option.value)).toEqual([
+      "anthropic-cli",
       "apiKey",
     ]);
   });
 
+  it("groups OpenAI auth methods under one provider entry", () => {
+    resolveProviderSetupFlowContributions.mockReturnValue([
+      flowContribution("openai", {
+        value: "openai",
+        label: "ChatGPT Login",
+        group: {
+          id: "openai",
+          label: "OpenAI",
+        },
+        assistantPriority: -40,
+        assistantVisibility: "manual-only",
+      }),
+      flowContribution("openai", {
+        value: "openai-device-code",
+        label: "ChatGPT Device Pairing",
+        group: {
+          id: "openai",
+          label: "OpenAI",
+        },
+        assistantPriority: -10,
+        assistantVisibility: "manual-only",
+      }),
+      flowContribution("openai", {
+        value: "openai-api-key",
+        label: "OpenAI API Key",
+        group: {
+          id: "openai",
+          label: "OpenAI",
+        },
+        assistantPriority: 5,
+      }),
+      flowContribution("openai", {
+        value: "openai",
+        label: "ChatGPT/Codex Browser Login",
+        group: {
+          id: "openai",
+          label: "OpenAI",
+        },
+        assistantPriority: -30,
+        onboardingFeatured: true,
+      }),
+      flowContribution("openai", {
+        value: "openai-chatgpt-device-code",
+        label: "ChatGPT/Codex Device Pairing",
+        group: {
+          id: "openai",
+          label: "OpenAI",
+        },
+        assistantPriority: -10,
+      }),
+    ]);
+
+    const { groups } = buildAuthChoiceGroups({
+      includeSkip: false,
+    });
+    const openAIGroup = requireChoiceGroup(groups, "openai");
+
+    expect(openAIGroup.options.map((option) => option.value)).toEqual([
+      "openai",
+      "openai-chatgpt-device-code",
+      "openai-api-key",
+    ]);
+    expect(openAIGroup.providerIds).toEqual(["openai"]);
+    expect(openAIGroup.options[0]?.onboardingFeatured).toBe(true);
+  });
+
+  it("includes manual-only methods when the grouped CLI picker requests them", () => {
+    resolveProviderSetupFlowContributions.mockReturnValue([
+      flowContribution("openai", {
+        value: "openai-device-code",
+        label: "ChatGPT Device Pairing",
+        group: {
+          id: "openai",
+          label: "OpenAI",
+        },
+        assistantPriority: -10,
+        assistantVisibility: "manual-only",
+      }),
+      flowContribution("openai", {
+        value: "openai-api-key",
+        label: "OpenAI API Key",
+        group: {
+          id: "openai",
+          label: "OpenAI",
+        },
+        assistantPriority: 5,
+      }),
+    ]);
+
+    const { groups } = buildAuthChoiceGroups({
+      includeSkip: false,
+      assistantVisibleOnly: false,
+    });
+
+    expect(requireChoiceGroup(groups, "openai").options.map((option) => option.value)).toEqual([
+      "openai-device-code",
+      "openai-api-key",
+    ]);
+  });
+
   it("groups OpenCode Zen and Go under one OpenCode entry", () => {
-    resolveManifestProviderAuthChoices.mockReturnValue([
-      {
-        pluginId: "opencode",
-        providerId: "opencode",
-        methodId: "api-key",
-        choiceId: "opencode-zen",
-        choiceLabel: "OpenCode Zen catalog",
-        groupId: "opencode",
-        groupLabel: "OpenCode",
-      },
-      {
-        pluginId: "opencode-go",
-        providerId: "opencode-go",
-        methodId: "api-key",
-        choiceId: "opencode-go",
-        choiceLabel: "OpenCode Go catalog",
-        groupId: "opencode",
-        groupLabel: "OpenCode",
-      },
+    resolveProviderSetupFlowContributions.mockReturnValue([
+      flowContribution("opencode", {
+        value: "opencode-zen",
+        label: "OpenCode Zen catalog",
+        group: {
+          id: "opencode",
+          label: "OpenCode",
+        },
+      }),
+      flowContribution("opencode-go", {
+        value: "opencode-go",
+        label: "OpenCode Go catalog",
+        group: {
+          id: "opencode",
+          label: "OpenCode",
+        },
+      }),
     ]);
     const { groups } = buildAuthChoiceGroups({
-      store: EMPTY_STORE,
       includeSkip: false,
     });
-    const openCodeGroup = groups.find((group) => group.value === "opencode");
+    const openCodeGroup = requireChoiceGroup(groups, "opencode");
 
-    expect(openCodeGroup).toBeDefined();
-    expect(openCodeGroup?.options.some((opt) => opt.value === "opencode-zen")).toBe(true);
-    expect(openCodeGroup?.options.some((opt) => opt.value === "opencode-go")).toBe(true);
+    const openCodeValues = openCodeGroup.options.map((option) => option.value);
+    expect(openCodeValues).toContain("opencode-zen");
+    expect(openCodeValues).toContain("opencode-go");
   });
 
-  it("shows Ollama in grouped provider selection", () => {
-    resolveManifestProviderAuthChoices.mockReturnValue([]);
-    resolveProviderWizardOptions.mockReturnValue([
-      {
-        value: "ollama",
-        label: "Ollama",
-        hint: "Cloud and local open models",
-        groupId: "ollama",
-        groupLabel: "Ollama",
-      },
-    ]);
-    const { groups } = buildAuthChoiceGroups({
-      store: EMPTY_STORE,
-      includeSkip: false,
-    });
-    const ollamaGroup = groups.find((group) => group.value === "ollama");
-
-    expect(ollamaGroup).toBeDefined();
-    expect(ollamaGroup?.options.some((opt) => opt.value === "ollama")).toBe(true);
-  });
-
-  it("hides image-generation-only providers from the interactive auth picker", () => {
-    resolveManifestProviderAuthChoices.mockReturnValue([
-      {
-        pluginId: "fal",
-        providerId: "fal",
-        methodId: "api-key",
-        choiceId: "fal-api-key",
-        choiceLabel: "fal API key",
-        groupId: "fal",
-        groupLabel: "fal",
-        onboardingScopes: ["image-generation"],
-      },
-      {
-        pluginId: "openai",
-        providerId: "openai",
-        methodId: "api-key",
-        choiceId: "openai-api-key",
-        choiceLabel: "OpenAI API key",
-        groupId: "openai",
-        groupLabel: "OpenAI",
-      },
-    ]);
-    resolveProviderWizardOptions.mockReturnValue([
-      {
-        value: "local-image-runtime",
-        label: "Local image runtime",
-        groupId: "local-image-runtime",
-        groupLabel: "Local image runtime",
-        onboardingScopes: ["image-generation"],
-      },
-      {
-        value: "ollama",
-        label: "Ollama",
-        groupId: "ollama",
-        groupLabel: "Ollama",
-      },
-    ]);
+  it("keeps media-generation auth choices available to the CLI but out of the interactive picker", () => {
+    resolveProviderSetupFlowContributions
+      .mockReturnValueOnce([
+        flowContribution("openai", {
+          value: "openai-api-key",
+          label: "OpenAI API key",
+          group: {
+            id: "openai",
+            label: "OpenAI",
+          },
+        }),
+        flowContribution("ollama", {
+          value: "ollama",
+          label: "Ollama",
+          group: {
+            id: "ollama",
+            label: "Ollama",
+          },
+        }),
+      ])
+      .mockReturnValueOnce([
+        flowContribution("fal", {
+          value: "fal-api-key",
+          label: "fal API key",
+          group: {
+            id: "fal",
+            label: "fal",
+          },
+        }),
+        flowContribution("vydra", {
+          value: "vydra-api-key",
+          label: "Vydra API key",
+          group: {
+            id: "vydra",
+            label: "Vydra",
+          },
+        }),
+        flowContribution("openrouter", {
+          value: "openrouter-api-key",
+          label: "OpenRouter API key",
+          group: {
+            id: "openrouter",
+            label: "OpenRouter",
+          },
+        }),
+        flowContribution("openai", {
+          value: "openai-api-key",
+          label: "OpenAI API key",
+          group: {
+            id: "openai",
+            label: "OpenAI",
+          },
+        }),
+        flowContribution("local-image-runtime", {
+          value: "local-image-runtime",
+          label: "Local image runtime",
+          group: {
+            id: "local-image-runtime",
+            label: "Local image runtime",
+          },
+        }),
+        flowContribution("local-music-runtime", {
+          value: "local-music-runtime",
+          label: "Local music runtime",
+          group: {
+            id: "local-music-runtime",
+            label: "Local music runtime",
+          },
+        }),
+        flowContribution("ollama", {
+          value: "ollama",
+          label: "Ollama",
+          group: {
+            id: "ollama",
+            label: "Ollama",
+          },
+        }),
+      ]);
 
     const options = getOptions();
+    const optionValues = options.map((option) => option.value);
+    const cliChoiceValues = formatAuthChoiceChoicesForCli().split("|");
 
-    expect(options.some((option) => option.value === "openai-api-key")).toBe(true);
-    expect(options.some((option) => option.value === "ollama")).toBe(true);
-    expect(options.some((option) => option.value === "fal-api-key")).toBe(false);
-    expect(options.some((option) => option.value === "local-image-runtime")).toBe(false);
+    expect(optionValues).toContain("openai-api-key");
+    expect(optionValues).toContain("ollama");
+    expect(optionValues).not.toContain("fal-api-key");
+    expect(optionValues).not.toContain("vydra-api-key");
+    expect(optionValues).not.toContain("openrouter-api-key");
+    expect(optionValues).not.toContain("local-image-runtime");
+    expect(optionValues).not.toContain("local-music-runtime");
+    expect(cliChoiceValues).toEqual(
+      expect.arrayContaining([
+        "openai-api-key",
+        "fal-api-key",
+        "vydra-api-key",
+        "openrouter-api-key",
+      ]),
+    );
+    expect(cliChoiceValues.filter((choice) => choice === "fal-api-key")).toHaveLength(1);
+    expect(resolveProviderSetupFlowContributions).toHaveBeenCalledTimes(2);
+    expect(resolveProviderSetupFlowContributions).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({ scope: "text-inference" }),
+    );
+    expect(resolveProviderSetupFlowContributions).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({ scope: "all" }),
+    );
   });
 });

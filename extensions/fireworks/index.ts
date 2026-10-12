@@ -1,88 +1,83 @@
-import type {
-  ProviderResolveDynamicModelContext,
-  ProviderRuntimeModel,
-} from "openclaw/plugin-sdk/plugin-entry";
+import type { ProviderResolveDynamicModelContext } from "openclaw/plugin-sdk/plugin-entry";
 import { defineSingleProviderPluginEntry } from "openclaw/plugin-sdk/provider-entry";
 import {
   buildProviderReplayFamilyHooks,
-  cloneFirstTemplateModel,
-  DEFAULT_CONTEXT_TOKENS,
-  normalizeModelCompat,
+  resolveFamilyForwardCompatModel,
 } from "openclaw/plugin-sdk/provider-model-shared";
-import { applyFireworksConfig, FIREWORKS_DEFAULT_MODEL_REF } from "./onboard.js";
+import { isFireworksKimiModelId } from "./model-id.js";
+import { applyFireworksConfig } from "./onboard.js";
+import manifest from "./openclaw.plugin.json" with { type: "json" };
 import {
-  buildFireworksProvider,
   FIREWORKS_BASE_URL,
   FIREWORKS_DEFAULT_CONTEXT_WINDOW,
   FIREWORKS_DEFAULT_MAX_TOKENS,
   FIREWORKS_DEFAULT_MODEL_ID,
+  isFireworksCatalogModelId,
 } from "./provider-catalog.js";
+import { wrapFireworksProviderStream } from "./stream.js";
+import { resolveFireworksThinkingProfile } from "./thinking-policy.js";
 
 const PROVIDER_ID = "fireworks";
-const OPENAI_COMPATIBLE_REPLAY_HOOKS = buildProviderReplayFamilyHooks({
-  family: "openai-compatible",
-});
 
-function resolveFireworksDynamicModel(
-  ctx: ProviderResolveDynamicModelContext,
-): ProviderRuntimeModel | undefined {
+function isFireworksGlmModelId(modelId: string): boolean {
+  const normalized = modelId.trim().toLowerCase();
+  const lastSegment = normalized.split("/").pop() ?? normalized;
+  return /^glm[-_.]/.test(lastSegment);
+}
+
+function resolveFireworksDynamicModel(ctx: ProviderResolveDynamicModelContext) {
   const modelId = ctx.modelId.trim();
-  if (!modelId) {
+  if (!modelId || isFireworksCatalogModelId(modelId)) {
     return undefined;
   }
 
-  return (
-    cloneFirstTemplateModel({
-      providerId: PROVIDER_ID,
-      modelId,
-      templateIds: [FIREWORKS_DEFAULT_MODEL_ID],
-      ctx,
-      patch: {
-        provider: PROVIDER_ID,
+  return resolveFamilyForwardCompatModel({
+    providerId: PROVIDER_ID,
+    modelId,
+    ctx,
+    cases: [
+      {
+        match: () => true,
+        templateIds: [FIREWORKS_DEFAULT_MODEL_ID],
+        patch: ({ template }) =>
+          template
+            ? undefined
+            : {
+                api: "openai-completions",
+                baseUrl: FIREWORKS_BASE_URL,
+                contextWindow: FIREWORKS_DEFAULT_CONTEXT_WINDOW,
+                maxTokens: FIREWORKS_DEFAULT_MAX_TOKENS,
+              },
       },
-    }) ??
-    normalizeModelCompat({
-      id: modelId,
-      name: modelId,
+    ],
+    patch: {
       provider: PROVIDER_ID,
-      api: "openai-completions",
-      baseUrl: FIREWORKS_BASE_URL,
-      reasoning: true,
-      input: ["text", "image"],
-      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-      contextWindow: FIREWORKS_DEFAULT_CONTEXT_WINDOW,
-      maxTokens: FIREWORKS_DEFAULT_MAX_TOKENS || DEFAULT_CONTEXT_TOKENS,
-    } as ProviderRuntimeModel)
-  );
+      reasoning: !isFireworksKimiModelId(modelId),
+      input: isFireworksGlmModelId(modelId) ? ["text"] : ["text", "image"],
+    },
+    synthesize: true,
+  });
 }
 
 export default defineSingleProviderPluginEntry({
   id: PROVIDER_ID,
   name: "Fireworks Provider",
   description: "Bundled Fireworks AI provider plugin",
+  manifest,
   provider: {
     label: "Fireworks",
     aliases: ["fireworks-ai"],
     docsPath: "/providers/fireworks",
-    auth: [
-      {
-        methodId: "api-key",
-        label: "Fireworks API key",
-        hint: "API key",
-        optionKey: "fireworksApiKey",
-        flagName: "--fireworks-api-key",
-        envVar: "FIREWORKS_API_KEY",
-        promptMessage: "Enter Fireworks API key",
-        defaultModel: FIREWORKS_DEFAULT_MODEL_REF,
-        applyConfig: (cfg) => applyFireworksConfig(cfg),
-      },
-    ],
+    manifestAuth: { applyConfig: applyFireworksConfig },
     catalog: {
-      buildProvider: buildFireworksProvider,
+      discoveryMode: "strict",
       allowExplicitBaseUrl: true,
+      liveModelDiscovery: true,
     },
-    ...OPENAI_COMPATIBLE_REPLAY_HOOKS,
-    resolveDynamicModel: (ctx) => resolveFireworksDynamicModel(ctx),
+    ...buildProviderReplayFamilyHooks({ family: "openai-compatible" }),
+    wrapStreamFn: wrapFireworksProviderStream,
+    resolveThinkingProfile: ({ modelId }) => resolveFireworksThinkingProfile(modelId),
+    resolveDynamicModel: resolveFireworksDynamicModel,
     isModernModelRef: () => true,
   },
 });

@@ -1,15 +1,14 @@
-import type { AgentToolResult } from "@mariozechner/pi-agent-core";
-import { Type } from "@sinclair/typebox";
-import {
-  type ChannelMessageActionAdapter,
-  type ChannelMessageToolDiscovery,
+import type { AgentToolResult } from "openclaw/plugin-sdk/agent-core";
+import type {
+  ChannelMessageActionAdapter,
+  ChannelMessageActionContext,
 } from "openclaw/plugin-sdk/channel-contract";
-import type { SlackActionContext } from "./action-runtime.js";
-import { isSlackInteractiveRepliesEnabled } from "./interactive-replies.js";
+import { createLazyRuntimeModule } from "openclaw/plugin-sdk/lazy-runtime";
+import type { SlackActionContext } from "./action-context.js";
 import { handleSlackMessageAction } from "./message-action-dispatch.js";
-import { extractSlackToolSend, listSlackMessageActions } from "./message-actions.js";
-import { createSlackMessageToolBlocksSchema } from "./message-tool-schema.js";
-import { resolveSlackChannelId } from "./targets.js";
+import { extractSlackToolSend } from "./message-actions.js";
+import { describeSlackMessageTool } from "./message-tool-api.js";
+import { parseSlackTarget } from "./target-parsing.js";
 
 type SlackActionInvoke = (
   action: Record<string, unknown>,
@@ -17,62 +16,105 @@ type SlackActionInvoke = (
   toolContext: unknown,
 ) => Promise<AgentToolResult<unknown>>;
 
-let slackActionRuntimePromise: Promise<typeof import("./action-runtime.runtime.js")> | undefined;
+const SLACK_TOOL_DELIVERY_ACTIONS = new Set([
+  "deleteMessage",
+  "editMessage",
+  "pinMessage",
+  "react",
+  "sendMessage",
+  "unpinMessage",
+  "uploadFile",
+]);
 
-async function loadSlackActionRuntime() {
-  slackActionRuntimePromise ??= import("./action-runtime.runtime.js");
-  return await slackActionRuntimePromise;
+const loadSlackActionRuntime = createLazyRuntimeModule(() => import("./action-runtime.runtime.js"));
+
+function resolveSlackActionContext(
+  ctx: ChannelMessageActionContext,
+  toolContext: unknown,
+): SlackActionContext | undefined {
+  if (
+    !toolContext &&
+    !ctx.mediaAccess &&
+    !ctx.mediaLocalRoots &&
+    !ctx.mediaReadFile &&
+    !ctx.conversationReadOrigin &&
+    !ctx.requesterAccountId &&
+    !ctx.requesterSenderId &&
+    !ctx.assertDirectAdapterHandoff
+  ) {
+    return undefined;
+  }
+  return {
+    ...(toolContext as SlackActionContext | undefined),
+    // Authority comes only from the host-owned action context. Overwrite any
+    // structurally compatible fields carried by generic tool context.
+    mediaAccess: ctx.mediaAccess,
+    mediaLocalRoots: ctx.mediaLocalRoots,
+    mediaReadFile: ctx.mediaReadFile,
+    conversationReadOrigin: ctx.conversationReadOrigin,
+    requesterAccountId: ctx.requesterAccountId ?? undefined,
+    requesterSenderId: ctx.requesterSenderId ?? undefined,
+    assertDirectAdapterHandoff: ctx.assertDirectAdapterHandoff,
+  };
 }
 
 export function createSlackActions(
   providerId: string,
   options?: { invoke?: SlackActionInvoke },
 ): ChannelMessageActionAdapter {
-  function describeMessageTool({
-    cfg,
-    accountId,
-  }: Parameters<
-    NonNullable<ChannelMessageActionAdapter["describeMessageTool"]>
-  >[0]): ChannelMessageToolDiscovery {
-    const actions = listSlackMessageActions(cfg, accountId);
-    const capabilities = new Set<"blocks" | "interactive">();
-    if (actions.includes("send")) {
-      capabilities.add("blocks");
-    }
-    if (isSlackInteractiveRepliesEnabled({ cfg, accountId })) {
-      capabilities.add("interactive");
-    }
-    return {
-      actions,
-      capabilities: Array.from(capabilities),
-      schema: actions.includes("send")
-        ? {
-            properties: {
-              blocks: Type.Optional(createSlackMessageToolBlocksSchema()),
-            },
-          }
-        : null,
-    };
-  }
-
   return {
-    describeMessageTool,
+    providerOwnedReadGates: true,
+    readAuthorityActions: [
+      "read",
+      "reactions",
+      "list-pins",
+      "member-info",
+      "emoji-list",
+      "download-file",
+    ],
+    describeMessageTool: describeSlackMessageTool,
     extractToolSend: ({ args }) => extractSlackToolSend(args),
+    isToolDeliveryAction: ({ args }) =>
+      typeof args.action === "string" && SLACK_TOOL_DELIVERY_ACTIONS.has(args.action),
+    prepareSendPayload: ({ ctx, to, payload }) =>
+      ctx.action === "send" && !shouldUseWorkspaceAwareSlackActionSend(to, ctx.toolContext)
+        ? payload
+        : null,
     handleAction: async (ctx) => {
       return await handleSlackMessageAction({
         providerId,
         ctx,
-        normalizeChannelId: resolveSlackChannelId,
-        includeReadThreadId: true,
-        invoke: async (action, cfg, toolContext) =>
-          await (options?.invoke
-            ? options.invoke(action, cfg, toolContext)
-            : (await loadSlackActionRuntime()).handleSlackAction(action, cfg, {
-                ...(toolContext as SlackActionContext | undefined),
-                mediaLocalRoots: ctx.mediaLocalRoots,
-                mediaReadFile: ctx.mediaReadFile,
-              })),
+        invoke: async (action, cfg, toolContext) => {
+          const actionContext = resolveSlackActionContext(ctx, toolContext);
+          return await (options?.invoke
+            ? options.invoke(action, cfg, actionContext)
+            : (await loadSlackActionRuntime()).handleSlackAction(action, cfg, actionContext));
+        },
       });
     },
   };
+}
+
+function shouldUseWorkspaceAwareSlackActionSend(
+  rawTarget: string,
+  context: ChannelMessageActionContext["toolContext"],
+): boolean {
+  const target = parseSlackTarget(rawTarget, { defaultKind: "channel" });
+  if (!target || target.teamId) {
+    return false;
+  }
+  for (const rawCurrentTarget of [context?.currentChannelId, context?.currentMessagingTarget]) {
+    if (!rawCurrentTarget) {
+      continue;
+    }
+    const currentTarget = parseSlackTarget(rawCurrentTarget);
+    if (
+      currentTarget?.teamId &&
+      currentTarget.kind === target.kind &&
+      currentTarget.id.toLowerCase() === target.id.toLowerCase()
+    ) {
+      return true;
+    }
+  }
+  return false;
 }

@@ -1,17 +1,22 @@
+/**
+ * Loopback browser bridge server.
+ *
+ * Hosts the browser control routes on an authenticated local port for sandbox,
+ * host, and node browser integrations that need HTTP access to browser control.
+ */
 import type { Server } from "node:http";
-import type { AddressInfo } from "node:net";
+import { isIPv6, type AddressInfo } from "node:net";
 import express from "express";
-import { isLoopbackHost } from "../gateway/net.js";
+import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
+import { isLoopbackHost } from "openclaw/plugin-sdk/ssrf-runtime";
+import { normalizeOptionalString } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { deleteBridgeAuthForPort, setBridgeAuthForPort } from "./bridge-auth-registry.js";
 import type { ResolvedBrowserConfig } from "./config.js";
-import { registerBrowserRoutes } from "./routes/index.js";
-import type { BrowserRouteRegistrar } from "./routes/types.js";
+import { listenBrowserHttpServer } from "./http-listen.js";
+import { stopBrowserBridgeRuntime } from "./runtime-lifecycle.js";
+import type { BrowserServerState, ProfileContext } from "./server-context.js";
 import {
-  type BrowserServerState,
-  createBrowserRouteContext,
-  type ProfileContext,
-} from "./server-context.js";
-import {
+  hasVerifiedBrowserAuth,
   installBrowserAuthMiddleware,
   installBrowserCommonMiddleware,
 } from "./server-middleware.js";
@@ -23,6 +28,24 @@ export type BrowserBridge = {
   state: BrowserServerState;
 };
 
+const bridgeStates = new WeakMap<Server, BrowserServerState>();
+const bridgeStopPromises = new WeakMap<Server, Promise<void>>();
+
+async function closeBridgeHttpServer(server: Server): Promise<void> {
+  if (!server.listening) {
+    return;
+  }
+  await new Promise<void>((resolve, reject) => {
+    server.close((error) => {
+      if (error) {
+        reject(error);
+        return;
+      }
+      resolve();
+    });
+  });
+}
+
 type ResolvedNoVncObserver = {
   noVncPort: number;
   password?: string;
@@ -33,8 +56,9 @@ function buildNoVncBootstrapHtml(params: ResolvedNoVncObserver): string {
     autoconnect: "1",
     resize: "remote",
   });
-  if (params.password?.trim()) {
-    hash.set("password", params.password);
+  const password = normalizeOptionalString(params.password);
+  if (password) {
+    hash.set("password", password);
   }
   const targetUrl = `http://127.0.0.1:${params.noVncPort}/vnc.html#${hash.toString()}`;
   const encodedTarget = JSON.stringify(targetUrl);
@@ -74,13 +98,24 @@ export async function startBrowserBridgeServer(params: {
   const app = express();
   installBrowserCommonMiddleware(app);
 
+  const authToken = normalizeOptionalString(params.authToken);
+  const authPassword = normalizeOptionalString(params.authPassword);
+  if (!authToken && !authPassword) {
+    throw new Error("bridge server requires auth (authToken/authPassword missing)");
+  }
+  installBrowserAuthMiddleware(app, { token: authToken, password: authPassword });
+
   if (params.resolveSandboxNoVncToken) {
     app.get("/sandbox/novnc", (req, res) => {
+      if (!hasVerifiedBrowserAuth(req)) {
+        res.status(401).send("Unauthorized");
+        return;
+      }
       res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
       res.setHeader("Pragma", "no-cache");
       res.setHeader("Expires", "0");
       res.setHeader("Referrer-Policy", "no-referrer");
-      const rawToken = typeof req.query?.token === "string" ? req.query.token.trim() : "";
+      const rawToken = normalizeOptionalString(req.query?.token);
       if (!rawToken) {
         res.status(400).send("Missing token");
         return;
@@ -94,53 +129,92 @@ export async function startBrowserBridgeServer(params: {
     });
   }
 
-  const authToken = params.authToken?.trim() || undefined;
-  const authPassword = params.authPassword?.trim() || undefined;
-  if (!authToken && !authPassword) {
-    throw new Error("bridge server requires auth (authToken/authPassword missing)");
-  }
-  installBrowserAuthMiddleware(app, { token: authToken, password: authPassword });
-
   const state: BrowserServerState = {
-    server: null as unknown as Server,
+    server: null,
     port,
     resolved: params.resolved,
     profiles: new Map(),
   };
 
+  const [{ createBrowserRouteContext }, { registerBrowserRoutes }] = await Promise.all([
+    import("./server-context.js"),
+    import("./routes/index.js"),
+  ]);
   const ctx = createBrowserRouteContext({
     getState: () => state,
     onEnsureAttachTarget: params.onEnsureAttachTarget,
   });
-  registerBrowserRoutes(app as unknown as BrowserRouteRegistrar, ctx);
+  registerBrowserRoutes(app, ctx);
 
-  const server = await new Promise<Server>((resolve, reject) => {
-    const s = app.listen(port, host, () => resolve(s));
-    s.once("error", reject);
-  });
+  const server = await listenBrowserHttpServer(app, port, host);
 
   const address = server.address() as AddressInfo | null;
   const resolvedPort = address?.port ?? port;
   state.server = server;
   state.port = resolvedPort;
   state.resolved.controlPort = resolvedPort;
+  bridgeStates.set(server, state);
 
   setBridgeAuthForPort(resolvedPort, { token: authToken, password: authPassword });
 
-  const baseUrl = `http://${host}:${resolvedPort}`;
+  const baseUrl = `http://${isIPv6(host) ? `[${host}]` : host}:${resolvedPort}`;
   return { server, port: resolvedPort, baseUrl, state };
 }
 
-export async function stopBrowserBridgeServer(server: Server): Promise<void> {
+async function stopBrowserBridgeServerOnce(server: Server): Promise<void> {
+  let port: number | undefined;
   try {
     const address = server.address() as AddressInfo | null;
     if (address?.port) {
-      deleteBridgeAuthForPort(address.port);
+      port = address.port;
     }
   } catch {
     // ignore
   }
-  await new Promise<void>((resolve) => {
-    server.close(() => resolve());
+  const state = bridgeStates.get(server);
+  // Calling close stops new accepts synchronously; its callback waits for
+  // already-admitted requests, which runtime invalidation below will abort.
+  const httpClose = closeBridgeHttpServer(server);
+  if (state) {
+    deleteBridgeAuthForPort(state.port);
+  } else if (port) {
+    deleteBridgeAuthForPort(port);
+  }
+  if (!state) {
+    await httpClose;
+    return;
+  }
+  const runtimeClose = stopBrowserBridgeRuntime({
+    current: state,
+    getState: () => bridgeStates.get(server) ?? null,
+    // Retain the exact state until ingress and resource cleanup both succeed.
+    clearState: () => {},
+    onWarn: () => {},
   });
+  const settled = await Promise.allSettled([httpClose, runtimeClose]);
+  const failed = settled.find(
+    (result): result is PromiseRejectedResult => result.status === "rejected",
+  );
+  if (failed) {
+    throw failed.reason;
+  }
+  bridgeStates.delete(server);
+}
+
+export function stopBrowserBridgeServer(server: Server): Promise<void> {
+  const current = bridgeStopPromises.get(server);
+  if (current) {
+    return current;
+  }
+  const { promise: stopping, resolve, reject } = createDeferred<void>();
+  bridgeStopPromises.set(server, stopping);
+  void stopBrowserBridgeServerOnce(server).then(resolve, reject);
+  void stopping
+    .finally(() => {
+      if (bridgeStopPromises.get(server) === stopping) {
+        bridgeStopPromises.delete(server);
+      }
+    })
+    .catch(() => {});
+  return stopping;
 }

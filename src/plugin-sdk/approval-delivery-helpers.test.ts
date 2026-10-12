@@ -1,7 +1,12 @@
+/**
+ * Tests approval delivery helper capability composition.
+ */
 import { describe, expect, it, vi } from "vitest";
 import {
   createApproverRestrictedNativeApprovalAdapter,
   createApproverRestrictedNativeApprovalCapability,
+  createApproverRestrictedNativeApprovalCapabilityFromForwardingRoutes,
+  createChannelApprovalCapability,
   splitChannelApprovalCapability,
 } from "./approval-delivery-helpers.js";
 
@@ -54,9 +59,25 @@ describe("createApproverRestrictedNativeApprovalAdapter", () => {
       authorized: false,
       reason: "❌ You are not authorized to approve plugin requests on Discord.",
     });
+
+    expect(
+      authorizeActorAction({
+        cfg: {},
+        accountId: "work",
+        senderId: "plugin-owner",
+        action: "approve",
+        approvalKind: "plugin",
+        request: {
+          id: "exec-request",
+          request: { command: "pwd" },
+          createdAtMs: 0,
+          expiresAtMs: 10_000,
+        },
+      }),
+    ).toMatchObject({ authorized: false });
   });
 
-  it("reports initiating-surface state and DM routing from configured approvers", () => {
+  it("reports approval availability and DM routing from the relevant delivery surface", () => {
     const adapter = createApproverRestrictedNativeApprovalAdapter({
       channel: "telegram",
       channelLabel: "Telegram",
@@ -70,8 +91,13 @@ describe("createApproverRestrictedNativeApprovalAdapter", () => {
       resolveApproverDmTargets: () => [{ to: "approver-1" }],
     });
     const getActionAvailabilityState = adapter.auth.getActionAvailabilityState;
+    const getExecInitiatingSurfaceState = adapter.auth.getExecInitiatingSurfaceState;
     const hasConfiguredDmRoute = adapter.delivery;
-    if (!getActionAvailabilityState || !hasConfiguredDmRoute?.hasConfiguredDmRoute) {
+    if (
+      !getActionAvailabilityState ||
+      !getExecInitiatingSurfaceState ||
+      !hasConfiguredDmRoute?.hasConfiguredDmRoute
+    ) {
       throw new Error("approval availability helpers unavailable");
     }
     const nativeCapabilities = adapter.native?.describeDeliveryCapabilities({
@@ -107,6 +133,21 @@ describe("createApproverRestrictedNativeApprovalAdapter", () => {
         action: "approve",
       }),
     ).toEqual({ kind: "enabled" });
+    expect(
+      getActionAvailabilityState({
+        cfg: {} as never,
+        accountId: "disabled",
+        action: "approve",
+        approvalKind: "plugin",
+      }),
+    ).toEqual({ kind: "enabled" });
+    expect(
+      getExecInitiatingSurfaceState({
+        cfg: {} as never,
+        accountId: "disabled",
+        action: "approve",
+      }),
+    ).toEqual({ kind: "disabled" });
     expect(hasConfiguredDmRoute.hasConfiguredDmRoute({ cfg: {} as never })).toBe(true);
     expect(nativeCapabilities).toEqual({
       enabled: true,
@@ -115,30 +156,6 @@ describe("createApproverRestrictedNativeApprovalAdapter", () => {
       supportsApproverDmSurface: true,
       notifyOriginWhenDmOnly: false,
     });
-  });
-
-  it("reports enabled when approvers exist even if native delivery is off (#59620)", () => {
-    const adapter = createApproverRestrictedNativeApprovalAdapter({
-      channel: "telegram",
-      channelLabel: "Telegram",
-      listAccountIds: () => ["default"],
-      hasApprovers: () => true,
-      isExecAuthorizedSender: () => true,
-      isNativeDeliveryEnabled: () => false,
-      resolveNativeDeliveryMode: () => "both",
-    });
-    const getActionAvailabilityState = adapter.auth.getActionAvailabilityState;
-    if (!getActionAvailabilityState) {
-      throw new Error("approval availability helper unavailable");
-    }
-
-    expect(
-      getActionAvailabilityState({
-        cfg: {} as never,
-        accountId: "default",
-        action: "approve",
-      }),
-    ).toEqual({ kind: "enabled" });
   });
 
   it("suppresses forwarding fallback only for matching native-delivery surfaces", () => {
@@ -231,6 +248,21 @@ describe("createApproverRestrictedNativeApprovalAdapter", () => {
 
 describe("createApproverRestrictedNativeApprovalCapability", () => {
   it("builds the canonical approval capability and preserves legacy split compatibility", () => {
+    const nativeRuntime = {
+      availability: {
+        isConfigured: vi.fn(),
+        shouldHandle: vi.fn(),
+      },
+      presentation: {
+        buildPendingPayload: vi.fn(),
+        buildResolvedResult: vi.fn(),
+        buildExpiredResult: vi.fn(),
+      },
+      transport: {
+        prepareTarget: vi.fn(),
+        deliverPending: vi.fn(),
+      },
+    };
     const describeExecApprovalSetup = vi.fn(
       ({
         channel,
@@ -242,7 +274,7 @@ describe("createApproverRestrictedNativeApprovalCapability", () => {
         accountId?: string;
       }) => `${channelLabel}:${channel}:${accountId ?? "default"}:setup`,
     );
-    const capability = createApproverRestrictedNativeApprovalCapability({
+    const adapterParams = {
       channel: "matrix",
       channelLabel: "Matrix",
       describeExecApprovalSetup,
@@ -252,17 +284,38 @@ describe("createApproverRestrictedNativeApprovalCapability", () => {
       isNativeDeliveryEnabled: () => true,
       resolveNativeDeliveryMode: () => "dm",
       resolveApproverDmTargets: () => [{ to: "user:@owner:example.com" }],
+    } satisfies Parameters<typeof createApproverRestrictedNativeApprovalCapability>[0];
+    const capability = createApproverRestrictedNativeApprovalCapability({
+      ...adapterParams,
+      nativeRuntime,
     });
+    const actorInput = {
+      cfg: {},
+      accountId: "work",
+      senderId: "@owner:example.com",
+      action: "approve",
+      approvalKind: "exec",
+    } as const;
+    const deliveryInput = {
+      cfg: {},
+      accountId: "work",
+      approvalKind: "exec",
+      request: {
+        id: "approval-1",
+        request: { command: "pwd" },
+        createdAtMs: 0,
+        expiresAtMs: 10_000,
+      },
+    } as const;
+    const expectedCapabilities = {
+      enabled: true,
+      preferredSurface: "approver-dm",
+      supportsOriginSurface: false,
+      supportsApproverDmSurface: true,
+      notifyOriginWhenDmOnly: false,
+    };
 
-    expect(
-      capability.authorizeActorAction?.({
-        cfg: {} as never,
-        accountId: "work",
-        senderId: "@owner:example.com",
-        action: "approve",
-        approvalKind: "exec",
-      }),
-    ).toEqual({ authorized: true });
+    expect(capability.authorizeActorAction?.(actorInput)).toEqual({ authorized: true });
     expect(capability.delivery?.hasConfiguredDmRoute?.({ cfg: {} as never })).toBe(true);
     expect(
       capability.describeExecApprovalSetup?.({
@@ -272,83 +325,156 @@ describe("createApproverRestrictedNativeApprovalCapability", () => {
       }),
     ).toBe("Matrix:matrix:ops:setup");
     expect(
-      capability.native?.describeDeliveryCapabilities({
-        cfg: {} as never,
-        accountId: "work",
-        approvalKind: "exec",
-        request: {
-          id: "approval-1",
-          request: { command: "pwd" },
-          createdAtMs: 0,
-          expiresAtMs: 10_000,
+      capability.describePluginApprovalSetup?.({
+        channel: "matrix",
+        channelLabel: "Matrix",
+        accountId: "ops",
+      }),
+    ).toBeUndefined();
+    expect(capability.native?.describeDeliveryCapabilities(deliveryInput)).toEqual(
+      expectedCapabilities,
+    );
+
+    const split = splitChannelApprovalCapability(capability);
+    const legacy = createApproverRestrictedNativeApprovalAdapter(adapterParams);
+    for (const adapter of [split, legacy]) {
+      expect(adapter.delivery?.hasConfiguredDmRoute?.({ cfg: {} })).toBe(true);
+      expect(adapter.native?.describeDeliveryCapabilities(deliveryInput)).toEqual(
+        expectedCapabilities,
+      );
+      expect(adapter.auth.authorizeActorAction?.(actorInput)).toEqual({ authorized: true });
+      expect(adapter.auth.getExecInitiatingSurfaceState?.(actorInput)).toEqual({ kind: "enabled" });
+      expect(adapter.describeExecApprovalSetup).toBe(describeExecApprovalSetup);
+      expect(adapter.describePluginApprovalSetup).toBeUndefined();
+    }
+    expect(split.nativeRuntime).toBe(nativeRuntime);
+  });
+
+  it("assembles forwarding-routed capabilities without replacing channel auth results", () => {
+    const authResult = { authorized: true } as const;
+    const authorizeActorAction = vi.fn(() => authResult);
+    const render = { exec: { buildPendingPayload: vi.fn() } };
+    const routed = createApproverRestrictedNativeApprovalCapabilityFromForwardingRoutes({
+      channel: "example",
+      channelLabel: "Example",
+      authorizeActorAction,
+      routing: {
+        defaultForwardingMode: "session",
+        isTransportEnabled: () => true,
+        listAccountIds: () => ["default"],
+        resolveDefaultAccountId: () => "default",
+        normalizeTo: (to) => to.trim().toLowerCase() || null,
+        resolveApprovers: () => ["owner"],
+      },
+      render,
+    });
+    const cfg = {
+      approvals: {
+        exec: {
+          enabled: true,
+          mode: "both",
+          targets: [{ channel: "example", to: "Origin" }],
         },
+      },
+    } as never;
+    const request = {
+      id: "approval-1",
+      request: {
+        command: "pwd",
+        turnSourceChannel: "example",
+        turnSourceTo: "Origin",
+      },
+      createdAtMs: 0,
+      expiresAtMs: 10_000,
+    } as never;
+
+    expect(
+      routed.capability.authorizeActorAction?.({
+        cfg,
+        accountId: "default",
+        senderId: "owner",
+        action: "approve",
+        approvalKind: "exec",
+      }),
+    ).toBe(authResult);
+    expect(routed.capability.render).toBe(render);
+    expect(
+      routed.capability.getActionAvailabilityState?.({
+        cfg,
+        accountId: "default",
+        action: "approve",
+        approvalKind: "exec",
+      }),
+    ).toEqual({ kind: "enabled" });
+    expect(
+      routed.capability.native?.describeDeliveryCapabilities({
+        cfg,
+        accountId: "default",
+        approvalKind: "exec",
+        request,
       }),
     ).toEqual({
       enabled: true,
-      preferredSurface: "approver-dm",
-      supportsOriginSurface: false,
+      preferredSurface: "origin",
+      supportsOriginSurface: true,
       supportsApproverDmSurface: true,
-      notifyOriginWhenDmOnly: false,
+      notifyOriginWhenDmOnly: true,
     });
+    expect(
+      routed.capability.delivery?.shouldSuppressForwardingFallback?.({
+        cfg,
+        approvalKind: "exec",
+        target: { channel: "example", to: "ORIGIN", source: "target" },
+        request,
+      }),
+    ).toBe(true);
+    expect(routed.routing.isNativeApprovalHandlerConfigured({ cfg })).toBe(true);
+  });
+});
 
-    const split = splitChannelApprovalCapability(capability);
-    const legacy = createApproverRestrictedNativeApprovalAdapter({
-      channel: "matrix",
-      channelLabel: "Matrix",
-      describeExecApprovalSetup,
-      listAccountIds: () => ["work"],
-      hasApprovers: () => true,
-      isExecAuthorizedSender: ({ senderId }) => senderId === "@owner:example.com",
-      isNativeDeliveryEnabled: () => true,
-      resolveNativeDeliveryMode: () => "dm",
-      resolveApproverDmTargets: () => [{ to: "user:@owner:example.com" }],
+describe("createChannelApprovalCapability", () => {
+  it("accepts canonical top-level capability surfaces", () => {
+    const delivery = { hasConfiguredDmRoute: vi.fn() };
+    const nativeRuntime = {
+      availability: {
+        isConfigured: vi.fn(),
+        shouldHandle: vi.fn(),
+      },
+      presentation: {
+        buildPendingPayload: vi.fn(),
+        buildResolvedResult: vi.fn(),
+        buildExpiredResult: vi.fn(),
+      },
+      transport: {
+        prepareTarget: vi.fn(),
+        deliverPending: vi.fn(),
+      },
+    };
+    const render = {
+      exec: {
+        buildPendingPayload: vi.fn(),
+      },
+    };
+    const native = { describeDeliveryCapabilities: vi.fn() };
+
+    expect(
+      createChannelApprovalCapability({
+        delivery,
+        nativeRuntime,
+        render,
+        native,
+      }),
+    ).toEqual({
+      authorizeActorAction: undefined,
+      getActionAvailabilityState: undefined,
+      getExecInitiatingSurfaceState: undefined,
+      resolveApproveCommandBehavior: undefined,
+      describeExecApprovalSetup: undefined,
+      describePluginApprovalSetup: undefined,
+      delivery,
+      nativeRuntime,
+      render,
+      native,
     });
-    expect(split.delivery?.hasConfiguredDmRoute?.({ cfg: {} as never })).toBe(
-      legacy.delivery?.hasConfiguredDmRoute?.({ cfg: {} as never }),
-    );
-    expect(
-      split.native?.describeDeliveryCapabilities({
-        cfg: {} as never,
-        accountId: "work",
-        approvalKind: "exec",
-        request: {
-          id: "approval-1",
-          request: { command: "pwd" },
-          createdAtMs: 0,
-          expiresAtMs: 10_000,
-        },
-      }),
-    ).toEqual(
-      legacy.native?.describeDeliveryCapabilities({
-        cfg: {} as never,
-        accountId: "work",
-        approvalKind: "exec",
-        request: {
-          id: "approval-1",
-          request: { command: "pwd" },
-          createdAtMs: 0,
-          expiresAtMs: 10_000,
-        },
-      }),
-    );
-    expect(
-      split.auth.authorizeActorAction?.({
-        cfg: {} as never,
-        accountId: "work",
-        senderId: "@owner:example.com",
-        action: "approve",
-        approvalKind: "exec",
-      }),
-    ).toEqual(
-      legacy.auth.authorizeActorAction?.({
-        cfg: {} as never,
-        accountId: "work",
-        senderId: "@owner:example.com",
-        action: "approve",
-        approvalKind: "exec",
-      }),
-    );
-    expect(split.describeExecApprovalSetup).toBe(describeExecApprovalSetup);
-    expect(legacy.describeExecApprovalSetup).toBe(describeExecApprovalSetup);
   });
 });

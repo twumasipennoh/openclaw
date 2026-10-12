@@ -1,12 +1,13 @@
-export type { OpenClawPluginApi, PluginRuntime } from "openclaw/plugin-sdk/core";
+import type { OpenClawConfig as RuntimeOpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
+export type { OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry";
 export type { ChannelMessageActionAdapter } from "openclaw/plugin-sdk/channel-contract";
 export type { TelegramApiOverride } from "./src/send.js";
 export type {
   OpenClawPluginService,
   OpenClawPluginServiceContext,
   PluginLogger,
-} from "openclaw/plugin-sdk/core";
-import type { OpenClawConfig as RuntimeOpenClawConfig } from "openclaw/plugin-sdk/config-runtime";
+} from "openclaw/plugin-sdk/plugin-entry";
+export type { PluginRuntime } from "openclaw/plugin-sdk/runtime-store";
 export type {
   AcpRuntime,
   AcpRuntimeCapabilities,
@@ -22,11 +23,11 @@ export type {
 export { AcpRuntimeError } from "openclaw/plugin-sdk/acp-runtime";
 
 export {
-  clearAccountEntryFields,
   emptyPluginConfigSchema,
   formatPairingApproveHint,
   getChatChannelMeta,
-} from "openclaw/plugin-sdk/core";
+} from "openclaw/plugin-sdk/channel-plugin-common";
+export { clearAccountEntryFields } from "openclaw/plugin-sdk/channel-core";
 export { buildChannelConfigSchema, TelegramConfigSchema } from "./config-api.js";
 export { DEFAULT_ACCOUNT_ID, normalizeAccountId } from "openclaw/plugin-sdk/account-id";
 export {
@@ -59,7 +60,7 @@ export {
   resolveTelegramTransport,
   shouldRetryTelegramTransportFallback,
 } from "./src/fetch.js";
-export { makeProxyFetch } from "./src/proxy.js";
+export { makeProxyFetch } from "openclaw/plugin-sdk/fetch-runtime";
 export {
   createForumTopicTelegram,
   deleteMessageTelegram,
@@ -78,14 +79,13 @@ export {
 export {
   createTelegramThreadBindingManager,
   getTelegramThreadBindingManager,
-  resetTelegramThreadBindingsForTests,
   setTelegramThreadBindingIdleTimeoutBySessionKey,
   setTelegramThreadBindingMaxAgeBySessionKey,
 } from "./src/thread-bindings.js";
 export { resolveTelegramToken } from "./src/token.js";
 export { setTelegramRuntime } from "./src/runtime.js";
-export type { ChannelPlugin } from "openclaw/plugin-sdk/core";
-export type { OpenClawConfig } from "openclaw/plugin-sdk/config-runtime";
+export type { ChannelPlugin } from "openclaw/plugin-sdk/channel-core";
+export type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 export type TelegramAccountConfig = NonNullable<
   NonNullable<RuntimeOpenClawConfig["channels"]>["telegram"]
 >;

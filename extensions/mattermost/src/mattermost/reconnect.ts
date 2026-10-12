@@ -1,13 +1,15 @@
-export type ReconnectOutcome = "resolved" | "rejected";
+import { setTimeout as delay } from "node:timers/promises";
 
-export type ShouldReconnectParams = {
+type ReconnectOutcome = "resolved" | "rejected";
+
+type ShouldReconnectParams = {
   attempt: number;
   delayMs: number;
   outcome: ReconnectOutcome;
   error?: unknown;
 };
 
-export type RunWithReconnectOpts = {
+type RunWithReconnectOpts = {
   abortSignal?: AbortSignal;
   onError?: (err: unknown) => void;
   onReconnect?: (delayMs: number) => void;
@@ -37,12 +39,10 @@ export async function runWithReconnect(
   let attempt = 0;
 
   while (!opts.abortSignal?.aborted) {
-    let shouldIncreaseDelay = false;
     let outcome: ReconnectOutcome = "resolved";
     let error: unknown;
     try {
       await connectFn();
-      retryDelay = initialDelayMs;
     } catch (err) {
       if (opts.abortSignal?.aborted) {
         return;
@@ -50,10 +50,12 @@ export async function runWithReconnect(
       outcome = "rejected";
       error = err;
       opts.onError?.(err);
-      shouldIncreaseDelay = true;
     }
     if (opts.abortSignal?.aborted) {
       return;
+    }
+    if (outcome === "resolved") {
+      retryDelay = initialDelayMs;
     }
     const delayMs = withJitter(retryDelay, jitterRatio, random);
     const shouldReconnect =
@@ -67,8 +69,14 @@ export async function runWithReconnect(
       return;
     }
     opts.onReconnect?.(delayMs);
-    await sleepAbortable(delayMs, opts.abortSignal);
-    if (shouldIncreaseDelay) {
+    try {
+      await delay(delayMs, undefined, { signal: opts.abortSignal });
+    } catch (delayError) {
+      if (!opts.abortSignal?.aborted) {
+        throw delayError;
+      }
+    }
+    if (outcome === "rejected") {
       retryDelay = Math.min(retryDelay * 2, maxDelayMs);
     }
     attempt++;
@@ -82,22 +90,4 @@ function withJitter(baseMs: number, jitterRatio: number, random: () => number): 
   const normalized = Math.max(0, Math.min(1, random()));
   const spread = baseMs * jitterRatio;
   return Math.max(1, Math.round(baseMs - spread + normalized * spread * 2));
-}
-
-function sleepAbortable(ms: number, signal?: AbortSignal): Promise<void> {
-  return new Promise((resolve) => {
-    if (signal?.aborted) {
-      resolve();
-      return;
-    }
-    const onAbort = () => {
-      clearTimeout(timer);
-      resolve();
-    };
-    const timer = setTimeout(() => {
-      signal?.removeEventListener("abort", onAbort);
-      resolve();
-    }, ms);
-    signal?.addEventListener("abort", onAbort, { once: true });
-  });
 }

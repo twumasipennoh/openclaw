@@ -9,7 +9,6 @@ import {
 
 async function updateMatrixPins(
   roomId: string,
-  messageId: string,
   opts: MatrixActionClientOpts,
   update: (current: string[]) => string[],
 ): Promise<{ pinned: string[] }> {
@@ -27,7 +26,7 @@ export async function pinMatrixMessage(
   messageId: string,
   opts: MatrixActionClientOpts = {},
 ): Promise<{ pinned: string[] }> {
-  return await updateMatrixPins(roomId, messageId, opts, (current) =>
+  return await updateMatrixPins(roomId, opts, (current) =>
     current.includes(messageId) ? current : [...current, messageId],
   );
 }
@@ -37,7 +36,7 @@ export async function unpinMatrixMessage(
   messageId: string,
   opts: MatrixActionClientOpts = {},
 ): Promise<{ pinned: string[] }> {
-  return await updateMatrixPins(roomId, messageId, opts, (current) =>
+  return await updateMatrixPins(roomId, opts, (current) =>
     current.filter((id) => id !== messageId),
   );
 }
@@ -49,15 +48,7 @@ export async function listMatrixPins(
   return await withResolvedRoomAction(roomId, opts, async (client, resolvedRoom) => {
     const pinned = await readPinnedEvents(client, resolvedRoom);
     const events = (
-      await Promise.all(
-        pinned.map(async (eventId) => {
-          try {
-            return await fetchEventSummary(client, resolvedRoom, eventId);
-          } catch {
-            return null;
-          }
-        }),
-      )
+      await Promise.all(pinned.map((eventId) => fetchEventSummary(client, resolvedRoom, eventId)))
     ).filter((event): event is MatrixMessageSummary => Boolean(event));
     return { pinned, events };
   });

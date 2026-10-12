@@ -1,18 +1,31 @@
+/** Formats daemon runtime state into compact status lines for CLI output. */
 import { formatRuntimeStatusWithDetails } from "../infra/runtime-status.ts";
+import { getSystemdCgroupHygieneSummary, type GatewayServiceRuntime } from "./service-runtime.js";
 
-export type ServiceRuntimeLike = {
-  status?: string;
-  state?: string;
-  subState?: string;
-  pid?: number;
-  lastExitStatus?: number;
-  lastExitReason?: string;
-  lastRunResult?: string;
-  lastRunTime?: string;
-  detail?: string;
-};
+export function formatServiceLabel(label: string, runtime?: GatewayServiceRuntime): string {
+  if (runtime?.inspectionReason === "service-manager-unavailable") {
+    return "no supported service manager detected";
+  }
+  return runtime?.systemd?.scope ? `systemd ${runtime.systemd.scope}` : label;
+}
 
-export function formatRuntimeStatus(runtime: ServiceRuntimeLike | undefined): string | null {
+// Windows and systemd expose signal exits as numeric status codes.
+const SIGNAL_NAMES_BY_STATUS = new Map<number, string>([
+  [129, "SIGHUP"],
+  [130, "SIGINT"],
+  [131, "SIGQUIT"],
+  [134, "SIGABRT/abort"],
+  [137, "SIGKILL"],
+  [143, "SIGTERM"],
+]);
+
+function formatLastExitStatus(status: number): string {
+  // Service managers usually report signal exits as 128 + signal number.
+  const signalName = SIGNAL_NAMES_BY_STATUS.get(status);
+  return signalName ? `last exit ${status} (${signalName})` : `last exit ${status}`;
+}
+
+export function formatRuntimeStatus(runtime: GatewayServiceRuntime | undefined): string | null {
   if (!runtime) {
     return null;
   }
@@ -21,7 +34,7 @@ export function formatRuntimeStatus(runtime: ServiceRuntimeLike | undefined): st
     details.push(`sub ${runtime.subState}`);
   }
   if (runtime.lastExitStatus !== undefined) {
-    details.push(`last exit ${runtime.lastExitStatus}`);
+    details.push(formatLastExitStatus(runtime.lastExitStatus));
   }
   if (runtime.lastExitReason) {
     details.push(`reason ${runtime.lastExitReason}`);
@@ -31,6 +44,10 @@ export function formatRuntimeStatus(runtime: ServiceRuntimeLike | undefined): st
   }
   if (runtime.lastRunTime) {
     details.push(`last run time ${runtime.lastRunTime}`);
+  }
+  const cgroupSummary = getSystemdCgroupHygieneSummary(runtime.systemd);
+  if (cgroupSummary) {
+    details.push(cgroupSummary);
   }
   if (runtime.detail) {
     details.push(runtime.detail);

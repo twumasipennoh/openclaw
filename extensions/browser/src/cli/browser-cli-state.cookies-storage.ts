@@ -1,47 +1,21 @@
 import type { Command } from "commander";
-import { callBrowserRequest, type BrowserParentOpts } from "./browser-cli-shared.js";
-import { danger, defaultRuntime, inheritOptionFromParent } from "./core-api.js";
-
-function resolveUrl(opts: { url?: string }, command: Command): string | undefined {
-  if (typeof opts.url === "string" && opts.url.trim()) {
-    return opts.url.trim();
-  }
-  const inherited = inheritOptionFromParent<string>(command, "url");
-  if (typeof inherited === "string" && inherited.trim()) {
-    return inherited.trim();
-  }
-  return undefined;
-}
+import { inheritOptionFromParent } from "openclaw/plugin-sdk/cli-runtime";
+import { danger, defaultRuntime } from "openclaw/plugin-sdk/runtime-env";
+import {
+  normalizeOptionalString,
+  readNonBlankString,
+} from "openclaw/plugin-sdk/string-coerce-runtime";
+import {
+  BROWSER_TAB_REFERENCE_HELP,
+  runBrowserCliRequest,
+  type BrowserParentOpts,
+} from "./browser-cli-shared.js";
 
 function resolveTargetId(rawTargetId: unknown, command: Command): string | undefined {
-  const local = typeof rawTargetId === "string" ? rawTargetId.trim() : "";
-  if (local) {
-    return local;
-  }
-  const inherited = inheritOptionFromParent<string>(command, "targetId");
-  if (typeof inherited !== "string") {
-    return undefined;
-  }
-  const trimmed = inherited.trim();
-  return trimmed ? trimmed : undefined;
-}
-
-async function runMutationRequest(params: {
-  parent: BrowserParentOpts;
-  request: Parameters<typeof callBrowserRequest>[1];
-  successMessage: string;
-}) {
-  try {
-    const result = await callBrowserRequest(params.parent, params.request, { timeoutMs: 20000 });
-    if (params.parent?.json) {
-      defaultRuntime.writeJson(result);
-      return;
-    }
-    defaultRuntime.log(params.successMessage);
-  } catch (err) {
-    defaultRuntime.error(danger(String(err)));
-    defaultRuntime.exit(1);
-  }
+  return (
+    normalizeOptionalString(rawTargetId) ??
+    normalizeOptionalString(inheritOptionFromParent<string>(command, "targetId"))
+  );
 }
 
 export function registerBrowserCookiesAndStorageCommands(
@@ -50,35 +24,18 @@ export function registerBrowserCookiesAndStorageCommands(
 ) {
   const cookies = browser.command("cookies").description("Read/write cookies");
 
-  cookies
-    .option("--target-id <id>", "CDP target id (or unique prefix)")
-    .action(async (opts, cmd) => {
-      const parent = parentOpts(cmd);
-      const profile = parent?.browserProfile;
-      const targetId = resolveTargetId(opts.targetId, cmd);
-      try {
-        const result = await callBrowserRequest<{ cookies?: unknown[] }>(
-          parent,
-          {
-            method: "GET",
-            path: "/cookies",
-            query: {
-              targetId,
-              profile,
-            },
-          },
-          { timeoutMs: 20000 },
-        );
-        if (parent?.json) {
-          defaultRuntime.writeJson(result);
-          return;
-        }
-        defaultRuntime.writeJson(result.cookies ?? []);
-      } catch (err) {
-        defaultRuntime.error(danger(String(err)));
-        defaultRuntime.exit(1);
-      }
+  cookies.option("--target-id <id>", BROWSER_TAB_REFERENCE_HELP).action(async (opts, cmd) => {
+    const parent = parentOpts(cmd);
+    const targetId = resolveTargetId(opts.targetId, cmd);
+    await runBrowserCliRequest<{ cookies?: unknown[] }>({
+      parent,
+      method: "GET",
+      path: "/cookies",
+      query: { targetId },
+      errorPolicy: "inline",
+      print: (result) => defaultRuntime.writeJson(result.cookies ?? []),
     });
+  });
 
   cookies
     .command("set")
@@ -86,28 +43,24 @@ export function registerBrowserCookiesAndStorageCommands(
     .argument("<name>", "Cookie name")
     .argument("<value>", "Cookie value")
     .option("--url <url>", "Cookie URL scope (recommended)")
-    .option("--target-id <id>", "CDP target id (or unique prefix)")
+    .option("--target-id <id>", BROWSER_TAB_REFERENCE_HELP)
     .action(async (name: string, value: string, opts, cmd) => {
       const parent = parentOpts(cmd);
-      const profile = parent?.browserProfile;
       const targetId = resolveTargetId(opts.targetId, cmd);
-      const url = resolveUrl(opts, cmd);
+      const url = normalizeOptionalString(opts.url);
       if (!url) {
         defaultRuntime.error(danger("Missing required --url option for cookies set"));
         defaultRuntime.exit(1);
         return;
       }
-      await runMutationRequest({
+      await runBrowserCliRequest({
         parent,
-        request: {
-          method: "POST",
-          path: "/cookies/set",
-          query: profile ? { profile } : undefined,
-          body: {
-            targetId,
-            cookie: { name, value, url },
-          },
+        path: "/cookies/set",
+        body: {
+          targetId,
+          cookie: { name, value, url },
         },
+        errorPolicy: "inline",
         successMessage: `cookie set: ${name}`,
       });
     });
@@ -115,62 +68,40 @@ export function registerBrowserCookiesAndStorageCommands(
   cookies
     .command("clear")
     .description("Clear all cookies")
-    .option("--target-id <id>", "CDP target id (or unique prefix)")
+    .option("--target-id <id>", BROWSER_TAB_REFERENCE_HELP)
     .action(async (opts, cmd) => {
       const parent = parentOpts(cmd);
-      const profile = parent?.browserProfile;
       const targetId = resolveTargetId(opts.targetId, cmd);
-      await runMutationRequest({
+      await runBrowserCliRequest({
         parent,
-        request: {
-          method: "POST",
-          path: "/cookies/clear",
-          query: profile ? { profile } : undefined,
-          body: {
-            targetId,
-          },
-        },
+        path: "/cookies/clear",
+        body: { targetId },
+        errorPolicy: "inline",
         successMessage: "cookies cleared",
       });
     });
 
   const storage = browser.command("storage").description("Read/write localStorage/sessionStorage");
 
-  function registerStorageKind(kind: "local" | "session") {
+  for (const kind of ["local", "session"] as const) {
     const cmd = storage.command(kind).description(`${kind}Storage commands`);
 
     cmd
       .command("get")
       .description(`Get ${kind}Storage (all keys or one key)`)
       .argument("[key]", "Key (optional)")
-      .option("--target-id <id>", "CDP target id (or unique prefix)")
+      .option("--target-id <id>", BROWSER_TAB_REFERENCE_HELP)
       .action(async (key: string | undefined, opts, cmd2) => {
         const parent = parentOpts(cmd2);
-        const profile = parent?.browserProfile;
         const targetId = resolveTargetId(opts.targetId, cmd2);
-        try {
-          const result = await callBrowserRequest<{ values?: Record<string, string> }>(
-            parent,
-            {
-              method: "GET",
-              path: `/storage/${kind}`,
-              query: {
-                key: key?.trim() || undefined,
-                targetId,
-                profile,
-              },
-            },
-            { timeoutMs: 20000 },
-          );
-          if (parent?.json) {
-            defaultRuntime.writeJson(result);
-            return;
-          }
-          defaultRuntime.writeJson(result.values ?? {});
-        } catch (err) {
-          defaultRuntime.error(danger(String(err)));
-          defaultRuntime.exit(1);
-        }
+        await runBrowserCliRequest<{ values?: Record<string, string> }>({
+          parent,
+          method: "GET",
+          path: `/storage/${kind}`,
+          query: { key: readNonBlankString(key), targetId },
+          errorPolicy: "inline",
+          print: (result) => defaultRuntime.writeJson(result.values ?? {}),
+        });
       });
 
     cmd
@@ -178,23 +109,15 @@ export function registerBrowserCookiesAndStorageCommands(
       .description(`Set a ${kind}Storage key`)
       .argument("<key>", "Key")
       .argument("<value>", "Value")
-      .option("--target-id <id>", "CDP target id (or unique prefix)")
+      .option("--target-id <id>", BROWSER_TAB_REFERENCE_HELP)
       .action(async (key: string, value: string, opts, cmd2) => {
         const parent = parentOpts(cmd2);
-        const profile = parent?.browserProfile;
         const targetId = resolveTargetId(opts.targetId, cmd2);
-        await runMutationRequest({
+        await runBrowserCliRequest({
           parent,
-          request: {
-            method: "POST",
-            path: `/storage/${kind}/set`,
-            query: profile ? { profile } : undefined,
-            body: {
-              key,
-              value,
-              targetId,
-            },
-          },
+          path: `/storage/${kind}/set`,
+          body: { key, value, targetId },
+          errorPolicy: "inline",
           successMessage: `${kind}Storage set: ${key}`,
         });
       });
@@ -202,26 +125,17 @@ export function registerBrowserCookiesAndStorageCommands(
     cmd
       .command("clear")
       .description(`Clear all ${kind}Storage keys`)
-      .option("--target-id <id>", "CDP target id (or unique prefix)")
+      .option("--target-id <id>", BROWSER_TAB_REFERENCE_HELP)
       .action(async (opts, cmd2) => {
         const parent = parentOpts(cmd2);
-        const profile = parent?.browserProfile;
         const targetId = resolveTargetId(opts.targetId, cmd2);
-        await runMutationRequest({
+        await runBrowserCliRequest({
           parent,
-          request: {
-            method: "POST",
-            path: `/storage/${kind}/clear`,
-            query: profile ? { profile } : undefined,
-            body: {
-              targetId,
-            },
-          },
+          path: `/storage/${kind}/clear`,
+          body: { targetId },
+          errorPolicy: "inline",
           successMessage: `${kind}Storage cleared`,
         });
       });
   }
-
-  registerStorageKind("local");
-  registerStorageKind("session");
 }

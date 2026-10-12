@@ -1,33 +1,11 @@
-export type QaChannelActionConfig = {
-  messages?: boolean;
-  reactions?: boolean;
-  search?: boolean;
-  threads?: boolean;
-};
+import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
+import type { QaChannelAccountConfig, QaChannelConfig } from "./config-schema.js";
 
-export type QaChannelAccountConfig = {
-  name?: string;
-  enabled?: boolean;
-  baseUrl?: string;
-  botUserId?: string;
-  botDisplayName?: string;
-  pollTimeoutMs?: number;
-  allowFrom?: Array<string | number>;
-  defaultTo?: string;
-  actions?: QaChannelActionConfig;
-};
+export type { QaChannelAccountConfig };
 
-export type QaChannelConfig = QaChannelAccountConfig & {
-  accounts?: Record<string, Partial<QaChannelAccountConfig>>;
-  defaultAccount?: string;
-};
-
-export type CoreConfig = {
+export type CoreConfig = OpenClawConfig & {
   channels?: {
     "qa-channel"?: QaChannelConfig;
-  };
-  session?: {
-    store?: string;
   };
 };
 
@@ -40,5 +18,6 @@ export type ResolvedQaChannelAccount = {
   botUserId: string;
   botDisplayName: string;
   pollTimeoutMs: number;
+  mediaMaxBytes?: number;
   config: QaChannelAccountConfig;
 };

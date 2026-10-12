@@ -1,28 +1,30 @@
+import { validateDottedDecimalIPv4Input } from "@openclaw/net-policy/ipv4";
+import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
+import { formatPortRangeHint } from "../cli/error-format.js";
 import {
   normalizeGatewayTokenInput,
   randomToken,
   validateGatewayPasswordInput,
 } from "../commands/onboard-helpers.js";
-import type { GatewayAuthChoice, SecretInputMode } from "../commands/onboard-types.js";
-import type { GatewayBindMode, GatewayTailscaleMode, OpenClawConfig } from "../config/config.js";
+import type { SecretInputMode } from "../commands/onboard-types.js";
+import type { GatewayAuthConfig, OpenClawConfig } from "../config/config.js";
 import { ensureControlUiAllowedOriginsForNonLoopbackBind } from "../config/gateway-control-ui-origins.js";
 import {
   normalizeSecretInputString,
   resolveSecretInputRef,
   type SecretInput,
 } from "../config/types.secrets.js";
+import { provisionGatewayTokenStoreRef } from "../gateway/auth-token-store-ref.js";
 import {
   maybeAddTailnetOriginToControlUiAllowedOrigins,
-  TAILSCALE_DOCS_LINES,
+  validateGatewayPortInput,
   TAILSCALE_EXPOSURE_OPTIONS,
-  TAILSCALE_MISSING_BIN_NOTE_LINES,
 } from "../gateway/gateway-config-prompts.shared.js";
-import { DEFAULT_DANGEROUS_NODE_COMMANDS } from "../gateway/node-command-policy.js";
 import { findTailscaleBinary } from "../infra/tailscale.js";
+import { parseTcpPort } from "../infra/tcp-port.js";
 import { resolveSecretInputModeForEnvSelection } from "../plugins/provider-auth-mode.js";
 import { promptSecretRefForSetup } from "../plugins/provider-auth-ref.js";
-import type { RuntimeEnv } from "../runtime.js";
-import { validateIPv4AddressInput } from "../shared/net/ipv4.js";
+import { t } from "./i18n/index.js";
 import type { WizardPrompter } from "./prompts.js";
 import { resolveSetupSecretInputString } from "./setup.secret-input.js";
 import type {
@@ -35,11 +37,9 @@ type ConfigureGatewayOptions = {
   flow: WizardFlow;
   baseConfig: OpenClawConfig;
   nextConfig: OpenClawConfig;
-  localPort: number;
   quickstartGateway: QuickstartGatewayDefaults;
   secretInputMode?: SecretInputMode;
   prompter: WizardPrompter;
-  runtime: RuntimeEnv;
 };
 
 type ConfigureGatewayResult = {
@@ -47,38 +47,53 @@ type ConfigureGatewayResult = {
   settings: GatewayWizardSettings;
 };
 
+function getLocalizedTailscaleExposureOptions() {
+  return TAILSCALE_EXPOSURE_OPTIONS.map((option) => ({
+    hint: t(`wizard.gatewayTailscale.${option.value}Hint`),
+    label: t(`wizard.gatewayTailscale.${option.value}`),
+    value: option.value,
+  }));
+}
+
 export async function configureGatewayForSetup(
   opts: ConfigureGatewayOptions,
 ): Promise<ConfigureGatewayResult> {
-  const { flow, localPort, quickstartGateway, prompter } = opts;
+  const { flow, quickstartGateway, prompter } = opts;
   let { nextConfig } = opts;
 
   const port =
     flow === "quickstart"
       ? quickstartGateway.port
-      : Number.parseInt(
-          String(
-            await prompter.text({
-              message: "Gateway port",
-              initialValue: String(localPort),
-              validate: (value) => (Number.isFinite(Number(value)) ? undefined : "Invalid port"),
-            }),
-          ),
-          10,
+      : parseTcpPort(
+          await prompter.text({
+            message: t("wizard.gateway.port"),
+            initialValue: String(quickstartGateway.port),
+            validate: validateGatewayPortInput,
+          }),
         );
+  if (port === null) {
+    throw new Error(formatPortRangeHint());
+  }
 
   let bind: GatewayWizardSettings["bind"] =
     flow === "quickstart"
       ? quickstartGateway.bind
       : await prompter.select<GatewayWizardSettings["bind"]>({
-          message: "Gateway bind",
-          options: [
-            { value: "loopback", label: "Loopback (127.0.0.1)" },
-            { value: "lan", label: "LAN (0.0.0.0)" },
-            { value: "tailnet", label: "Tailnet (Tailscale IP)" },
-            { value: "auto", label: "Auto (Loopback → LAN)" },
-            { value: "custom", label: "Custom IP" },
-          ],
+          message: t("wizard.gateway.bindAddress"),
+          options: (
+            [
+              ["loopback", "bindLoopback"],
+              ["lan", "bindLan"],
+              ["tailnet", "bindTailnet"],
+              ["auto", "bindAuto"],
+              ["custom", "bindCustom"],
+            ] as const
+          ).map(([value, key]) => ({
+            value,
+            label: t(`wizard.gateway.${key}`),
+            hint: t(`wizard.gateway.${key}Hint`),
+          })),
+          initialValue: quickstartGateway.bind,
         });
 
   let customBindHost = quickstartGateway.customBindHost;
@@ -86,37 +101,24 @@ export async function configureGatewayForSetup(
     const needsPrompt = flow !== "quickstart" || !customBindHost;
     if (needsPrompt) {
       const input = await prompter.text({
-        message: "Custom IP address",
+        message: t("wizard.gateway.bindCustomIp"),
         placeholder: "192.168.1.100",
         initialValue: customBindHost ?? "",
-        validate: validateIPv4AddressInput,
+        validate: validateDottedDecimalIPv4Input,
       });
       customBindHost = typeof input === "string" ? input.trim() : undefined;
     }
   }
 
-  let authMode =
-    flow === "quickstart"
-      ? quickstartGateway.authMode
-      : ((await prompter.select({
-          message: "Gateway auth",
-          options: [
-            {
-              value: "token",
-              label: "Token",
-              hint: "Recommended default (local + remote)",
-            },
-            { value: "password", label: "Password" },
-          ],
-          initialValue: "token",
-        })) as GatewayAuthChoice);
+  let authMode = quickstartGateway.authMode;
 
-  const tailscaleMode: GatewayWizardSettings["tailscaleMode"] =
+  const tailscaleMode: QuickstartGatewayDefaults["tailscaleMode"] =
     flow === "quickstart"
       ? quickstartGateway.tailscaleMode
-      : await prompter.select<GatewayWizardSettings["tailscaleMode"]>({
-          message: "Tailscale exposure",
-          options: [...TAILSCALE_EXPOSURE_OPTIONS],
+      : await prompter.select<QuickstartGatewayDefaults["tailscaleMode"]>({
+          message: t("wizard.gateway.tailscaleExposure"),
+          options: getLocalizedTailscaleExposureOptions(),
+          initialValue: quickstartGateway.tailscaleMode,
         });
 
   // Detect Tailscale binary before proceeding with serve/funnel setup.
@@ -125,61 +127,68 @@ export async function configureGatewayForSetup(
   if (tailscaleMode !== "off") {
     tailscaleBin = await findTailscaleBinary();
     if (!tailscaleBin) {
-      await prompter.note(TAILSCALE_MISSING_BIN_NOTE_LINES.join("\n"), "Tailscale Warning");
+      await prompter.note(
+        t("wizard.gatewayTailscale.missingBinNote"),
+        t("wizard.gatewayTailscale.warningTitle"),
+      );
     }
   }
 
-  let tailscaleResetOnExit = flow === "quickstart" ? quickstartGateway.tailscaleResetOnExit : false;
   if (tailscaleMode !== "off" && flow !== "quickstart") {
-    await prompter.note(TAILSCALE_DOCS_LINES.join("\n"), "Tailscale");
-    tailscaleResetOnExit = Boolean(
-      await prompter.confirm({
-        message: "Reset Tailscale serve/funnel on exit?",
-        initialValue: false,
-      }),
-    );
+    await prompter.note(t("wizard.gatewayTailscale.docsNote"), "Tailscale");
   }
 
   // Safety + constraints:
   // - Tailscale wants bind=loopback so we never expose a non-loopback server + tailscale serve/funnel at once.
   // - Funnel requires password auth.
   if (tailscaleMode !== "off" && bind !== "loopback") {
-    await prompter.note("Tailscale requires bind=loopback. Adjusting bind to loopback.", "Note");
+    await prompter.note(
+      t("wizard.gatewayNotes.tailscaleBindLoopback"),
+      t("wizard.gatewayNotes.bindTitle"),
+    );
     bind = "loopback";
     customBindHost = undefined;
   }
 
   if (tailscaleMode === "funnel" && authMode !== "password") {
-    await prompter.note("Tailscale funnel requires password auth.", "Note");
+    // Funnel must not replace the operator's proxy identity policy.
+    if (authMode !== "token") {
+      throw new Error(
+        `Tailscale Funnel requires password auth, but the Gateway is configured with "${authMode}" auth. ` +
+          `Re-run with --gateway-auth password to switch, or keep Tailscale exposure off.`,
+      );
+    }
+    await prompter.note(t("wizard.gatewayNotes.tailscaleFunnelPassword"), t("wizard.gateway.auth"));
     authMode = "password";
   }
 
   let gatewayToken: string | undefined;
-  let gatewayTokenInput: SecretInput | undefined;
+  const auth: GatewayAuthConfig = { ...nextConfig.gateway?.auth, mode: authMode };
   if (authMode === "token") {
+    let gatewayTokenInput: SecretInput | undefined;
     const quickstartTokenString = normalizeSecretInputString(quickstartGateway.token);
     const quickstartTokenRef = resolveSecretInputRef({
       value: quickstartGateway.token,
       defaults: nextConfig.secrets?.defaults,
     }).ref;
-    const tokenMode =
-      flow === "quickstart" && opts.secretInputMode !== "ref" // pragma: allowlist secret
-        ? quickstartTokenRef
-          ? "ref"
-          : "plaintext"
+    const tokenMode = quickstartTokenRef
+      ? "ref"
+      : flow === "quickstart" && opts.secretInputMode !== "ref" // pragma: allowlist secret
+        ? "plaintext"
         : await resolveSecretInputModeForEnvSelection({
             prompter,
             explicitMode: opts.secretInputMode,
             copy: {
-              modeMessage: "How do you want to provide the gateway token?",
-              plaintextLabel: "Generate/store plaintext token",
-              plaintextHint: "Default",
-              refLabel: "Use SecretRef",
-              refHint: "Store a reference instead of plaintext",
+              modeMessage: t("wizard.gateway.authTokenMode"),
+              plaintextLabel: t("wizard.gateway.plaintextTokenLabel"),
+              plaintextHint: t("wizard.gateway.plaintextTokenHint"),
+              refLabel: t("wizard.gateway.refLabel"),
+              refHint: t("wizard.gateway.refHint"),
             },
           });
+    const ambientToken = normalizeGatewayTokenInput(process.env.OPENCLAW_GATEWAY_TOKEN);
     if (tokenMode === "ref") {
-      if (flow === "quickstart" && quickstartTokenRef) {
+      if (quickstartTokenRef) {
         gatewayTokenInput = quickstartTokenRef;
         gatewayToken = await resolveSetupSecretInputString({
           config: nextConfig,
@@ -187,6 +196,17 @@ export async function configureGatewayForSetup(
           path: "gateway.auth.token",
           env: process.env,
         });
+      } else if (!quickstartTokenString && !ambientToken) {
+        // Nothing exists for an env/file/exec ref to point at, so asking where the
+        // token lives has no answerable option. Setup mints it into the shared
+        // secret store instead and config keeps only the reference.
+        const provisioned = await provisionGatewayTokenStoreRef({ config: nextConfig });
+        gatewayTokenInput = provisioned.ref;
+        gatewayToken = provisioned.token;
+        await prompter.note(
+          t("wizard.gateway.tokenStoreProvisioned", { name: provisioned.ref.id }),
+          t("wizard.gateway.auth"),
+        );
       } else {
         const resolved = await promptSecretRefForSetup({
           provider: "gateway-auth-token",
@@ -194,43 +214,41 @@ export async function configureGatewayForSetup(
           prompter,
           preferredEnvVar: "OPENCLAW_GATEWAY_TOKEN",
           copy: {
-            sourceMessage: "Where is this gateway token stored?",
+            sourceMessage: t("wizard.gateway.authTokenStoredMessage"),
             envVarPlaceholder: "OPENCLAW_GATEWAY_TOKEN",
           },
         });
         gatewayTokenInput = resolved.ref;
         gatewayToken = resolved.resolvedValue;
       }
-    } else if (flow === "quickstart") {
-      gatewayToken =
-        (quickstartTokenString ?? normalizeGatewayTokenInput(process.env.OPENCLAW_GATEWAY_TOKEN)) ||
-        randomToken();
-      gatewayTokenInput = gatewayToken;
     } else {
-      const tokenInput = await prompter.text({
-        message: "Gateway token (blank to generate)",
-        placeholder: "Needed for multi-machine or non-loopback access",
-        initialValue:
-          quickstartTokenString ??
-          normalizeGatewayTokenInput(process.env.OPENCLAW_GATEWAY_TOKEN) ??
-          "",
-      });
-      gatewayToken = normalizeGatewayTokenInput(tokenInput) || randomToken();
+      gatewayToken = (quickstartTokenString ?? ambientToken) || randomToken();
       gatewayTokenInput = gatewayToken;
     }
+    auth.token = gatewayTokenInput;
   }
 
   if (authMode === "password") {
-    let password: SecretInput | undefined =
-      flow === "quickstart" && quickstartGateway.password ? quickstartGateway.password : undefined;
+    const existingPasswordRef = resolveSecretInputRef({
+      value: quickstartGateway.password,
+      defaults: nextConfig.secrets?.defaults,
+    }).ref;
+    const needsPasswordRef =
+      opts.secretInputMode === "ref" &&
+      !existingPasswordRef &&
+      (flow === "advanced" ||
+        quickstartGateway.password !== opts.baseConfig.gateway?.auth?.password);
+    let password: SecretInput | undefined = !needsPasswordRef
+      ? quickstartGateway.password
+      : (existingPasswordRef ?? undefined);
     if (!password) {
       const selectedMode = await resolveSecretInputModeForEnvSelection({
         prompter,
         explicitMode: opts.secretInputMode,
         copy: {
-          modeMessage: "How do you want to provide the gateway password?",
-          plaintextLabel: "Enter password now",
-          plaintextHint: "Stores the password directly in OpenClaw config",
+          modeMessage: t("wizard.gateway.authPasswordMode"),
+          plaintextLabel: t("wizard.gateway.plaintextPasswordLabel"),
+          plaintextHint: t("wizard.gateway.plaintextPasswordHint"),
         },
       });
       if (selectedMode === "ref") {
@@ -240,43 +258,23 @@ export async function configureGatewayForSetup(
           prompter,
           preferredEnvVar: "OPENCLAW_GATEWAY_PASSWORD",
           copy: {
-            sourceMessage: "Where is this gateway password stored?",
+            sourceMessage: t("wizard.gateway.authPasswordStoredMessage"),
             envVarPlaceholder: "OPENCLAW_GATEWAY_PASSWORD",
           },
         });
         password = resolved.ref;
       } else {
-        password = String(
-          (await prompter.text({
-            message: "Gateway password",
-            validate: validateGatewayPasswordInput,
-          })) ?? "",
-        ).trim();
+        password =
+          normalizeOptionalString(
+            await prompter.text({
+              message: t("wizard.gateway.passwordPrompt"),
+              validate: validateGatewayPasswordInput,
+              sensitive: true,
+            }),
+          ) ?? "";
       }
     }
-    nextConfig = {
-      ...nextConfig,
-      gateway: {
-        ...nextConfig.gateway,
-        auth: {
-          ...nextConfig.gateway?.auth,
-          mode: "password",
-          password,
-        },
-      },
-    };
-  } else if (authMode === "token") {
-    nextConfig = {
-      ...nextConfig,
-      gateway: {
-        ...nextConfig.gateway,
-        auth: {
-          ...nextConfig.gateway?.auth,
-          mode: "token",
-          token: gatewayTokenInput,
-        },
-      },
-    };
+    auth.password = password;
   }
 
   nextConfig = {
@@ -284,32 +282,15 @@ export async function configureGatewayForSetup(
     gateway: {
       ...nextConfig.gateway,
       port,
-      bind: bind as GatewayBindMode,
+      bind,
+      auth,
       ...(bind === "custom" && customBindHost ? { customBindHost } : {}),
       tailscale: {
         ...nextConfig.gateway?.tailscale,
-        mode: tailscaleMode as GatewayTailscaleMode,
-        resetOnExit: tailscaleResetOnExit,
+        mode: tailscaleMode,
       },
     },
   };
-
-  if (
-    flow === "quickstart" &&
-    bind === "loopback" &&
-    nextConfig.gateway?.controlUi?.allowInsecureAuth === undefined
-  ) {
-    nextConfig = {
-      ...nextConfig,
-      gateway: {
-        ...nextConfig.gateway,
-        controlUi: {
-          ...nextConfig.gateway?.controlUi,
-          allowInsecureAuth: true,
-        },
-      },
-    };
-  }
 
   nextConfig = ensureControlUiAllowedOriginsForNonLoopbackBind(nextConfig, {
     requireControlUiEnabled: true,
@@ -320,37 +301,14 @@ export async function configureGatewayForSetup(
     tailscaleBin,
   });
 
-  // If this is a new gateway setup (no existing gateway settings), start with a
-  // denylist for high-risk node commands. Users can arm these temporarily via
-  // /phone arm ... (phone-control plugin).
-  if (
-    !quickstartGateway.hasExisting &&
-    nextConfig.gateway?.nodes?.denyCommands === undefined &&
-    nextConfig.gateway?.nodes?.allowCommands === undefined &&
-    nextConfig.gateway?.nodes?.browser === undefined
-  ) {
-    nextConfig = {
-      ...nextConfig,
-      gateway: {
-        ...nextConfig.gateway,
-        nodes: {
-          ...nextConfig.gateway?.nodes,
-          denyCommands: [...DEFAULT_DANGEROUS_NODE_COMMANDS],
-        },
-      },
-    };
-  }
-
   return {
     nextConfig,
     settings: {
       port,
-      bind: bind as GatewayBindMode,
+      bind,
       customBindHost: bind === "custom" ? customBindHost : undefined,
       authMode,
       gatewayToken,
-      tailscaleMode: tailscaleMode as GatewayTailscaleMode,
-      tailscaleResetOnExit,
     },
   };
 }

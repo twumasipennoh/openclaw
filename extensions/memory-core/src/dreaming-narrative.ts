@@ -1,25 +1,14 @@
-import fs from "node:fs/promises";
-import path from "node:path";
+import {
+  extractErrorCode,
+  formatErrorMessage,
+  RequestScopedSubagentRuntimeError,
+  readErrorName,
+  SUBAGENT_RUNTIME_REQUEST_SCOPE_ERROR_CODE,
+} from "openclaw/plugin-sdk/error-runtime";
+import type { PluginRuntime } from "openclaw/plugin-sdk/runtime-store";
+import { appendNarrativeEntry, clampDreamDiaryContextEntry } from "./dreaming-dreams-file.js";
 
-// ── Types ──────────────────────────────────────────────────────────────
-
-type SubagentSurface = {
-  run: (params: {
-    sessionKey: string;
-    message: string;
-    extraSystemPrompt?: string;
-    deliver?: boolean;
-  }) => Promise<{ runId: string }>;
-  waitForRun: (params: {
-    runId: string;
-    timeoutMs?: number;
-  }) => Promise<{ status: string; error?: string }>;
-  getSessionMessages: (params: {
-    sessionKey: string;
-    limit?: number;
-  }) => Promise<{ messages: unknown[] }>;
-  deleteSession: (params: { sessionKey: string }) => Promise<void>;
-};
+export type DreamingCompletion = Pick<PluginRuntime["subagent"], "complete">;
 
 export type NarrativePhaseData = {
   phase: "light" | "deep" | "rem";
@@ -29,6 +18,10 @@ export type NarrativePhaseData = {
   themes?: string[];
   /** Snippets that were promoted to durable memory (deep). */
   promotions?: string[];
+  currentDate?: string;
+  recentDiaryEntries?: string[];
+  /** Tracked inputs that must still exist when generated text is published. */
+  sourceEntryKeys?: readonly string[];
 };
 
 type Logger = {
@@ -36,8 +29,6 @@ type Logger = {
   warn: (message: string) => void;
   error: (message: string) => void;
 };
-
-// ── Constants ──────────────────────────────────────────────────────────
 
 const NARRATIVE_SYSTEM_PROMPT = [
   "You are keeping a dream diary. Write a single entry in first person.",
@@ -65,235 +56,258 @@ const NARRATIVE_SYSTEM_PROMPT = [
   "- Output ONLY the diary entry. No preamble, no sign-off, no commentary.",
 ].join("\n");
 
+// Bound best-effort diary inference independently from the parent sweep.
 const NARRATIVE_TIMEOUT_MS = 60_000;
-const DREAMS_FILENAMES = ["DREAMS.md", "dreams.md"] as const;
-const DIARY_START_MARKER = "<!-- openclaw:dreaming:diary:start -->";
-const DIARY_END_MARKER = "<!-- openclaw:dreaming:diary:end -->";
+const RECENT_DIARY_CONTEXT_LIMIT = 3;
+function isRequestScopedSubagentRuntimeError(err: unknown): boolean {
+  return (
+    err instanceof RequestScopedSubagentRuntimeError ||
+    (err instanceof Error &&
+      err.name === "RequestScopedSubagentRuntimeError" &&
+      extractErrorCode(err) === SUBAGENT_RUNTIME_REQUEST_SCOPE_ERROR_CODE)
+  );
+}
 
-// ── Prompt building ────────────────────────────────────────────────────
+function formatFallbackWriteFailure(err: unknown): string {
+  const code = extractErrorCode(err);
+  const name = readErrorName(err);
+  return (
+    [code && `code=${code}`, name && `name=${name}`].filter(Boolean).join(" ") || "unknown error"
+  );
+}
 
-export function buildNarrativePrompt(data: NarrativePhaseData): string {
-  const lines: string[] = [];
-  lines.push("Write a dream diary entry from these memory fragments:\n");
+const REQUEST_SCOPED_FALLBACK_NARRATIVE =
+  "A memory trace surfaced, but details were unavailable in this run.";
 
-  for (const snippet of data.snippets.slice(0, 12)) {
-    lines.push(`- ${snippet}`);
+export async function appendFallbackNarrativeEntry(params: {
+  workspaceDir: string;
+  data: NarrativePhaseData;
+  nowMs: number;
+  timezone?: string;
+  logger: Logger;
+  reason: string;
+}): Promise<void> {
+  try {
+    await appendNarrativeEntry({
+      workspaceDir: params.workspaceDir,
+      // Raw snippets and promotions are pre-processing memory staging fragments.
+      // Keep fallback diary text generic so DREAMS.md never leaks staging content.
+      narrative: REQUEST_SCOPED_FALLBACK_NARRATIVE,
+      nowMs: params.nowMs,
+      timezone: params.timezone,
+    });
+    params.logger.info(
+      `memory-core: narrative generation used fallback for ${params.data.phase} phase because ${params.reason}.`,
+    );
+  } catch (fallbackErr) {
+    params.logger.warn(
+      `memory-core: narrative fallback failed for ${params.data.phase} phase (${formatFallbackWriteFailure(fallbackErr)})`,
+    );
   }
+}
 
-  if (data.themes?.length) {
-    lines.push("\nRecurring themes:");
-    for (const theme of data.themes.slice(0, 6)) {
-      lines.push(`- ${theme}`);
+function isConfiguredModelUnavailableNarrativeError(error: unknown): boolean {
+  const errors: Error[] = [];
+  for (
+    let current = error;
+    current instanceof Error && !errors.includes(current);
+    current = current.cause
+  ) {
+    errors.push(current);
+  }
+  // Runtime wrappers retain provider causes, but denied authority never authorizes
+  // a retry through the default model even if a nested cause names a missing model.
+  if (errors.some((entry) => extractErrorCode(entry) === "LLM_COMPLETION_NOT_AUTHORIZED")) {
+    return false;
+  }
+  return errors.some((entry) => isModelUnavailableMessage(entry.message));
+}
+
+function isModelUnavailableMessage(message: string): boolean {
+  return (
+    [
+      /requested model may be(?: temporarily)? unavailable/i,
+      /model unavailable/i,
+      /no endpoints found for/i,
+      /unknown model/i,
+      /model(?:[_\-\s])?not(?:[_\-\s])?found/i,
+      /not_found_error/i,
+      /models\/[^\s]+ is not found/i,
+      /unsupported model/i,
+      /is not a valid model id/i,
+    ].some((pattern) => pattern.test(message)) ||
+    (/\b404\b/.test(message) && /not(?:[_\-\s])?found/i.test(message)) ||
+    (/model/i.test(message) && /does not exist/i.test(message))
+  );
+}
+
+function buildNarrativePrompt(data: NarrativePhaseData): string {
+  const lines = [
+    "Write a dream diary entry from these memory fragments:\n",
+    ...data.snippets.slice(0, 12).map((snippet) => `- ${snippet}`),
+  ];
+  for (const [heading, entries, limit] of [
+    ["\nRecurring themes:", data.themes, 6],
+    ["\nMemories that crystallized into something lasting:", data.promotions, 5],
+  ] as const) {
+    if (entries?.length) {
+      lines.push(heading, ...entries.slice(0, limit).map((entry) => `- ${entry}`));
     }
   }
 
-  if (data.promotions?.length) {
-    lines.push("\nMemories that crystallized into something lasting:");
-    for (const promo of data.promotions.slice(0, 5)) {
-      lines.push(`- ${promo}`);
+  const currentDate = data.currentDate?.trim();
+  const recentDiaryEntries = (data.recentDiaryEntries ?? [])
+    .map(clampDreamDiaryContextEntry)
+    .filter((entry) => entry.length > 0)
+    .slice(0, RECENT_DIARY_CONTEXT_LIMIT);
+  if (currentDate || recentDiaryEntries.length > 0) {
+    lines.push("\nDiary continuity context:");
+    if (currentDate) {
+      lines.push(`- Current sweep: ${currentDate}`);
     }
+    if (recentDiaryEntries.length > 0) {
+      lines.push("- Recent diary entries already written:");
+      for (const entry of recentDiaryEntries) {
+        lines.push(`  - ${entry}`);
+      }
+    }
+    lines.push(
+      "- Prefer a fresh angle; do not replay the same first-day framing unless newer fragments change it.",
+    );
   }
 
   return lines.join("\n");
 }
 
-// ── Message extraction ─────────────────────────────────────────────────
-
-export function extractNarrativeText(messages: unknown[]): string | null {
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const msg = messages[i];
-    if (!msg || typeof msg !== "object" || Array.isArray(msg)) {
-      continue;
-    }
-    const record = msg as Record<string, unknown>;
-    if (record.role !== "assistant") {
-      continue;
-    }
-    const content = record.content;
-    if (typeof content === "string" && content.trim().length > 0) {
-      return content.trim();
-    }
-    if (Array.isArray(content)) {
-      const text = content
-        .filter(
-          (part: unknown) =>
-            part &&
-            typeof part === "object" &&
-            !Array.isArray(part) &&
-            (part as Record<string, unknown>).type === "text" &&
-            typeof (part as Record<string, unknown>).text === "string",
-        )
-        .map((part) => (part as { text: string }).text)
-        .join("\n")
-        .trim();
-      if (text.length > 0) {
-        return text;
-      }
-    }
-  }
-  return null;
-}
-
-// ── Date formatting ────────────────────────────────────────────────────
-
-export function formatNarrativeDate(epochMs: number, timezone?: string): string {
-  const opts: Intl.DateTimeFormatOptions = {
-    timeZone: timezone ?? "UTC",
-    year: "numeric",
-    month: "long",
-    day: "numeric",
-    hour: "numeric",
-    minute: "2-digit",
-    hour12: true,
-  };
-  return new Intl.DateTimeFormat("en-US", opts).format(new Date(epochMs));
-}
-
-// ── DREAMS.md file I/O ─────────────────────────────────────────────────
-
-async function resolveDreamsPath(workspaceDir: string): Promise<string> {
-  for (const name of DREAMS_FILENAMES) {
-    const target = path.join(workspaceDir, name);
-    try {
-      await fs.access(target);
-      return target;
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") {
-        throw err;
-      }
-    }
-  }
-  return path.join(workspaceDir, DREAMS_FILENAMES[0]);
-}
-
-export function buildDiaryEntry(narrative: string, dateStr: string): string {
-  return `\n---\n\n*${dateStr}*\n\n${narrative}\n`;
-}
-
-export async function appendNarrativeEntry(params: {
-  workspaceDir: string;
-  narrative: string;
-  nowMs: number;
-  timezone?: string;
-}): Promise<string> {
-  const dreamsPath = await resolveDreamsPath(params.workspaceDir);
-  await fs.mkdir(path.dirname(dreamsPath), { recursive: true });
-
-  const dateStr = formatNarrativeDate(params.nowMs, params.timezone);
-  const entry = buildDiaryEntry(params.narrative, dateStr);
-
-  let existing = "";
-  try {
-    existing = await fs.readFile(dreamsPath, "utf-8");
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") {
-      throw err;
-    }
-  }
-
-  let updated: string;
-  if (existing.includes(DIARY_START_MARKER) && existing.includes(DIARY_END_MARKER)) {
-    // Append entry before end marker.
-    const endIdx = existing.lastIndexOf(DIARY_END_MARKER);
-    updated = existing.slice(0, endIdx) + entry + "\n" + existing.slice(endIdx);
-  } else if (existing.includes(DIARY_START_MARKER)) {
-    // Start marker without end — append entry and add end marker.
-    const startIdx = existing.indexOf(DIARY_START_MARKER) + DIARY_START_MARKER.length;
-    updated =
-      existing.slice(0, startIdx) +
-      entry +
-      "\n" +
-      DIARY_END_MARKER +
-      "\n" +
-      existing.slice(startIdx);
-  } else {
-    // No diary section yet — create one.
-    const diarySection = `# Dream Diary\n\n${DIARY_START_MARKER}${entry}\n${DIARY_END_MARKER}\n`;
-    if (existing.trim().length === 0) {
-      updated = diarySection;
-    } else {
-      // Prepend diary before any existing managed blocks.
-      updated = diarySection + "\n" + existing;
-    }
-  }
-
-  await fs.writeFile(dreamsPath, updated.endsWith("\n") ? updated : `${updated}\n`, "utf-8");
-  return dreamsPath;
-}
-
-// ── Orchestrator ───────────────────────────────────────────────────────
-
-export async function generateAndAppendDreamNarrative(params: {
-  subagent: SubagentSurface;
+export type DreamNarrativeRequest = {
+  /** Agent whose configured model and credentials own the completion. */
+  agentId: string;
+  subagent: DreamingCompletion;
   workspaceDir: string;
   data: NarrativePhaseData;
   nowMs?: number;
   timezone?: string;
+  model?: string;
   logger: Logger;
-}): Promise<void> {
-  const nowMs = Number.isFinite(params.nowMs) ? (params.nowMs as number) : Date.now();
+  runInBackground?: <T>(run: () => Promise<T>) => Promise<T>;
+};
 
-  if (params.data.snippets.length === 0 && !params.data.promotions?.length) {
-    return;
-  }
+export type DreamNarrativeOutcome =
+  | { status: "completed" | "pending" | "skipped" }
+  | { status: "degraded"; error: string };
 
-  const sessionKey = `dreaming-narrative-${params.data.phase}-${nowMs}`;
+async function generateAndAppendDreamNarrative(
+  params: DreamNarrativeRequest,
+): Promise<DreamNarrativeOutcome> {
+  const nowMs =
+    typeof params.nowMs === "number" && Number.isFinite(params.nowMs) ? params.nowMs : Date.now();
   const message = buildNarrativePrompt(params.data);
-
   try {
-    const { runId } = await params.subagent.run({
-      sessionKey,
-      message,
-      extraSystemPrompt: NARRATIVE_SYSTEM_PROMPT,
-      deliver: false,
-    });
-
-    const result = await params.subagent.waitForRun({
-      runId,
-      timeoutMs: NARRATIVE_TIMEOUT_MS,
-    });
-
-    if (result.status !== "ok") {
-      params.logger.warn(
-        `memory-core: narrative generation ended with status=${result.status} for ${params.data.phase} phase.`,
-      );
-      return;
+    const attemptModels = params.model ? [params.model, undefined] : [undefined];
+    let narrative = "";
+    for (const model of attemptModels) {
+      try {
+        const result = await params.subagent.complete({
+          agentId: params.agentId,
+          message,
+          extraSystemPrompt: NARRATIVE_SYSTEM_PROMPT,
+          ...(model ? { model } : {}),
+          timeoutMs: NARRATIVE_TIMEOUT_MS,
+        });
+        narrative = result.text.trim();
+        break;
+      } catch (error) {
+        if (!model || !isConfiguredModelUnavailableNarrativeError(error)) {
+          throw error;
+        }
+        params.logger.warn(
+          `memory-core: narrative generation could not use configured model "${model}" for ${params.data.phase} phase; retrying with the agent default (${formatErrorMessage(error)}).`,
+        );
+      }
     }
-
-    const { messages } = await params.subagent.getSessionMessages({
-      sessionKey,
-      limit: 5,
-    });
-
-    const narrative = extractNarrativeText(messages);
     if (!narrative) {
       params.logger.warn(
-        `memory-core: narrative generation produced no text for ${params.data.phase} phase.`,
+        `memory-core: narrative generation produced no text for ${params.data.phase} phase; writing fallback diary entry.`,
       );
-      return;
+      await appendFallbackNarrativeEntry({
+        ...params,
+        nowMs,
+        reason: "the narrative run produced no text",
+      });
+      return { status: "degraded", error: "the narrative run produced no text" };
     }
-
-    await appendNarrativeEntry({
+    const dreamsPath = await appendNarrativeEntry({
       workspaceDir: params.workspaceDir,
       narrative,
       nowMs,
       timezone: params.timezone,
+      sourceEntryKeys: params.data.sourceEntryKeys,
+      recentDiaryEntries: params.data.recentDiaryEntries,
     });
-
+    if (dreamsPath === undefined) {
+      params.logger.info(
+        `memory-core: narrative publication skipped for ${params.data.phase} phase because source memory or diary context changed.`,
+      );
+      return { status: "skipped" };
+    }
     params.logger.info(
       `memory-core: dream diary entry written for ${params.data.phase} phase [workspace=${params.workspaceDir}].`,
     );
-  } catch (err) {
-    // Narrative generation is best-effort — never fail the parent phase.
-    params.logger.warn(
-      `memory-core: narrative generation failed for ${params.data.phase} phase: ${err instanceof Error ? err.message : String(err)}`,
-    );
-  } finally {
-    // Clean up the transient session.
-    try {
-      await params.subagent.deleteSession({ sessionKey });
-    } catch {
-      // Ignore cleanup failures.
+  } catch (error) {
+    const requestScoped = isRequestScopedSubagentRuntimeError(error);
+    if (!requestScoped) {
+      params.logger.warn(
+        `memory-core: narrative generation failed for ${params.data.phase} phase: ${formatErrorMessage(error)}`,
+      );
     }
+    await appendFallbackNarrativeEntry({
+      ...params,
+      nowMs,
+      reason: requestScoped
+        ? "subagent runtime is request-scoped"
+        : `the narrative run failed (${formatErrorMessage(error)})`,
+    });
+    return { status: "degraded", error: formatErrorMessage(error) };
   }
+  return { status: "completed" };
+}
+
+/**
+ * Single entry point for every dreaming phase. Cron sweeps detach so a stalled diary run
+ * cannot hold the sweep open; heartbeat sweeps await so the phase reports the outcome.
+ * A sweep without an owning agent still runs; only the subagent narrative is unavailable.
+ */
+export async function runDreamNarrative(
+  params: Omit<DreamNarrativeRequest, "agentId"> & { agentId?: string },
+): Promise<DreamNarrativeOutcome> {
+  const { agentId, runInBackground, ...rest } = params;
+  // Nothing to narrate is a no-op on every path; checking ownership first would let an
+  // ownerless empty sweep append a diary entry for material that never existed.
+  if (rest.data.snippets.length === 0 && !rest.data.promotions?.length) {
+    return { status: "skipped" };
+  }
+  // Model and credential selection requires the workspace's owning agent.
+  // Write the local diary fallback instead of skipping the entry without a trace, and
+  // keep it on the same dispatch so a detached cron sweep never awaits a diary write.
+  const job = agentId
+    ? () => generateAndAppendDreamNarrative({ ...rest, agentId })
+    : async () => {
+        await appendFallbackNarrativeEntry({
+          ...rest,
+          nowMs:
+            typeof rest.nowMs === "number" && Number.isFinite(rest.nowMs) ? rest.nowMs : Date.now(),
+          reason: "the dreaming sweep has no owning agent id",
+        });
+        return { status: "completed" as const };
+      };
+  if (runInBackground) {
+    // Keep completion and publication in the owning instance after the sweep returns.
+    void runInBackground(job).catch((error: unknown) => {
+      rest.logger.warn(
+        `memory-core: detached dreaming narrative failed for ${rest.data.phase} phase: ${formatErrorMessage(error)}`,
+      );
+    });
+    return { status: "pending" };
+  }
+  return await job();
 }

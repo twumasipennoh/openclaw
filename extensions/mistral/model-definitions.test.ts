@@ -1,53 +1,25 @@
 import { describe, expect, it } from "vitest";
-import {
-  buildMistralCatalogModels,
-  buildMistralModelDefinition,
-  MISTRAL_DEFAULT_CONTEXT_WINDOW,
-  MISTRAL_DEFAULT_COST,
-  MISTRAL_DEFAULT_MAX_TOKENS,
-  MISTRAL_DEFAULT_MODEL_ID,
-} from "./model-definitions.js";
+import { buildMistralModelDefinition, MISTRAL_DEFAULT_MODEL_ID } from "./model-definitions.js";
+import { buildMistralProvider } from "./provider-catalog.js";
 
 describe("mistral model definitions", () => {
-  it("uses current Pi pricing for the bundled default model", () => {
-    expect(buildMistralModelDefinition()).toMatchObject({
-      id: MISTRAL_DEFAULT_MODEL_ID,
-      contextWindow: MISTRAL_DEFAULT_CONTEXT_WINDOW,
-      maxTokens: MISTRAL_DEFAULT_MAX_TOKENS,
-      cost: MISTRAL_DEFAULT_COST,
-    });
-
-    expect(MISTRAL_DEFAULT_COST).toEqual({
+  it("uses current OpenClaw pricing for the default model", () => {
+    const model = buildMistralModelDefinition();
+    expect(model.id).toBe(MISTRAL_DEFAULT_MODEL_ID);
+    expect(model.contextWindow).toBe(262144);
+    expect(model.maxTokens).toBe(16384);
+    expect(model.cost).toEqual({
       input: 0.5,
       output: 1.5,
-      cacheRead: 0,
+      cacheRead: 0.05,
       cacheWrite: 0,
     });
   });
 
-  it("publishes a curated set of current Mistral catalog models", () => {
-    expect(buildMistralCatalogModels()).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          id: "codestral-latest",
-          input: ["text"],
-          contextWindow: 256000,
-          maxTokens: 4096,
-        }),
-        expect.objectContaining({
-          id: "magistral-small",
-          reasoning: true,
-          input: ["text"],
-          contextWindow: 128000,
-          maxTokens: 40000,
-        }),
-        expect.objectContaining({
-          id: "pixtral-large-latest",
-          input: ["text", "image"],
-          contextWindow: 128000,
-          maxTokens: 32768,
-        }),
-      ]),
-    );
+  it("prices cached Mistral input tokens at ten percent of standard input tokens", () => {
+    for (const model of buildMistralProvider().models) {
+      expect(model.cost.cacheRead).toBeCloseTo(model.cost.input * 0.1, 10);
+      expect(model.cost.cacheWrite).toBe(0);
+    }
   });
 });

@@ -1,162 +1,69 @@
 import { PermissionFlagsBits } from "discord-api-types/v10";
-import type { DiscordActionConfig } from "openclaw/plugin-sdk/config-runtime";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import {
-  discordModerationActionRuntime,
-  handleDiscordModerationAction,
-} from "./runtime.moderation.js";
+import { EMPTY_DISCORD_TEST_CONFIG } from "../test-support/config.js";
+import { handleDiscordModerationAction } from "./runtime.moderation.js";
 
-const originalDiscordModerationActionRuntime = { ...discordModerationActionRuntime };
-const banMemberDiscord = vi.fn(async () => ({ ok: true }));
-const kickMemberDiscord = vi.fn(async () => ({ ok: true }));
-const timeoutMemberDiscord = vi.fn(async () => ({ id: "user-1" }));
-const hasAnyGuildPermissionDiscord = vi.fn(async () => false);
+const { banMemberDiscord, kickMemberDiscord, timeoutMemberDiscord, hasAnyGuildPermissionDiscord } =
+  vi.hoisted(() => ({
+    banMemberDiscord: vi.fn(async () => ({ ok: true })),
+    kickMemberDiscord: vi.fn(async () => ({ ok: true })),
+    timeoutMemberDiscord: vi.fn(async () => ({ id: "user-1" })),
+    hasAnyGuildPermissionDiscord: vi.fn(async () => false),
+  }));
 
-const enableAllActions = (_key: keyof DiscordActionConfig, _defaultValue = true) => true;
+vi.mock("../send.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../send.js")>()),
+  banMemberDiscord,
+  kickMemberDiscord,
+  timeoutMemberDiscord,
+  hasAnyGuildPermissionDiscord,
+}));
+
+const cfg = EMPTY_DISCORD_TEST_CONFIG;
+const target = { guildId: "guild-1", userId: "user-1", senderUserId: "sender-1" };
+function moderate(action: string, params: Record<string, unknown> = {}) {
+  return handleDiscordModerationAction(action, { ...target, ...params }, () => true, cfg);
+}
 
 describe("discord moderation sender authorization", () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-    Object.assign(discordModerationActionRuntime, originalDiscordModerationActionRuntime, {
-      banMemberDiscord,
-      kickMemberDiscord,
-      timeoutMemberDiscord,
-      hasAnyGuildPermissionDiscord,
-    });
-  });
+  beforeEach(() => vi.clearAllMocks());
 
-  it("rejects ban when sender lacks BAN_MEMBERS", async () => {
-    hasAnyGuildPermissionDiscord.mockResolvedValueOnce(false);
+  it.each([
+    { action: "ban", permission: PermissionFlagsBits.BanMembers, mutation: banMemberDiscord },
+    { action: "kick", permission: PermissionFlagsBits.KickMembers, mutation: kickMemberDiscord },
+    {
+      action: "timeout",
+      permission: PermissionFlagsBits.ModerateMembers,
+      mutation: timeoutMemberDiscord,
+    },
+  ])(
+    "rejects $action without its required permission",
+    async ({ action, permission, mutation }) => {
+      await expect(moderate(action, { durationMinutes: 60 })).rejects.toThrow(
+        "required permissions",
+      );
+      expect(hasAnyGuildPermissionDiscord).toHaveBeenCalledWith(
+        "guild-1",
+        "sender-1",
+        [permission],
+        { cfg },
+      );
+      expect(mutation).not.toHaveBeenCalled();
+    },
+  );
 
-    await expect(
-      handleDiscordModerationAction(
-        "ban",
-        {
-          guildId: "guild-1",
-          userId: "user-1",
-          senderUserId: "sender-1",
-        },
-        enableAllActions,
-      ),
-    ).rejects.toThrow("required permissions");
-
-    expect(hasAnyGuildPermissionDiscord).toHaveBeenCalledWith(
-      "guild-1",
-      "sender-1",
-      [PermissionFlagsBits.BanMembers],
-      undefined,
-    );
-    expect(banMemberDiscord).not.toHaveBeenCalled();
-  });
-
-  it("rejects kick when sender lacks KICK_MEMBERS", async () => {
-    hasAnyGuildPermissionDiscord.mockResolvedValueOnce(false);
-
-    await expect(
-      handleDiscordModerationAction(
-        "kick",
-        {
-          guildId: "guild-1",
-          userId: "user-1",
-          senderUserId: "sender-1",
-        },
-        enableAllActions,
-      ),
-    ).rejects.toThrow("required permissions");
-
+  it("executes an authorized kick with the same account used for permission checks", async () => {
+    hasAnyGuildPermissionDiscord.mockResolvedValueOnce(true);
+    await moderate("kick", { accountId: "ops", reason: "rule violation" });
     expect(hasAnyGuildPermissionDiscord).toHaveBeenCalledWith(
       "guild-1",
       "sender-1",
       [PermissionFlagsBits.KickMembers],
-      undefined,
+      { cfg, accountId: "ops" },
     );
-    expect(kickMemberDiscord).not.toHaveBeenCalled();
-  });
-
-  it("rejects timeout when sender lacks MODERATE_MEMBERS", async () => {
-    hasAnyGuildPermissionDiscord.mockResolvedValueOnce(false);
-
-    await expect(
-      handleDiscordModerationAction(
-        "timeout",
-        {
-          guildId: "guild-1",
-          userId: "user-1",
-          senderUserId: "sender-1",
-          durationMinutes: 60,
-        },
-        enableAllActions,
-      ),
-    ).rejects.toThrow("required permissions");
-
-    expect(hasAnyGuildPermissionDiscord).toHaveBeenCalledWith(
-      "guild-1",
-      "sender-1",
-      [PermissionFlagsBits.ModerateMembers],
-      undefined,
-    );
-    expect(timeoutMemberDiscord).not.toHaveBeenCalled();
-  });
-
-  it("executes moderation action when sender has required permission", async () => {
-    hasAnyGuildPermissionDiscord.mockResolvedValueOnce(true);
-    kickMemberDiscord.mockResolvedValueOnce({ ok: true });
-
-    await handleDiscordModerationAction(
-      "kick",
-      {
-        guildId: "guild-1",
-        userId: "user-1",
-        senderUserId: "sender-1",
-        reason: "rule violation",
-      },
-      enableAllActions,
-    );
-
-    expect(hasAnyGuildPermissionDiscord).toHaveBeenCalledWith(
-      "guild-1",
-      "sender-1",
-      [PermissionFlagsBits.KickMembers],
-      undefined,
-    );
-    expect(kickMemberDiscord).toHaveBeenCalledWith({
-      guildId: "guild-1",
-      userId: "user-1",
-      reason: "rule violation",
-    });
-  });
-
-  it("forwards accountId into permission check and moderation execution", async () => {
-    hasAnyGuildPermissionDiscord.mockResolvedValueOnce(true);
-    timeoutMemberDiscord.mockResolvedValueOnce({ id: "user-1" });
-
-    await handleDiscordModerationAction(
-      "timeout",
-      {
-        guildId: "guild-1",
-        userId: "user-1",
-        senderUserId: "sender-1",
-        accountId: "ops",
-        durationMinutes: 5,
-      },
-      enableAllActions,
-    );
-
-    expect(hasAnyGuildPermissionDiscord).toHaveBeenCalledWith(
-      "guild-1",
-      "sender-1",
-      [PermissionFlagsBits.ModerateMembers],
-      { accountId: "ops" },
-    );
-    expect(timeoutMemberDiscord).toHaveBeenCalledWith(
-      {
-        guildId: "guild-1",
-        userId: "user-1",
-        durationMinutes: 5,
-        until: undefined,
-        reason: undefined,
-      },
-      { accountId: "ops" },
+    expect(kickMemberDiscord).toHaveBeenCalledWith(
+      { guildId: "guild-1", userId: "user-1", reason: "rule violation" },
+      { cfg, accountId: "ops" },
     );
   });
 });

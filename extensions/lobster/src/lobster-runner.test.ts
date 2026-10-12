@@ -1,14 +1,58 @@
 import fs from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
+import { toErrorObject as toLintErrorObject } from "openclaw/plugin-sdk/error-runtime";
+import { useAutoCleanupTempDirTracker } from "openclaw/plugin-sdk/test-env";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createEmbeddedLobsterRunner, resolveLobsterCwd } from "./lobster-runner.js";
+import {
+  createEmbeddedLobsterRunner,
+  resolveLobsterCwd,
+  type LobsterRunnerParams,
+} from "./lobster-runner.js";
+
+type RuntimeLoader = NonNullable<
+  NonNullable<Parameters<typeof createEmbeddedLobsterRunner>[0]>["loadRuntime"]
+>;
+type Runtime = Awaited<ReturnType<RuntimeLoader>>;
+const tempDirs = useAutoCleanupTempDirTracker(afterEach);
+const success = {
+  ok: true,
+  protocolVersion: 1,
+  status: "ok" as const,
+  output: [],
+  requiresApproval: null,
+};
+
+function createRunner() {
+  const runtime = {
+    runToolRequest: vi.fn<Runtime["runToolRequest"]>(),
+    resumeToolRequest: vi.fn<Runtime["resumeToolRequest"]>(),
+  };
+  const loadRuntime = vi.fn().mockResolvedValue(runtime);
+  return { runtime, loadRuntime, runner: createEmbeddedLobsterRunner({ loadRuntime }) };
+}
+
+function runParams(overrides: Partial<LobsterRunnerParams> = {}): LobsterRunnerParams {
+  return {
+    action: "run",
+    pipeline: "exec --json=true echo hi",
+    cwd: process.cwd(),
+    timeoutMs: 2000,
+    maxStdoutBytes: 4096,
+    ...overrides,
+  };
+}
+
+async function createWorkflow(name = "workflow.lobster") {
+  const cwd = tempDirs.make("openclaw-lobster-runner-");
+  const filePath = path.join(cwd, name);
+  await fs.writeFile(filePath, "steps: []\n", "utf8");
+  return { cwd, filePath };
+}
+
+const toolContext = (cwd = process.cwd()) =>
+  expect.objectContaining({ cwd, mode: "tool", signal: expect.any(AbortSignal) });
 
 describe("resolveLobsterCwd", () => {
-  it("defaults to the current working directory", () => {
-    expect(resolveLobsterCwd(undefined)).toBe(process.cwd());
-  });
-
   it("keeps relative paths inside the repo root", () => {
     expect(resolveLobsterCwd("extensions/lobster")).toBe(
       path.resolve(process.cwd(), "extensions/lobster"),
@@ -21,39 +65,31 @@ describe("createEmbeddedLobsterRunner", () => {
     vi.restoreAllMocks();
   });
 
-  it("runs inline pipelines through the embedded runtime", async () => {
-    const runtime = {
-      runToolRequest: vi.fn().mockResolvedValue({
-        ok: true,
-        protocolVersion: 1,
-        status: "ok",
-        output: [{ hello: "world" }],
-        requiresApproval: null,
-      }),
-      resumeToolRequest: vi.fn(),
-    };
-
-    const runner = createEmbeddedLobsterRunner({
-      loadRuntime: vi.fn().mockResolvedValue(runtime),
+  it("bounds the model-visible result for an embedded workflow request", async () => {
+    const { runtime, runner } = createRunner();
+    runtime.runToolRequest.mockResolvedValue({
+      ...success,
+      output: Array.from({ length: 115 }, () => ({ a: 1 })),
     });
+    const { cwd, filePath } = await createWorkflow();
 
-    const envelope = await runner.run({
-      action: "run",
-      pipeline: "exec --json=true echo hi",
-      cwd: process.cwd(),
-      timeoutMs: 2000,
-      maxStdoutBytes: 4096,
-    });
+    await expect(
+      runner.run(runParams({ pipeline: filePath, cwd, maxStdoutBytes: 1024 })),
+    ).rejects.toThrow("lobster runtime result exceeded maxStdoutBytes");
+  });
 
-    expect(runtime.runToolRequest).toHaveBeenCalledTimes(1);
-    expect(runtime.runToolRequest).toHaveBeenCalledWith({
-      pipeline: "exec --json=true echo hi",
-      ctx: expect.objectContaining({
-        cwd: process.cwd(),
-        mode: "tool",
-        signal: expect.any(AbortSignal),
-      }),
+  it("runs inline pipelines with file-like arguments through the embedded runtime", async () => {
+    const { runtime, runner } = createRunner();
+    runtime.runToolRequest.mockResolvedValue({ ...success, output: [{ hello: "world" }] });
+    const pipeline = "exec --json=true cat data.json";
+
+    const envelope = await runner.run(runParams({ pipeline }));
+
+    expect(runtime.runToolRequest).toHaveBeenCalledExactlyOnceWith({
+      pipeline,
+      ctx: toolContext(),
     });
+    expect(runtime.runToolRequest.mock.calls[0]?.[0].filePath).toBeUndefined();
     expect(envelope).toEqual({
       ok: true,
       status: "ok",
@@ -62,140 +98,75 @@ describe("createEmbeddedLobsterRunner", () => {
     });
   });
 
-  it("detects workflow files and parses argsJson", async () => {
-    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-lobster-runner-"));
-    const workflowPath = path.join(tempDir, "workflow.lobster");
-    await fs.writeFile(workflowPath, "steps: []\n", "utf8");
+  it("detects workflow files with spaces and parses argsJson", async () => {
+    const { runtime, runner } = createRunner();
+    runtime.runToolRequest.mockResolvedValue(success);
+    const { cwd, filePath } = await createWorkflow("daily inbox.lobster");
 
-    try {
-      const runtime = {
-        runToolRequest: vi.fn().mockResolvedValue({
-          ok: true,
-          protocolVersion: 1,
-          status: "ok",
-          output: [],
-          requiresApproval: null,
-        }),
-        resumeToolRequest: vi.fn(),
-      };
+    await runner.run(runParams({ pipeline: "daily inbox.lobster", argsJson: '{"limit":3}', cwd }));
 
-      const runner = createEmbeddedLobsterRunner({
-        loadRuntime: vi.fn().mockResolvedValue(runtime),
-      });
+    expect(runtime.runToolRequest).toHaveBeenCalledExactlyOnceWith({
+      filePath,
+      args: { limit: 3 },
+      ctx: toolContext(cwd),
+    });
+    expect(runtime.runToolRequest.mock.calls[0]?.[0].pipeline).toBeUndefined();
+  });
 
-      await runner.run({
-        action: "run",
-        pipeline: "workflow.lobster",
-        argsJson: '{"limit":3}',
-        cwd: tempDir,
-        timeoutMs: 2000,
-        maxStdoutBytes: 4096,
-      });
+  it("surfaces missing workflow path errors", async () => {
+    const { runtime, runner } = createRunner();
+    const cwd = tempDirs.make("openclaw-lobster-runner-");
 
-      expect(runtime.runToolRequest).toHaveBeenCalledWith({
-        filePath: workflowPath,
-        args: { limit: 3 },
-        ctx: expect.objectContaining({
-          cwd: tempDir,
-          mode: "tool",
-        }),
-      });
-    } finally {
-      await fs.rm(tempDir, { recursive: true, force: true });
-    }
+    await expect(runner.run(runParams({ pipeline: "missing.lobster", cwd }))).rejects.toMatchObject(
+      {
+        code: "ENOENT",
+        path: path.join(cwd, "missing.lobster"),
+      },
+    );
+    expect(runtime.runToolRequest).not.toHaveBeenCalled();
   });
 
   it("returns a parse error when workflow args are invalid JSON", async () => {
-    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-lobster-runner-"));
-    const workflowPath = path.join(tempDir, "workflow.lobster");
-    await fs.writeFile(workflowPath, "steps: []\n", "utf8");
+    const { runtime, runner } = createRunner();
+    const { cwd } = await createWorkflow();
 
-    try {
-      const runtime = {
-        runToolRequest: vi.fn(),
-        resumeToolRequest: vi.fn(),
-      };
-      const runner = createEmbeddedLobsterRunner({
-        loadRuntime: vi.fn().mockResolvedValue(runtime),
-      });
-
-      await expect(
-        runner.run({
-          action: "run",
-          pipeline: "workflow.lobster",
-          argsJson: "{bad",
-          cwd: tempDir,
-          timeoutMs: 2000,
-          maxStdoutBytes: 4096,
-        }),
-      ).rejects.toThrow("run --args-json must be valid JSON");
-      expect(runtime.runToolRequest).not.toHaveBeenCalled();
-    } finally {
-      await fs.rm(tempDir, { recursive: true, force: true });
-    }
+    await expect(
+      runner.run(runParams({ pipeline: "workflow.lobster", argsJson: "{bad", cwd })),
+    ).rejects.toThrow("run --args-json must be valid JSON");
+    expect(runtime.runToolRequest).not.toHaveBeenCalled();
   });
 
   it("throws when the embedded runtime returns an error envelope", async () => {
-    const runtime = {
-      runToolRequest: vi.fn().mockResolvedValue({
-        ok: false,
-        protocolVersion: 1,
-        error: {
-          type: "runtime_error",
-          message: "boom",
-        },
-      }),
-      resumeToolRequest: vi.fn(),
-    };
-
-    const runner = createEmbeddedLobsterRunner({
-      loadRuntime: vi.fn().mockResolvedValue(runtime),
+    const { runtime, runner } = createRunner();
+    runtime.runToolRequest.mockResolvedValue({
+      ok: false,
+      error: { message: "boom" },
     });
 
-    await expect(
-      runner.run({
-        action: "run",
-        pipeline: "exec --json=true echo hi",
-        cwd: process.cwd(),
-        timeoutMs: 2000,
-        maxStdoutBytes: 4096,
-      }),
-    ).rejects.toThrow("boom");
+    await expect(runner.run(runParams())).rejects.toThrow("boom");
+  });
+
+  it("rejects an input request without a resumable checkpoint", async () => {
+    const { runtime, runner } = createRunner();
+    runtime.runToolRequest.mockResolvedValue({ ...success, status: "needs_input" });
+
+    await expect(runner.run(runParams())).rejects.toThrow(
+      "Lobster input request is missing its resume token",
+    );
   });
 
   it("routes resume through the embedded runtime", async () => {
-    const runtime = {
-      runToolRequest: vi.fn(),
-      resumeToolRequest: vi.fn().mockResolvedValue({
-        ok: true,
-        protocolVersion: 1,
-        status: "cancelled",
-        output: [],
-        requiresApproval: null,
-      }),
-    };
+    const { runtime, runner } = createRunner();
+    runtime.resumeToolRequest.mockResolvedValue({ ...success, status: "cancelled" });
 
-    const runner = createEmbeddedLobsterRunner({
-      loadRuntime: vi.fn().mockResolvedValue(runtime),
-    });
+    const envelope = await runner.run(
+      runParams({ action: "resume", pipeline: undefined, token: "resume-token", approve: false }),
+    );
 
-    const envelope = await runner.run({
-      action: "resume",
-      token: "resume-token",
-      approve: false,
-      cwd: process.cwd(),
-      timeoutMs: 2000,
-      maxStdoutBytes: 4096,
-    });
-
-    expect(runtime.resumeToolRequest).toHaveBeenCalledWith({
+    expect(runtime.resumeToolRequest).toHaveBeenCalledExactlyOnceWith({
       token: "resume-token",
       approved: false,
-      ctx: expect.objectContaining({
-        cwd: process.cwd(),
-        mode: "tool",
-        signal: expect.any(AbortSignal),
-      }),
+      ctx: toolContext(),
     });
     expect(envelope).toEqual({
       ok: true,
@@ -205,122 +176,125 @@ describe("createEmbeddedLobsterRunner", () => {
     });
   });
 
+  it("forwards approvalId through resume when token is absent", async () => {
+    const { runtime, runner } = createRunner();
+    runtime.resumeToolRequest.mockResolvedValue(success);
+
+    await runner.run(
+      runParams({ action: "resume", pipeline: undefined, approvalId: "dbc98d05", approve: true }),
+    );
+
+    expect(runtime.resumeToolRequest).toHaveBeenCalledExactlyOnceWith({
+      approvalId: "dbc98d05",
+      approved: true,
+      ctx: toolContext(),
+    });
+  });
+
+  it("passes approvalId through the normalized needs_approval envelope", async () => {
+    const { runtime, runner } = createRunner();
+    const approval = { prompt: "ok?", items: [], resumeToken: "eyJ...", approvalId: "dbc98d05" };
+    runtime.runToolRequest.mockResolvedValue({
+      ...success,
+      status: "needs_approval",
+      requiresApproval: approval,
+    });
+
+    expect(await runner.run(runParams())).toEqual({
+      ok: true,
+      status: "needs_approval",
+      output: [],
+      requiresApproval: { type: "approval_request", ...approval },
+    });
+  });
+
   it("loads the embedded runtime once per runner", async () => {
-    const runtime = {
-      runToolRequest: vi.fn().mockResolvedValue({
-        ok: true,
-        protocolVersion: 1,
-        status: "ok",
-        output: [],
-        requiresApproval: null,
-      }),
-      resumeToolRequest: vi.fn().mockResolvedValue({
-        ok: true,
-        protocolVersion: 1,
-        status: "cancelled",
-        output: [],
-        requiresApproval: null,
-      }),
-    };
-    const loadRuntime = vi.fn().mockResolvedValue(runtime);
+    const { runtime, loadRuntime, runner } = createRunner();
+    runtime.runToolRequest.mockResolvedValue(success);
+    runtime.resumeToolRequest.mockResolvedValue({ ...success, status: "cancelled" });
 
-    const runner = createEmbeddedLobsterRunner({ loadRuntime });
-
-    await runner.run({
-      action: "run",
-      pipeline: "exec --json=true echo hi",
-      cwd: process.cwd(),
-      timeoutMs: 2000,
-      maxStdoutBytes: 4096,
-    });
-    await runner.run({
-      action: "resume",
-      token: "resume-token",
-      approve: false,
-      cwd: process.cwd(),
-      timeoutMs: 2000,
-      maxStdoutBytes: 4096,
-    });
+    await runner.run(runParams());
+    await runner.run(
+      runParams({ action: "resume", pipeline: undefined, token: "resume-token", approve: false }),
+    );
 
     expect(loadRuntime).toHaveBeenCalledTimes(1);
   });
 
+  it("loads the published package core runtime", async () => {
+    await expect(
+      createEmbeddedLobsterRunner().run(
+        runParams({ pipeline: "commands.list", maxStdoutBytes: 512_000 }),
+      ),
+    ).resolves.toMatchObject({ ok: true, status: "ok" });
+  });
+
   it("requires a pipeline for run", async () => {
-    const runner = createEmbeddedLobsterRunner({
-      loadRuntime: vi.fn().mockResolvedValue({
-        runToolRequest: vi.fn(),
-        resumeToolRequest: vi.fn(),
-      }),
-    });
+    const { runner } = createRunner();
 
-    await expect(
-      runner.run({
-        action: "run",
-        cwd: process.cwd(),
-        timeoutMs: 2000,
-        maxStdoutBytes: 4096,
-      }),
-    ).rejects.toThrow(/pipeline required/);
+    await expect(runner.run(runParams({ pipeline: undefined }))).rejects.toThrow(
+      /pipeline required/,
+    );
   });
 
-  it("requires token and approve for resume", async () => {
-    const runner = createEmbeddedLobsterRunner({
-      loadRuntime: vi.fn().mockResolvedValue({
-        runToolRequest: vi.fn(),
-        resumeToolRequest: vi.fn(),
-      }),
-    });
+  it("requires a checkpoint and a decision for resume", async () => {
+    const { runner } = createRunner();
 
     await expect(
-      runner.run({
-        action: "resume",
-        approve: true,
-        cwd: process.cwd(),
-        timeoutMs: 2000,
-        maxStdoutBytes: 4096,
-      }),
-    ).rejects.toThrow(/token required/);
-
+      runner.run(runParams({ action: "resume", pipeline: undefined, approve: true })),
+    ).rejects.toThrow(/token or approvalId required/);
     await expect(
-      runner.run({
-        action: "resume",
+      runner.run(runParams({ action: "resume", pipeline: undefined, token: "resume-token" })),
+    ).rejects.toThrow(/exactly one/);
+  });
+
+  it.each([
+    { responseJson: "{bad" },
+    { responseJson: "" },
+    { approve: true, responseJson: "null" },
+    { cancel: true, responseJson: "null" },
+    { cancel: true, approve: false },
+    { cancel: false },
+  ])(
+    "rejects invalid or ambiguous resume arguments before touching state: %j",
+    async (decision) => {
+      const { runtime, runner } = createRunner();
+      await expect(
+        runner.run(runParams({ action: "resume", token: "resume-token", ...decision })),
+      ).rejects.toThrow();
+      expect(runtime.resumeToolRequest).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(["null", "false", "[]"])(
+    "passes JSON values unchanged on resume: %s",
+    async (responseJson) => {
+      const { runtime, runner } = createRunner();
+      runtime.resumeToolRequest.mockResolvedValue(success);
+      await runner.run(runParams({ action: "resume", token: "resume-token", responseJson }));
+      expect(runtime.resumeToolRequest).toHaveBeenCalledExactlyOnceWith({
         token: "resume-token",
-        cwd: process.cwd(),
-        timeoutMs: 2000,
-        maxStdoutBytes: 4096,
-      }),
-    ).rejects.toThrow(/approve required/);
-  });
+        response: JSON.parse(responseJson),
+        ctx: toolContext(),
+      });
+    },
+  );
 
   it("aborts long-running embedded work", async () => {
-    const runtime = {
-      runToolRequest: vi.fn(
-        async ({ ctx }: { ctx?: { signal?: AbortSignal } }) =>
-          await new Promise((resolve, reject) => {
-            ctx?.signal?.addEventListener("abort", () => {
-              reject(ctx.signal?.reason ?? new Error("aborted"));
-            });
-            setTimeout(
-              () => resolve({ ok: true, status: "ok", output: [], requiresApproval: null }),
-              500,
+    const { runtime, runner } = createRunner();
+    runtime.runToolRequest.mockImplementation(
+      async ({ ctx }) =>
+        await new Promise((resolve, reject) => {
+          const timeout = setTimeout(() => resolve(success), 500);
+          ctx?.signal?.addEventListener("abort", () => {
+            clearTimeout(timeout);
+            reject(
+              toLintErrorObject(ctx.signal?.reason ?? new Error("aborted"), "Non-Error rejection"),
             );
-          }),
-      ),
-      resumeToolRequest: vi.fn(),
-    };
+          });
+        }),
+    );
 
-    const runner = createEmbeddedLobsterRunner({
-      loadRuntime: vi.fn().mockResolvedValue(runtime),
-    });
-
-    await expect(
-      runner.run({
-        action: "run",
-        pipeline: "exec --json=true echo hi",
-        cwd: process.cwd(),
-        timeoutMs: 200,
-        maxStdoutBytes: 4096,
-      }),
-    ).rejects.toThrow(/timed out|aborted/);
+    await expect(runner.run(runParams({ timeoutMs: 200 }))).rejects.toThrow(/timed out|aborted/);
   });
 });

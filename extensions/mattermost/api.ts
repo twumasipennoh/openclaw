@@ -1,4 +1,3 @@
-// Keep this barrel helper-only so plugin-sdk facades do not pull the full
-// channel plugin (and its runtime state) into tests or other shared surfaces.
-export { mattermostPlugin } from "./src/channel.js";
+// Public Mattermost API barrel for lightweight integration helpers.
+export { buildButtonAttachments } from "./src/mattermost/interactions.js";
 export { isMattermostSenderAllowed } from "./src/mattermost/monitor-auth.js";

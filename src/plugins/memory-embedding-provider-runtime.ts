@@ -1,39 +1,24 @@
-import type { OpenClawConfig } from "../config/config.js";
-import { resolvePluginCapabilityProviders } from "./capability-provider-runtime.js";
-import {
-  getRegisteredMemoryEmbeddingProvider,
-  listRegisteredMemoryEmbeddingProviders,
-  type MemoryEmbeddingProviderAdapter,
-} from "./memory-embedding-providers.js";
+import type { OpenClawConfig } from "../config/types.openclaw.js";
+import { getEmbeddingProvider, listEmbeddingProviders } from "./embedding-provider-runtime.js";
+import { listRegisteredEmbeddingProviders } from "./embedding-providers.js";
+import type { MemoryEmbeddingProviderAdapter } from "./memory-embedding-providers.js";
 
-export { listRegisteredMemoryEmbeddingProviders };
-
+/** Lists registered memory embedding provider adapters without registry metadata. */
 export function listRegisteredMemoryEmbeddingProviderAdapters(): MemoryEmbeddingProviderAdapter[] {
-  return listRegisteredMemoryEmbeddingProviders().map((entry) => entry.adapter);
+  return listRegisteredEmbeddingProviders().map((entry) => entry.adapter);
 }
+
+/** Lists memory embedding providers from runtime config and registered adapters. */
 export function listMemoryEmbeddingProviders(
   cfg?: OpenClawConfig,
 ): MemoryEmbeddingProviderAdapter[] {
-  const registered = listRegisteredMemoryEmbeddingProviderAdapters();
-  if (registered.length > 0) {
-    return registered;
-  }
-  return resolvePluginCapabilityProviders({
-    key: "memoryEmbeddingProviders",
-    cfg,
-  });
+  return listEmbeddingProviders(cfg);
 }
 
+/** Resolves one memory embedding provider by id, alias, or configured API owner. */
 export function getMemoryEmbeddingProvider(
   id: string,
   cfg?: OpenClawConfig,
 ): MemoryEmbeddingProviderAdapter | undefined {
-  const registered = getRegisteredMemoryEmbeddingProvider(id);
-  if (registered) {
-    return registered.adapter;
-  }
-  if (listRegisteredMemoryEmbeddingProviders().length > 0) {
-    return undefined;
-  }
-  return listMemoryEmbeddingProviders(cfg).find((adapter) => adapter.id === id);
+  return getEmbeddingProvider(id, cfg);
 }

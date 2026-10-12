@@ -1,22 +1,35 @@
-import { logWarn } from "../logger.js";
+/**
+ * Resolves MCP transport command, environment, and timeout configuration.
+ */
+import { redactSensitiveUrl } from "@openclaw/net-policy/redact-sensitive-url";
 import {
-  describeHttpMcpServerLaunchConfig,
-  resolveHttpMcpServerLaunchConfig,
-  type HttpMcpTransportType,
-} from "./mcp-http.js";
+  clampPositiveTimerTimeoutMs,
+  resolvePositiveTimerTimeoutMs,
+} from "@openclaw/normalization-core/number-coercion";
+import { asOptionalObjectRecord, isRecord } from "@openclaw/normalization-core/record-coerce";
+import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
+import { sanitizeForLog } from "../../packages/terminal-core/src/ansi.js";
+import { resolveConfiguredMcpTransport } from "../config/mcp-config-normalize.js";
+import { createDedupeCache } from "../infra/dedupe.js";
+import { logWarn } from "../logger.js";
+import { resolveHttpMcpServerLaunchConfig, type HttpMcpTransportType } from "./mcp-http.js";
+import type { McpOAuthConfig } from "./mcp-oauth-provider.js";
 import {
   describeStdioMcpServerLaunchConfig,
   resolveStdioMcpServerLaunchConfig,
 } from "./mcp-stdio.js";
 
-export type McpTransportType = "stdio" | HttpMcpTransportType;
-
+// Resolves raw MCP server config into the transport shape used by bundle MCP
+// runtime startup. Stdio is preferred when launch config is valid; otherwise
+// HTTP/SSE transports are attempted with normalized timeout fields.
 type ResolvedBaseMcpTransportConfig = {
   description: string;
   connectionTimeoutMs: number;
+  requestTimeoutMs: number;
+  supportsParallelToolCalls: boolean;
 };
 
-export type ResolvedStdioMcpTransportConfig = ResolvedBaseMcpTransportConfig & {
+type ResolvedStdioMcpTransportConfig = ResolvedBaseMcpTransportConfig & {
   kind: "stdio";
   transportType: "stdio";
   command: string;
@@ -25,80 +38,138 @@ export type ResolvedStdioMcpTransportConfig = ResolvedBaseMcpTransportConfig & {
   cwd?: string;
 };
 
+type ResolvedMcpOAuthConfig = McpOAuthConfig & {
+  identity?: "shared" | "per-requester";
+  authProfileId?: unknown;
+};
+
 export type ResolvedHttpMcpTransportConfig = ResolvedBaseMcpTransportConfig & {
   kind: "http";
   transportType: HttpMcpTransportType;
   url: string;
   headers?: Record<string, string>;
+  auth?: "oauth";
+  oauth?: ResolvedMcpOAuthConfig;
+  sslVerify?: boolean;
+  clientCert?: string;
+  clientKey?: string;
 };
 
-export type ResolvedMcpTransportConfig =
-  | ResolvedStdioMcpTransportConfig
-  | ResolvedHttpMcpTransportConfig;
+type ResolvedMcpTransportConfig = ResolvedStdioMcpTransportConfig | ResolvedHttpMcpTransportConfig;
 
 const DEFAULT_CONNECTION_TIMEOUT_MS = 30_000;
+const DEFAULT_REQUEST_TIMEOUT_MS = 60_000;
+const MAX_WARNED_DROPPED_STDIO_ENV_KEYS = 4096;
+// Warning state spans repeated MCP transport resolutions in one gateway process;
+// bounding it means evicted server/env pairs can re-warn instead of growing unbounded.
+const warnedDroppedStdioEnvKeys = createDedupeCache({
+  ttlMs: 0,
+  maxSize: MAX_WARNED_DROPPED_STDIO_ENV_KEYS,
+});
 
-function getConnectionTimeoutMs(rawServer: unknown): number {
-  if (
-    rawServer &&
-    typeof rawServer === "object" &&
-    typeof (rawServer as { connectionTimeoutMs?: unknown }).connectionTimeoutMs === "number" &&
-    (rawServer as { connectionTimeoutMs: number }).connectionTimeoutMs > 0
-  ) {
-    return (rawServer as { connectionTimeoutMs: number }).connectionTimeoutMs;
+function warnDroppedStdioEnvOnce(serverName: string, key: string): void {
+  const logServerName = sanitizeForLog(serverName);
+  const logKey = sanitizeForLog(key);
+  if (warnedDroppedStdioEnvKeys.check(JSON.stringify([serverName, key]))) {
+    return;
   }
-  return DEFAULT_CONNECTION_TIMEOUT_MS;
+  logWarn(
+    `bundle-mcp: server "${logServerName}": env "${logKey}" is blocked for stdio startup safety and was ignored.`,
+  );
 }
 
-function getRequestedTransport(rawServer: unknown): string {
-  if (
-    !rawServer ||
-    typeof rawServer !== "object" ||
-    typeof (rawServer as { transport?: unknown }).transport !== "string"
-  ) {
-    return "";
-  }
-  return ((rawServer as { transport?: string }).transport ?? "").trim().toLowerCase();
+function getConnectionTimeoutMs(rawServer: unknown): number {
+  return resolvePositiveTimerTimeoutMs(
+    asOptionalObjectRecord(rawServer)?.connectionTimeoutMs,
+    DEFAULT_CONNECTION_TIMEOUT_MS,
+  );
+}
+
+export function resolveMcpRequestTimeoutMs(
+  rawServer: unknown,
+  fallbackMs = DEFAULT_REQUEST_TIMEOUT_MS,
+): number {
+  return (
+    clampPositiveTimerTimeoutMs(asOptionalObjectRecord(rawServer)?.requestTimeoutMs) ??
+    resolvePositiveTimerTimeoutMs(fallbackMs, DEFAULT_REQUEST_TIMEOUT_MS)
+  );
+}
+
+function getBooleanField(rawServer: unknown, key: string): boolean | undefined {
+  const value = asOptionalObjectRecord(rawServer)?.[key];
+  return typeof value === "boolean" ? value : undefined;
 }
 
 function resolveHttpTransportConfig(
   serverName: string,
   rawServer: unknown,
   transportType: HttpMcpTransportType,
+  logWarnings: boolean,
 ): ResolvedHttpMcpTransportConfig | null {
-  const launch = resolveHttpMcpServerLaunchConfig(rawServer, {
-    transportType,
-    onDroppedHeader: (key) => {
-      logWarn(
-        `bundle-mcp: server "${serverName}": header "${key}" has an unsupported value type and was ignored.`,
-      );
-    },
-    onMalformedHeaders: () => {
-      logWarn(
-        `bundle-mcp: server "${serverName}": "headers" must be a JSON object; the value was ignored.`,
-      );
-    },
-  });
+  const launch = resolveHttpMcpServerLaunchConfig(
+    rawServer,
+    logWarnings
+      ? {
+          transportType,
+          onDroppedHeader: (key: string) => {
+            logWarn(
+              `bundle-mcp: server "${serverName}": header "${key}" has an unsupported value type and was ignored.`,
+            );
+          },
+          onMalformedHeaders: () => {
+            logWarn(
+              `bundle-mcp: server "${serverName}": "headers" must be a JSON object; the value was ignored.`,
+            );
+          },
+        }
+      : { transportType },
+  );
   if (!launch.ok) {
     return null;
   }
+  const record = asOptionalObjectRecord(rawServer);
+  const oauth = record?.oauth;
+  const sslVerify = getBooleanField(rawServer, "sslVerify");
+  const clientCert = normalizeOptionalString(record?.clientCert);
+  const clientKey = normalizeOptionalString(record?.clientKey);
   return {
     kind: "http",
     transportType: launch.config.transportType,
     url: launch.config.url,
     headers: launch.config.headers,
-    description: describeHttpMcpServerLaunchConfig(launch.config),
+    ...(record?.auth === "oauth" ? { auth: "oauth" as const } : {}),
+    ...(isRecord(oauth) ? { oauth: oauth as ResolvedMcpOAuthConfig } : {}),
+    ...(sslVerify !== undefined ? { sslVerify } : {}),
+    ...(clientCert ? { clientCert } : {}),
+    ...(clientKey ? { clientKey } : {}),
+    description: redactSensitiveUrl(launch.config.url),
     connectionTimeoutMs: getConnectionTimeoutMs(rawServer),
+    requestTimeoutMs: resolveMcpRequestTimeoutMs(rawServer),
+    supportsParallelToolCalls: getBooleanField(rawServer, "supportsParallelToolCalls") ?? false,
   };
 }
 
+/** Resolve one MCP server's launch transport config, or null when unsupported. */
 export function resolveMcpTransportConfig(
   serverName: string,
   rawServer: unknown,
+  options?: { logWarnings?: boolean },
 ): ResolvedMcpTransportConfig | null {
-  const requestedTransport = getRequestedTransport(rawServer);
-  const stdioLaunch = resolveStdioMcpServerLaunchConfig(rawServer);
+  const logWarnings = options?.logWarnings !== false;
+  const effectiveTransport = resolveConfiguredMcpTransport(rawServer);
+  const stdioLaunch = resolveStdioMcpServerLaunchConfig(
+    rawServer,
+    logWarnings
+      ? {
+          onDroppedEnv: (key: string) => {
+            warnDroppedStdioEnvOnce(serverName, key);
+          },
+        }
+      : undefined,
+  );
   if (stdioLaunch.ok) {
+    // A command-bearing server is always treated as stdio even when HTTP-ish
+    // aliases are present, matching existing MCP config precedence.
     return {
       kind: "stdio",
       transportType: "stdio",
@@ -108,36 +179,40 @@ export function resolveMcpTransportConfig(
       cwd: stdioLaunch.config.cwd,
       description: describeStdioMcpServerLaunchConfig(stdioLaunch.config),
       connectionTimeoutMs: getConnectionTimeoutMs(rawServer),
+      requestTimeoutMs: resolveMcpRequestTimeoutMs(rawServer),
+      supportsParallelToolCalls: getBooleanField(rawServer, "supportsParallelToolCalls") ?? false,
     };
   }
 
   if (
-    requestedTransport &&
-    requestedTransport !== "sse" &&
-    requestedTransport !== "streamable-http"
+    effectiveTransport &&
+    effectiveTransport !== "sse" &&
+    effectiveTransport !== "streamable-http"
   ) {
-    logWarn(
-      `bundle-mcp: skipped server "${serverName}" because transport "${requestedTransport}" is not supported.`,
-    );
+    if (logWarnings) {
+      logWarn(
+        `bundle-mcp: skipped server "${sanitizeForLog(serverName)}" because transport "${sanitizeForLog(effectiveTransport)}" is not supported.`,
+      );
+    }
     return null;
   }
 
-  if (requestedTransport === "streamable-http") {
-    const httpTransport = resolveHttpTransportConfig(serverName, rawServer, "streamable-http");
-    if (httpTransport) {
-      return httpTransport;
-    }
-  }
-
-  const sseTransport = resolveHttpTransportConfig(serverName, rawServer, "sse");
-  if (sseTransport) {
-    return sseTransport;
+  const httpTransport = resolveHttpTransportConfig(
+    serverName,
+    rawServer,
+    effectiveTransport === "streamable-http" ? "streamable-http" : "sse",
+    logWarnings,
+  );
+  if (httpTransport) {
+    return httpTransport;
   }
 
   const httpLaunch = resolveHttpMcpServerLaunchConfig(rawServer);
   const httpReason = httpLaunch.ok ? "not an HTTP MCP server" : httpLaunch.reason;
-  logWarn(
-    `bundle-mcp: skipped server "${serverName}" because ${stdioLaunch.reason} and ${httpReason}.`,
-  );
+  if (logWarnings) {
+    logWarn(
+      `bundle-mcp: skipped server "${sanitizeForLog(serverName)}" because ${stdioLaunch.reason} and ${httpReason}.`,
+    );
+  }
   return null;
 }

@@ -1,32 +1,40 @@
-/**
- * Shared helpers for FileConsentCard flow in MSTeams.
- *
- * FileConsentCard is required for:
- * - Personal (1:1) chats with large files (>=4MB)
- * - Personal chats with non-image files (PDFs, documents, etc.)
- *
- * This module consolidates the logic used by both send.ts (proactive sends)
- * and messenger.ts (reply path) to avoid duplication.
- */
-
+import { normalizeOptionalLowercaseString } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { buildFileConsentCard } from "./file-consent.js";
+import { storePendingUploadFs } from "./pending-uploads-fs.js";
 import { storePendingUpload } from "./pending-uploads.js";
 
-export type FileConsentMedia = {
+export const FILE_CONSENT_THRESHOLD_BYTES = 4 * 1024 * 1024;
+
+type FileConsentMedia = {
   buffer: Buffer;
   filename: string;
   contentType?: string;
 };
 
-export type FileConsentActivityResult = {
+type FileConsentActivityResult = {
   activity: Record<string, unknown>;
   uploadId: string;
 };
 
-/**
- * Prepare a FileConsentCard activity for large files or non-images in personal chats.
- * Returns the activity object and uploadId - caller is responsible for sending.
- */
+function buildConsentActivity(params: {
+  media: FileConsentMedia;
+  description?: string;
+  uploadId: string;
+}): Record<string, unknown> {
+  const { media, description, uploadId } = params;
+  const consentCard = buildFileConsentCard({
+    filename: media.filename,
+    description: description || `File: ${media.filename}`,
+    sizeInBytes: media.buffer.length,
+    context: { uploadId },
+  });
+  return {
+    type: "message",
+    attachments: [consentCard],
+  };
+}
+
+/** In-process replies keep consent bytes in memory; CLI sends use the persisted variant below. */
 export function prepareFileConsentActivity(params: {
   media: FileConsentMedia;
   conversationId: string;
@@ -41,33 +49,29 @@ export function prepareFileConsentActivity(params: {
     conversationId,
   });
 
-  const consentCard = buildFileConsentCard({
-    filename: media.filename,
-    description: description || `File: ${media.filename}`,
-    sizeInBytes: media.buffer.length,
-    context: { uploadId },
-  });
-
-  const activity: Record<string, unknown> = {
-    type: "message",
-    attachments: [consentCard],
-  };
-
-  return { activity, uploadId };
+  return { activity: buildConsentActivity({ media, description, uploadId }), uploadId };
 }
 
-/**
- * Check if a file requires FileConsentCard flow.
- * True for: personal chat AND (large file OR non-image)
- */
+/** Persist consent bytes for callbacks received by another process after the CLI exits. */
+export async function prepareFileConsentActivityFs(
+  params: Parameters<typeof prepareFileConsentActivity>[0],
+): Promise<FileConsentActivityResult> {
+  const result = prepareFileConsentActivity(params);
+  await storePendingUploadFs({
+    id: result.uploadId,
+    ...params.media,
+    conversationId: params.conversationId,
+  });
+  return result;
+}
+
 export function requiresFileConsent(params: {
   conversationType: string | undefined;
   contentType: string | undefined;
   bufferSize: number;
-  thresholdBytes: number;
 }): boolean {
-  const isPersonal = params.conversationType?.toLowerCase() === "personal";
+  const isPersonal = normalizeOptionalLowercaseString(params.conversationType) === "personal";
   const isImage = params.contentType?.startsWith("image/") ?? false;
-  const isLargeFile = params.bufferSize >= params.thresholdBytes;
+  const isLargeFile = params.bufferSize >= FILE_CONSENT_THRESHOLD_BYTES;
   return isPersonal && (isLargeFile || !isImage);
 }

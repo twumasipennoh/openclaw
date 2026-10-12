@@ -1,12 +1,16 @@
+import { uniqueValues } from "@openclaw/normalization-core/string-normalization";
+import { resolveVideoGenerationModeCapabilities } from "./capabilities.js";
 import type { VideoGenerationProvider } from "./types.js";
 
+// Duration support is provider/mode/model scoped. Values are normalized to
+// positive rounded seconds before runtime snaps requests to the nearest option.
 function normalizeSupportedDurationValues(
   values: readonly number[] | undefined,
 ): number[] | undefined {
   if (!Array.isArray(values) || values.length === 0) {
     return undefined;
   }
-  const normalized = [...new Set(values)]
+  const normalized = uniqueValues(values)
     .filter((value) => Number.isFinite(value) && value > 0)
     .map((value) => Math.round(value))
     .filter((value) => value > 0)
@@ -17,8 +21,15 @@ function normalizeSupportedDurationValues(
 export function resolveVideoGenerationSupportedDurations(params: {
   provider?: VideoGenerationProvider;
   model?: string;
+  inputImageCount?: number;
+  inputVideoCount?: number;
 }): number[] | undefined {
-  const caps = params.provider?.capabilities;
+  const { capabilities: caps } = resolveVideoGenerationModeCapabilities({
+    provider: params.provider,
+    model: params.model,
+    inputImageCount: params.inputImageCount,
+    inputVideoCount: params.inputVideoCount,
+  });
   const model = params.model?.trim();
   const modelSpecific =
     model && caps?.supportedDurationSecondsByModel
@@ -27,10 +38,14 @@ export function resolveVideoGenerationSupportedDurations(params: {
   return normalizeSupportedDurationValues(modelSpecific ?? caps?.supportedDurationSeconds);
 }
 
+// Normalize requested duration for providers with explicit allowed values. Ties
+// choose the longer duration to avoid shortening user intent unexpectedly.
 export function normalizeVideoGenerationDuration(params: {
   provider?: VideoGenerationProvider;
   model?: string;
   durationSeconds?: number;
+  inputImageCount?: number;
+  inputVideoCount?: number;
 }): number | undefined {
   if (typeof params.durationSeconds !== "number" || !Number.isFinite(params.durationSeconds)) {
     return undefined;
@@ -40,9 +55,17 @@ export function normalizeVideoGenerationDuration(params: {
   if (!supported || supported.length === 0) {
     return rounded;
   }
+  return selectSupportedVideoDuration(rounded, supported);
+}
+
+/** Select from a nonempty duration list, preferring the longer value on ties. */
+export function selectSupportedVideoDuration(
+  durationSeconds: number,
+  supported: readonly number[],
+): number {
   return supported.reduce((best, current) => {
-    const currentDistance = Math.abs(current - rounded);
-    const bestDistance = Math.abs(best - rounded);
+    const currentDistance = Math.abs(current - durationSeconds);
+    const bestDistance = Math.abs(best - durationSeconds);
     if (currentDistance < bestDistance) {
       return current;
     }

@@ -1,106 +1,76 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { ModelDefinitionConfig } from "../config/types.models.js";
+import type { OpenClawConfig } from "../config/types.openclaw.js";
+import { getContextWindowCaches, providerContextTokenCacheKey } from "./context-cache.js";
 import {
-  ANTHROPIC_CONTEXT_1M_TOKENS,
   applyConfiguredContextWindows,
   applyDiscoveredContextWindows,
+  resetContextWindowCacheForTest,
   resolveContextTokensForModel,
+  resolveModelContextTokenProjection,
 } from "./context.js";
-import { createSessionManagerRuntimeRegistry } from "./pi-hooks/session-manager-runtime-registry.js";
 
-describe("applyDiscoveredContextWindows", () => {
-  it("keeps the smallest context window when the same bare model id appears under multiple providers", () => {
-    const cache = new Map<string, number>();
-    applyDiscoveredContextWindows({
-      cache,
-      models: [
-        { id: "gemini-3.1-pro-preview", contextWindow: 128_000 },
-        { id: "gemini-3.1-pro-preview", contextWindow: 1_048_576 },
-      ],
-    });
+vi.mock("../config/config.js", () => ({
+  getRuntimeConfig: () => ({}),
+  projectConfigOntoRuntimeSourceSnapshot: (config: unknown) => config,
+}));
 
-    // Keep the conservative (minimum) value: this cache feeds runtime paths such
-    // as flush thresholds and session persistence, not just /status display.
-    // Callers with a known provider should use resolveContextTokensForModel which
-    // tries the provider-qualified key first.
-    expect(cache.get("gemini-3.1-pro-preview")).toBe(128_000);
-  });
-
-  it("stores provider-qualified entries independently", () => {
-    const cache = new Map<string, number>();
-    applyDiscoveredContextWindows({
-      cache,
-      models: [
-        { id: "github-copilot/gemini-3.1-pro-preview", contextWindow: 128_000 },
-        { id: "google-gemini-cli/gemini-3.1-pro-preview", contextWindow: 1_048_576 },
-      ],
-    });
-
-    expect(cache.get("github-copilot/gemini-3.1-pro-preview")).toBe(128_000);
-    expect(cache.get("google-gemini-cli/gemini-3.1-pro-preview")).toBe(1_048_576);
-  });
-
-  it("prefers discovered contextTokens over contextWindow", () => {
-    const cache = new Map<string, number>();
-    applyDiscoveredContextWindows({
-      cache,
-      models: [{ id: "gpt-5.4", contextWindow: 1_050_000, contextTokens: 272_000 }],
-    });
-
-    expect(cache.get("gpt-5.4")).toBe(272_000);
-  });
-});
-
-describe("applyConfiguredContextWindows", () => {
-  it("writes bare model id to cache; does not touch raw provider-qualified discovery entries", () => {
-    // Discovery stored a provider-qualified entry; config override goes into the
-    // bare key only. resolveContextTokensForModel now scans config directly, so
-    // there is no need (and no benefit) to also write a synthetic qualified key.
-    const cache = new Map<string, number>([["openrouter/anthropic/claude-opus-4-6", 1_000_000]]);
-    applyConfiguredContextWindows({
-      cache,
-      modelsConfig: {
-        providers: {
-          openrouter: {
-            models: [{ id: "anthropic/claude-opus-4-6", contextWindow: 200_000 }],
-          },
+function modelConfig(
+  provider: string,
+  id: string,
+  limits: Partial<Pick<ModelDefinitionConfig, "contextWindow" | "contextTokens">>,
+): OpenClawConfig {
+  return {
+    models: {
+      providers: {
+        [provider]: {
+          baseUrl: "https://example.invalid",
+          models: [
+            {
+              id,
+              name: id,
+              reasoning: false,
+              input: ["text"],
+              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+              contextWindow: 200_000,
+              maxTokens: 4096,
+              ...limits,
+            },
+          ],
         },
       },
-    });
+    },
+  };
+}
 
-    expect(cache.get("anthropic/claude-opus-4-6")).toBe(200_000);
-    // Discovery entry is untouched — no synthetic write that could corrupt
-    // an unrelated provider's raw slash-containing model ID.
-    expect(cache.get("openrouter/anthropic/claude-opus-4-6")).toBe(1_000_000);
+function resolve(params: Parameters<typeof resolveContextTokensForModel>[0]) {
+  return resolveContextTokensForModel({ allowAsyncLoad: false, ...params });
+}
+
+function discover(models: Parameters<typeof applyDiscoveredContextWindows>[0]["models"]) {
+  applyDiscoveredContextWindows({ cache: getContextWindowCaches().discoveredTokenCache, models });
+}
+
+beforeEach(resetContextWindowCacheForTest);
+afterEach(resetContextWindowCacheForTest);
+
+describe("context cache projection", () => {
+  it("prefers discovered contextTokens over the native window", () => {
+    discover([{ id: "gpt-5.4", contextWindow: 1_050_000, contextTokens: 272_000 }]);
+    expect(resolve({ model: "gpt-5.4" })).toBe(272_000);
   });
 
-  it("does not write synthetic provider-qualified keys; only bare model ids go into cache", () => {
-    // applyConfiguredContextWindows must NOT write "google-gemini-cli/gemini-3.1-pro-preview"
-    // into the cache — that keyspace is reserved for raw discovery model IDs and
-    // a synthetic write would overwrite unrelated entries (e.g. OpenRouter's
-    // "google/gemini-2.5-pro" being clobbered by a Google provider config).
-    const cache = new Map<string, number>();
-    cache.set("google-gemini-cli/gemini-3.1-pro-preview", 1_048_576); // discovery entry
-    applyConfiguredContextWindows({
-      cache,
-      modelsConfig: {
-        providers: {
-          "google-gemini-cli": {
-            models: [{ id: "gemini-3.1-pro-preview", contextWindow: 200_000 }],
-          },
-        },
-      },
-    });
-
-    // Bare key is written.
-    expect(cache.get("gemini-3.1-pro-preview")).toBe(200_000);
-    // Discovery entry is NOT overwritten.
-    expect(cache.get("google-gemini-cli/gemini-3.1-pro-preview")).toBe(1_048_576);
+  it("keeps unowned CLI discovery at its reported window", () => {
+    discover([{ id: "claude-cli/claude-opus-4.7-20260219", contextWindow: 200_000 }]);
+    expect(resolve({ model: "claude-cli/claude-opus-4.7-20260219" })).toBe(200_000);
   });
 
-  it("adds config-only model context windows and ignores invalid entries", () => {
+  it("adds valid configured windows and ignores invalid entries", () => {
     const cache = new Map<string, number>();
+    const windowCache = new Map<string, number>();
     applyConfiguredContextWindows({
       cache,
+      windowCache,
       modelsConfig: {
         providers: {
           openrouter: {
@@ -113,140 +83,159 @@ describe("applyConfiguredContextWindows", () => {
         },
       },
     });
-
-    expect(cache.get("custom/model")).toBe(150_000);
-    expect(cache.has("bad/model")).toBe(false);
+    expect(windowCache.get("custom/model")).toBe(150_000);
+    expect(windowCache.has("bad/model")).toBe(false);
+    expect(windowCache.has("")).toBe(false);
   });
 
-  it("prefers configured contextTokens over contextWindow", () => {
+  it("writes provider-owned bare keys for self-prefixed configured token caps", () => {
     const cache = new Map<string, number>();
     applyConfiguredContextWindows({
       cache,
+      windowCache: new Map(),
       modelsConfig: {
         providers: {
-          openrouter: {
-            models: [{ id: "custom/model", contextWindow: 1_050_000, contextTokens: 200_000 }],
+          "google-gemini-cli": {
+            models: [
+              {
+                id: "google-gemini-cli/gemini-3.1-pro-preview",
+                contextTokens: 1_000_000,
+              },
+            ],
           },
         },
       },
     });
-
-    expect(cache.get("custom/model")).toBe(200_000);
+    expect(
+      cache.get(providerContextTokenCacheKey("google-gemini-cli", "gemini-3.1-pro-preview")),
+    ).toBe(1_000_000);
   });
 });
 
-describe("createSessionManagerRuntimeRegistry", () => {
-  it("stores, reads, and clears values by object identity", () => {
-    const registry = createSessionManagerRuntimeRegistry<{ value: number }>();
-    const key = {};
-    expect(registry.get(key)).toBeNull();
-    registry.set(key, { value: 1 });
-    expect(registry.get(key)).toEqual({ value: 1 });
-    registry.set(key, null);
-    expect(registry.get(key)).toBeNull();
+describe("context token resolution", () => {
+  it("can exclude unscoped discovery from provider-owned lookup", () => {
+    discover([{ id: "large", contextTokens: 32_000 }]);
+    const params = { provider: "claude-cli", model: "large" };
+    expect(resolve({ ...params, allowUnscopedModelLookup: false })).toBeUndefined();
+    expect(resolve(params)).toBe(32_000);
   });
 
-  it("ignores non-object keys", () => {
-    const registry = createSessionManagerRuntimeRegistry<{ value: number }>();
-    registry.set(null, { value: 1 });
-    registry.set(123, { value: 1 });
-    expect(registry.get(null)).toBeNull();
-    expect(registry.get(123)).toBeNull();
-  });
-});
-
-describe("resolveContextTokensForModel", () => {
-  it("returns 1M context when anthropic context1m is enabled for opus/sonnet", () => {
-    const result = resolveContextTokensForModel({
-      cfg: {
-        agents: {
-          defaults: {
-            models: {
-              "anthropic/claude-opus-4-6": {
-                params: { context1m: true },
-              },
+  it.each([
+    [true, 1_000_000],
+    [false, 200_000],
+  ])("uses the model context1m setting %s over the global default", (context1m, expected) => {
+    expect(
+      resolve({
+        cfg: {
+          agents: {
+            defaults: {
+              params: { context1m: !context1m },
+              models: { "claude-cli/claude-opus-4-7": { params: { context1m } } },
             },
           },
         },
-      },
-      provider: "anthropic",
-      model: "claude-opus-4-6",
-      fallbackContextTokens: 200_000,
-    });
-
-    expect(result).toBe(ANTHROPIC_CONTEXT_1M_TOKENS);
+        provider: "claude-cli",
+        model: "claude-opus-4-7",
+        fallbackContextTokens: 200_000,
+      }),
+    ).toBe(expected);
   });
 
-  it("does not force 1M context when context1m is not enabled", () => {
-    const result = resolveContextTokensForModel({
-      cfg: {
-        agents: {
-          defaults: {
-            models: {
-              "anthropic/claude-opus-4-6": {
-                params: {},
-              },
-            },
-          },
-        },
-      },
-      provider: "anthropic",
-      model: "claude-opus-4-6",
-      fallbackContextTokens: 200_000,
-    });
-
-    expect(result).toBe(200_000);
+  it.each([
+    ["anthropic", "claude-fable-5"],
+    ["anthropic-vertex", "claude-mythos-5"],
+    ["claude-cli", "claude-sonnet-5"],
+    ["claude-cli", "claude-opus-5"],
+    ["anthropic-vertex", "claude-sonnet-4-6"],
+    ["claude-cli", "claude-opus-4-7[1m]"],
+  ])("resolves the fixed window for %s/%s", (provider, model) => {
+    expect(resolve({ provider, model, fallbackContextTokens: 200_000 })).toBe(1_000_000);
   });
 
-  it("does not force 1M context for non-opus/sonnet Anthropic models", () => {
-    const result = resolveContextTokensForModel({
-      cfg: {
-        agents: {
-          defaults: {
-            models: {
-              "anthropic/claude-haiku-3-5": {
-                params: { context1m: true },
-              },
-            },
-          },
-        },
-      },
-      provider: "anthropic",
-      model: "claude-haiku-3-5",
-      fallbackContextTokens: 200_000,
+  it("retains authored cap provenance when a native window lowers the effective cap", () => {
+    const params = {
+      cfg: modelConfig("custom", "wide", { contextWindow: 128_000, contextTokens: 1_000_000 }),
+      provider: "custom",
+      model: "wide",
+      allowAsyncLoad: false,
+    };
+    expect(resolveModelContextTokenProjection(params)).toEqual({
+      contextTokens: 128_000,
+      authoredContextTokens: 1_000_000,
     });
-
-    expect(result).toBe(200_000);
+    expect(resolve(params)).toBe(128_000);
   });
 
-  it("prefers per-model contextTokens config over contextWindow", () => {
-    const result = resolveContextTokensForModel({
-      cfg: {
-        models: {
-          providers: {
-            "openai-codex": {
-              baseUrl: "https://chatgpt.com/backend-api",
-              models: [
-                {
-                  id: "gpt-5.4",
-                  name: "gpt-5.4",
-                  reasoning: true,
-                  input: ["text", "image"],
-                  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-                  contextWindow: 1_050_000,
-                  contextTokens: 160_000,
-                  maxTokens: 128_000,
-                },
-              ],
-            },
-          },
-        },
-      },
-      provider: "openai-codex",
-      model: "gpt-5.4",
-      fallbackContextTokens: 272_000,
-    });
+  it.each([
+    [200_000, 200_000],
+    [1_200_000, 1_000_000],
+  ])("bounds an authored cap of %i by the fixed provider contract", (contextTokens, expected) => {
+    expect(
+      resolve({
+        cfg: modelConfig("anthropic", "claude-sonnet-4-6", {
+          contextWindow: 2_000_000,
+          contextTokens,
+        }),
+        provider: "anthropic",
+        model: "claude-sonnet-4-6",
+      }),
+    ).toBe(expected);
+  });
 
-    expect(result).toBe(160_000);
+  it("uses the caller-supplied model provider for runtime aliases", () => {
+    expect(
+      resolve({
+        cfg: modelConfig("anthropic", "claude-custom", {
+          contextWindow: 180_000,
+          contextTokens: 100_000,
+        }),
+        provider: "fixture-cli",
+        modelProvider: "anthropic",
+        model: "anthropic/claude-custom",
+      }),
+    ).toBe(100_000);
+  });
+
+  it("keeps configured token caps authoritative over lower discovery", () => {
+    discover([{ provider: "openai", id: "gpt-5.5", contextWindow: 272_000 }]);
+    const cfg = modelConfig("openai", "gpt-5.5", { contextTokens: 350_000 });
+    const caches = getContextWindowCaches();
+    applyConfiguredContextWindows({
+      cache: caches.configuredTokenCache,
+      windowCache: caches.contextWindowCache,
+      modelsConfig: cfg.models,
+    });
+    expect(resolve({ provider: "openai", model: "gpt-5.5" })).toBe(350_000);
+  });
+
+  it("keeps provider discovery ahead of static caps under configured windows", () => {
+    discover([{ provider: "openai", id: "gpt-5.5", contextTokens: 200_000 }]);
+    expect(
+      resolve({
+        cfg: modelConfig("openai", "gpt-5.5", { contextWindow: 1_000_000 }),
+        provider: "openai",
+        model: "gpt-5.5",
+        modelContextTokens: 272_000,
+      }),
+    ).toBe(200_000);
+  });
+
+  it.each([
+    [1_000_000, 272_000],
+    [128_000, 128_000],
+  ])("bounds prepared tokens by a configured native window of %i", (contextWindow, expected) => {
+    const caches = getContextWindowCaches();
+    applyConfiguredContextWindows({
+      cache: caches.discoveredTokenCache,
+      windowCache: caches.contextWindowCache,
+      modelsConfig: modelConfig("openai", "gpt-5.5", { contextWindow }).models,
+    });
+    expect(
+      resolve({
+        provider: "openai",
+        model: "gpt-5.5",
+        modelContextTokens: 272_000,
+      }),
+    ).toBe(expected);
   });
 });

@@ -1,4 +1,6 @@
-import type { InlineDirectives } from "./directive-handling.js";
+import { type InlineDirectives, parseInlineSessionDirectives } from "./directive-handling.parse.js";
+
+const EMPTY_DIRECTIVES = { ...parseInlineSessionDirectives(""), command: undefined };
 
 const CLEARED_EXEC_FIELDS = {
   hasExecDirective: false,
@@ -17,42 +19,12 @@ const CLEARED_EXEC_FIELDS = {
   invalidExecNode: false,
 } satisfies Partial<InlineDirectives>;
 
+/** Clears all inline directive state while preserving cleaned text. */
 export function clearInlineDirectives(cleaned: string): InlineDirectives {
-  return {
-    cleaned,
-    hasThinkDirective: false,
-    thinkLevel: undefined,
-    rawThinkLevel: undefined,
-    hasVerboseDirective: false,
-    verboseLevel: undefined,
-    rawVerboseLevel: undefined,
-    hasFastDirective: false,
-    fastMode: undefined,
-    rawFastMode: undefined,
-    hasReasoningDirective: false,
-    reasoningLevel: undefined,
-    rawReasoningLevel: undefined,
-    hasElevatedDirective: false,
-    elevatedLevel: undefined,
-    rawElevatedLevel: undefined,
-    ...CLEARED_EXEC_FIELDS,
-    hasStatusDirective: false,
-    hasModelDirective: false,
-    rawModelDirective: undefined,
-    hasQueueDirective: false,
-    queueMode: undefined,
-    queueReset: false,
-    rawQueueMode: undefined,
-    debounceMs: undefined,
-    cap: undefined,
-    dropPolicy: undefined,
-    rawDebounce: undefined,
-    rawCap: undefined,
-    rawDrop: undefined,
-    hasQueueOptions: false,
-  };
+  return { ...EMPTY_DIRECTIVES, cleaned };
 }
 
+/** Clears only exec-related directive state after execution policy is consumed. */
 export function clearExecInlineDirectives(directives: InlineDirectives): InlineDirectives {
   return {
     ...directives,

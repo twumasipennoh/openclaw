@@ -1,9 +1,8 @@
-import type { ChatFullInfo, Message, UserFromGetMe } from "@grammyjs/types";
+import type { Context } from "grammy";
+import type { ChatFullInfo, Message, Update, UserFromGetMe } from "grammy/types";
 
-/** App-specific stream mode for Telegram stream previews. */
-export type TelegramStreamMode = "off" | "partial" | "block";
+export type { StreamingMode as TelegramStreamMode } from "openclaw/plugin-sdk/channel-outbound";
 
-export type TelegramGetFile = () => Promise<{ file_path?: string }>;
 export type TelegramChatDetails = {
   id?: number | string;
   available_reactions?: ChatFullInfo["available_reactions"] | null;
@@ -18,12 +17,9 @@ export type TelegramGetChat = (chatId: number | string) => Promise<TelegramChatD
  */
 export type TelegramContext = {
   message: Message;
+  update?: Update;
   me?: UserFromGetMe;
-  getFile: TelegramGetFile;
-};
-
-export type TelegramSyntheticContextSource = Pick<TelegramContext, "me"> & {
-  getFile?: TelegramGetFile;
+  getFile: Context["getFile"];
 };
 
 /** Telegram sticker metadata for context enrichment and caching. */

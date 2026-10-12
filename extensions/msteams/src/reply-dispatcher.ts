@@ -1,21 +1,37 @@
+import { resolveHumanDelayConfig } from "openclaw/plugin-sdk/agent-runtime";
 import {
-  createChannelReplyPipeline,
+  createChannelPartialDeliveryError,
+  type ChannelInboundTurnPlan,
+} from "openclaw/plugin-sdk/channel-inbound";
+import {
+  normalizeAgentPlanSteps,
+  resolveChannelPreviewStreamMode,
+  resolveChannelStreamingBlockEnabled,
+} from "openclaw/plugin-sdk/channel-outbound";
+import { PlatformMessageNotDispatchedError } from "openclaw/plugin-sdk/error-runtime";
+import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
+import { getGlobalHookRunner } from "openclaw/plugin-sdk/plugin-runtime";
+import { normalizeOptionalLowercaseString } from "openclaw/plugin-sdk/string-coerce-runtime";
+import {
+  createChannelMessageReplyPipeline,
   logTypingFailure,
   resolveChannelMediaMaxBytes,
   type OpenClawConfig,
   type MSTeamsReplyStyle,
+  type ReplyPayload,
   type RuntimeEnv,
 } from "../runtime-api.js";
 import type { MSTeamsAccessTokenProvider } from "./attachments/types.js";
+import { resolveMSTeamsSdkCloudOptions } from "./cloud.js";
 import type { StoredConversationReference } from "./conversation-store.js";
 import {
   classifyMSTeamsSendError,
+  formatMSTeamsDeliveryFailureGuidance,
   formatMSTeamsSendErrorHint,
   formatUnknownError,
 } from "./errors.js";
 import {
   buildConversationReference,
-  type MSTeamsAdapter,
   type MSTeamsRenderedMessage,
   renderReplyPayloadsToMessages,
   sendMSTeamsMessages,
@@ -24,9 +40,9 @@ import type { MSTeamsMonitorLogger } from "./monitor-types.js";
 import { createTeamsReplyStreamController } from "./reply-stream-controller.js";
 import { withRevokedProxyFallback } from "./revoked-context.js";
 import { getMSTeamsRuntime } from "./runtime.js";
+import { sendMSTeamsActivityWithReference } from "./sdk-proactive.js";
 import type { MSTeamsTurnContext } from "./sdk-types.js";
-
-export { pickInformativeStatusText } from "./reply-stream-controller.js";
+import type { MSTeamsApp } from "./sdk.js";
 
 export function createMSTeamsReplyDispatcher(params: {
   cfg: OpenClawConfig;
@@ -35,8 +51,7 @@ export function createMSTeamsReplyDispatcher(params: {
   accountId?: string;
   runtime: RuntimeEnv;
   log: MSTeamsMonitorLogger;
-  adapter: MSTeamsAdapter;
-  appId: string;
+  app: MSTeamsApp;
   conversationRef: StoredConversationReference;
   context: MSTeamsTurnContext;
   replyStyle: MSTeamsReplyStyle;
@@ -47,40 +62,51 @@ export function createMSTeamsReplyDispatcher(params: {
 }) {
   const core = getMSTeamsRuntime();
   const msteamsCfg = params.cfg.channels?.msteams;
-  const conversationType = params.conversationRef.conversation?.conversationType?.toLowerCase();
+  const conversationType = normalizeOptionalLowercaseString(
+    params.conversationRef.conversation?.conversationType,
+  );
   const isTypingSupported = conversationType === "personal" || conversationType === "groupchat";
 
-  const sendTypingIndicator = isTypingSupported
-    ? async () => {
-        await withRevokedProxyFallback({
-          run: async () => {
-            await params.context.sendActivity({ type: "typing" });
-          },
-          onRevoked: async () => {
-            const baseRef = buildConversationReference(params.conversationRef);
-            await params.adapter.continueConversation(
-              params.appId,
-              { ...baseRef, activityId: undefined },
-              async (ctx) => {
-                await ctx.sendActivity({ type: "typing" });
-              },
-            );
-          },
-          onRevokedLog: () => {
-            params.log.debug?.("turn context revoked, sending typing via proactive messaging");
-          },
-        });
-      }
-    : async () => {};
+  // Bot Framework turn proxies expire after ~30s idle; keep them alive through tool calls.
+  const TYPING_KEEPALIVE_INTERVAL_MS = 8_000;
 
-  const { onModelSelected, typingCallbacks, ...replyPipeline } = createChannelReplyPipeline({
+  // Teams tool chains can exceed the shared typing callback's 60s default (#59731).
+  const TYPING_KEEPALIVE_MAX_DURATION_MS = 10 * 60_000;
+
+  const sendTypingIndicator = async () => {
+    // Stream previews and Stop suppress typing; between segments, typing keeps
+    // the Bot Framework turn context alive for later tool replies.
+    if (!isTypingSupported || streamController.isStreamActive() || streamController.wasCanceled()) {
+      return;
+    }
+    await withRevokedProxyFallback({
+      run: async () => {
+        await params.context.sendActivity({ type: "typing" });
+      },
+      onRevoked: async () => {
+        await sendMSTeamsActivityWithReference(
+          params.app,
+          buildConversationReference(params.conversationRef),
+          { type: "typing" },
+          { serviceUrlBoundary: resolveMSTeamsSdkCloudOptions(msteamsCfg) },
+        );
+      },
+      onRevokedLog: () => {
+        params.log.debug?.("turn context revoked, sending typing via proactive messaging");
+      },
+    });
+  };
+
+  const { onModelSelected, typingCallbacks, ...replyPipeline } = createChannelMessageReplyPipeline({
     cfg: params.cfg,
     agentId: params.agentId,
     channel: "msteams",
     accountId: params.accountId,
     typing: {
       start: sendTypingIndicator,
-      onStartError: (err) => {
+      keepaliveIntervalMs: TYPING_KEEPALIVE_INTERVAL_MS,
+      maxDurationMs: TYPING_KEEPALIVE_MAX_DURATION_MS,
+      onStartError: (err: unknown) => {
         logTypingFailure({
           log: (message) => params.log.debug?.(message),
           channel: "msteams",
@@ -101,25 +127,72 @@ export function createMSTeamsReplyDispatcher(params: {
     resolveChannelLimitMb: ({ cfg }) => cfg.channels?.msteams?.mediaMaxMb,
   });
   const feedbackLoopEnabled = params.cfg.channels?.msteams?.feedbackEnabled !== false;
+  // Teams native streams are provider-visible before outbound modifiers run. Keep them off
+  // whenever a hook can rewrite or cancel so the original payload cannot escape the final gate.
+  const hookRunner = getGlobalHookRunner();
+  const allowProviderPreview = !(
+    (hookRunner?.hasHooks("reply_payload_sending") ?? false) ||
+    (hookRunner?.hasHooks("message_sending") ?? false)
+  );
   const streamController = createTeamsReplyStreamController({
+    tableMode,
+    allowProviderPreview,
     conversationType,
     context: params.context,
     feedbackLoopEnabled,
     log: params.log,
+    msteamsConfig: msteamsCfg,
+    // Stable seed so the same conversation gets a consistent rotating
+    // "Thinking..." flavor across reconnects. accountId scopes per-bot,
+    // conversation.id scopes per-chat.
+    progressSeed: `${params.accountId ?? "default"}:${params.conversationRef.conversation?.id ?? ""}`,
   });
 
-  const blockStreamingEnabled =
-    typeof msteamsCfg?.blockStreaming === "boolean" ? msteamsCfg.blockStreaming : false;
+  const teamsStreamMode = resolveChannelPreviewStreamMode(msteamsCfg, "partial");
+  const blockStreamingResolved =
+    teamsStreamMode === "block" ? true : resolveChannelStreamingBlockEnabled(msteamsCfg);
+  const blockStreamingEnabled = blockStreamingResolved ?? false;
   const typingIndicatorEnabled =
     typeof msteamsCfg?.typingIndicator === "boolean" ? msteamsCfg.typingIndicator : true;
 
-  const pendingMessages: MSTeamsRenderedMessage[] = [];
+  type DeliveryOutcome = {
+    messageIds?: string[];
+    visibleReplySent: boolean;
+    content?: string;
+  };
+
+  type AcceptedDeliveryPart = {
+    messageIds: string[];
+    content?: string;
+  };
+
+  type PendingDelivery = {
+    messages: MSTeamsRenderedMessage[];
+    finalization: ReturnType<typeof createDeferred<DeliveryOutcome>>;
+    content?: string;
+    nativeResult?: AcceptedDeliveryPart;
+    blockResults: AcceptedDeliveryPart[];
+    native: boolean;
+    nativeSettled: boolean;
+    blockSettled: boolean;
+    settled: boolean;
+    errors: unknown[];
+  };
+
+  const pendingDeliveries: PendingDelivery[] = [];
+  // onIdle can overlap later deliveries. Join both close and fallback sends
+  // before another payload can mutate or overtake the native segment.
+  let pendingSettlement: Promise<void> | undefined;
+  const findPendingNativeDelivery = () =>
+    pendingDeliveries.find((candidate) => candidate.native && !candidate.nativeSettled);
+
+  const joinAcceptedContents = (contents: readonly (string | undefined)[]): string =>
+    contents.filter((content): content is string => Boolean(content)).join("\n");
 
   const sendMessages = async (messages: MSTeamsRenderedMessage[]): Promise<string[]> => {
     return sendMSTeamsMessages({
       replyStyle: params.replyStyle,
-      adapter: params.adapter,
-      appId: params.appId,
+      app: params.app,
       conversationRef: params.conversationRef,
       context: params.context,
       messages,
@@ -134,6 +207,7 @@ export function createMSTeamsReplyDispatcher(params: {
       sharePointSiteId: params.sharePointSiteId,
       mediaMaxBytes,
       feedbackLoopEnabled,
+      serviceUrlBoundary: resolveMSTeamsSdkCloudOptions(msteamsCfg),
     });
   };
 
@@ -145,17 +219,22 @@ export function createMSTeamsReplyDispatcher(params: {
     const classification = classifyMSTeamsSendError(failure.error);
     const errorText = formatUnknownError(failure.error);
     const failedAll = failure.failed >= failure.total;
-    const summary = failedAll
-      ? "the previous reply was not delivered"
-      : `${failure.failed} of ${failure.total} message blocks were not delivered`;
+    const ambiguous = classification.kind === "ambiguous";
+    const summary = ambiguous
+      ? failedAll
+        ? "the delivery outcome is unknown for the previous reply"
+        : `the delivery outcome is unknown for ${failure.failed} of ${failure.total} message blocks`
+      : failedAll
+        ? "the previous reply was not delivered"
+        : `${failure.failed} of ${failure.total} message blocks were not delivered`;
     const sentences = [
       `Microsoft Teams delivery failed: ${summary}.`,
-      `The user may not have received ${failedAll ? "that reply" : "the full reply"}.`,
+      ambiguous
+        ? undefined
+        : `The user may not have received ${failedAll ? "that reply" : "the full reply"}.`,
       `Error: ${errorText}.`,
       classification.statusCode != null ? `Status: ${classification.statusCode}.` : undefined,
-      classification.kind === "transient" || classification.kind === "throttled"
-        ? "Retrying later may succeed."
-        : undefined,
+      formatMSTeamsDeliveryFailureGuidance(classification),
     ].filter(Boolean);
     core.system.enqueueSystemEvent(sentences.join(" "), {
       sessionKey: params.sessionKey,
@@ -163,26 +242,108 @@ export function createMSTeamsReplyDispatcher(params: {
     });
   };
 
-  const flushPendingMessages = async () => {
-    if (pendingMessages.length === 0) {
+  const renderReplyPayload = (payload: ReplyPayload) => {
+    return renderReplyPayloadsToMessages([payload], {
+      textChunkLimit: params.textLimit,
+      chunkText: true,
+      mediaMode: "split",
+      tableMode,
+      chunkMode,
+    });
+  };
+
+  const deliveryOutcome = (delivery: PendingDelivery): DeliveryOutcome => {
+    const acceptedParts = [
+      ...(delivery.nativeResult ? [delivery.nativeResult] : []),
+      ...delivery.blockResults,
+    ];
+    const messageIds = acceptedParts.flatMap((part) => part.messageIds);
+    const content =
+      delivery.errors.length > 0
+        ? joinAcceptedContents(acceptedParts.map((part) => part.content))
+        : delivery.content;
+    return {
+      visibleReplySent: acceptedParts.length > 0,
+      ...(messageIds.length > 0 ? { messageIds } : {}),
+      ...(acceptedParts.length > 0 && content !== undefined ? { content } : {}),
+    };
+  };
+
+  const settlePendingDelivery = (delivery: PendingDelivery) => {
+    if (
+      delivery.settled ||
+      !delivery.blockSettled ||
+      (delivery.native && !delivery.nativeSettled)
+    ) {
       return;
     }
-    const toSend = pendingMessages.splice(0);
-    const total = toSend.length;
-    let ids: string[];
-    try {
-      ids = await sendMessages(toSend);
-    } catch (batchError) {
-      ids = [];
+    delivery.settled = true;
+    const outcome = deliveryOutcome(delivery);
+    if (delivery.errors.length === 0) {
+      delivery.finalization.resolve(outcome);
+      return;
+    }
+
+    const error =
+      delivery.errors.find(
+        (candidate) => !(candidate instanceof PlatformMessageNotDispatchedError),
+      ) ?? delivery.errors[0];
+    delivery.finalization.reject(
+      outcome.visibleReplySent
+        ? createChannelPartialDeliveryError(error, {
+            ...outcome,
+            visibleReplySent: true,
+          })
+        : error,
+    );
+  };
+
+  const queueReplyPayload = (
+    payload: ReplyPayload,
+    messages: MSTeamsRenderedMessage[],
+    native: boolean,
+  ): PendingDelivery => {
+    const finalization = createDeferred<DeliveryOutcome>();
+    const delivery: PendingDelivery = {
+      messages,
+      finalization,
+      content: payload.text,
+      blockResults: [],
+      native,
+      nativeSettled: !native,
+      blockSettled: messages.length === 0,
+      settled: false,
+      errors: [],
+    };
+    pendingDeliveries.push(delivery);
+    return delivery;
+  };
+
+  const flushPendingMessages = async () => {
+    for (const delivery of pendingDeliveries) {
+      if (delivery.blockSettled) {
+        continue;
+      }
+      const toSend = delivery.messages.splice(0);
+      const total = toSend.length;
       let failed = 0;
-      let lastFailedError: unknown = batchError;
+      let lastFailedError: unknown;
+      const sentIds: string[] = [];
       for (const msg of toSend) {
         try {
           const msgIds = await sendMessages([msg]);
-          ids.push(...msgIds);
+          const validIds = msgIds.filter((id) => id.trim() && id !== "unknown");
+          if (msgIds.length > 0) {
+            delivery.blockResults.push({
+              messageIds: validIds,
+              ...(msg.text ? { content: msg.text } : {}),
+            });
+          }
+          sentIds.push(...validIds);
         } catch (msgError) {
           failed += 1;
           lastFailedError = msgError;
+          delivery.errors.push(msgError);
           params.log.debug?.("individual message send failed, continuing with remaining blocks");
         }
       }
@@ -197,47 +358,67 @@ export function createMSTeamsReplyDispatcher(params: {
           error: lastFailedError,
         });
       }
-    }
-    if (ids.length > 0) {
-      params.onSentMessageIds?.(ids);
+      delivery.blockSettled = true;
+      settlePendingDelivery(delivery);
+      if (sentIds.length > 0) {
+        try {
+          params.onSentMessageIds?.(sentIds);
+        } catch (error) {
+          params.log.warn?.("failed to record sent Teams message ids", {
+            error: formatUnknownError(error),
+          });
+        }
+      }
     }
   };
 
-  const {
-    dispatcher,
-    replyOptions,
-    markDispatchIdle: baseMarkDispatchIdle,
-  } = core.channel.reply.createReplyDispatcherWithTyping({
+  const dispatcherOptions: NonNullable<ChannelInboundTurnPlan["dispatcherOptions"]> = {
     ...replyPipeline,
-    humanDelay: core.channel.reply.resolveHumanDelayConfig(params.cfg, params.agentId),
+    humanDelay: resolveHumanDelayConfig(params.cfg, params.agentId),
     onReplyStart: async () => {
-      await streamController.onReplyStart();
-      // Avoid duplicate typing UX in DMs: stream status already shows progress.
-      if (typingIndicatorEnabled && !streamController.hasStream()) {
+      // The indicator gate suppresses sends during streams and resumes them between segments.
+      if (typingIndicatorEnabled) {
         await typingCallbacks?.onReplyStart?.();
       }
     },
     typingCallbacks,
+  };
+  const delivery: ChannelInboundTurnPlan["delivery"] = {
+    observeMessageSent: true,
     deliver: async (payload) => {
+      if (pendingSettlement) {
+        await pendingSettlement;
+      }
       const preparedPayload = streamController.preparePayload(payload);
-      if (!preparedPayload) {
-        return;
+      const native = streamController.claimNativeDelivery();
+      if (preparedPayload && !native && findPendingNativeDelivery()) {
+        // Close the earlier native segment before later blocks can overtake
+        // its final text or escape a Stop discovered by that closing request.
+        await settleDelivery();
+      }
+      const messages =
+        preparedPayload && !streamController.wasCanceled()
+          ? renderReplyPayload(preparedPayload)
+          : [];
+      if (!native && messages.length === 0) {
+        return {
+          visibleReplySent: false,
+          suppression: { reason: "no_visible_result" },
+        };
       }
 
-      const messages = renderReplyPayloadsToMessages([preparedPayload], {
-        textChunkLimit: params.textLimit,
-        chunkText: true,
-        mediaMode: "split",
-        tableMode,
-        chunkMode,
-      });
-      pendingMessages.push(...messages);
+      const pending = queueReplyPayload(payload, messages, native);
 
       // When block streaming is enabled, flush immediately so blocks are
       // delivered progressively instead of batching until markDispatchIdle.
       if (blockStreamingEnabled) {
         await flushPendingMessages();
       }
+      settlePendingDelivery(pending);
+      return {
+        visibleReplySent: false,
+        finalization: pending.finalization.promise,
+      };
     },
     onError: (err, info) => {
       const errMsg = formatUnknownError(err);
@@ -253,45 +434,141 @@ export function createMSTeamsReplyDispatcher(params: {
         hint,
       });
     },
-  });
-
-  const markDispatchIdle = (): Promise<void> => {
-    return flushPendingMessages()
-      .catch((err) => {
-        const errMsg = formatUnknownError(err);
-        const classification = classifyMSTeamsSendError(err);
-        const hint = formatMSTeamsSendErrorHint(classification);
-        params.runtime.error?.(`msteams flush reply failed: ${errMsg}${hint ? ` (${hint})` : ""}`);
-        params.log.error("flush reply failed", {
-          error: errMsg,
-          classification,
-          hint,
-        });
-      })
-      .then(() => {
-        return streamController.finalize().catch((err) => {
-          params.log.debug?.("stream finalize failed", { error: formatUnknownError(err) });
-        });
-      })
-      .finally(() => {
-        baseMarkDispatchIdle();
-      });
   };
 
+  const settleDelivery = (): Promise<void> =>
+    (pendingSettlement ??= Promise.resolve()
+      .then(async () => {
+        await flushPendingMessages();
+
+        const nativeDelivery = findPendingNativeDelivery();
+        if (!nativeDelivery) {
+          await streamController.finalize();
+          return;
+        }
+        let nativeResult;
+        try {
+          nativeResult = await streamController.finalize();
+        } catch (error) {
+          nativeDelivery.errors.push(error);
+          nativeDelivery.nativeSettled = true;
+          settlePendingDelivery(nativeDelivery);
+          return;
+        }
+
+        if (nativeResult.visibleReplySent) {
+          nativeDelivery.nativeResult = {
+            messageIds: nativeResult.messageId ? [nativeResult.messageId] : [],
+            ...(nativeResult.content !== undefined ? { content: nativeResult.content } : {}),
+          };
+        }
+        const hasPostNativePayloads = Boolean(nativeResult.postNativePayloads?.length);
+        if (nativeResult.logicalContent !== undefined) {
+          nativeDelivery.content = nativeResult.logicalContent;
+        } else if (
+          nativeResult.content !== undefined &&
+          ((!nativeResult.fallbackPayload && !hasPostNativePayloads) ||
+            nativeDelivery.content === undefined)
+        ) {
+          nativeDelivery.content = nativeResult.content;
+        }
+        const afterNativePayloads = [
+          ...(nativeResult.fallbackPayload ? [nativeResult.fallbackPayload] : []),
+          ...(nativeResult.postNativePayloads ?? []),
+        ];
+        if (afterNativePayloads.length > 0) {
+          nativeDelivery.messages.push(
+            ...afterNativePayloads.flatMap((payload) => renderReplyPayload(payload)),
+          );
+          nativeDelivery.blockSettled = nativeDelivery.messages.length === 0;
+        }
+        nativeDelivery.nativeSettled = true;
+        if (!nativeDelivery.blockSettled) {
+          await flushPendingMessages();
+        }
+        settlePendingDelivery(nativeDelivery);
+        if (nativeResult.messageId) {
+          try {
+            params.onSentMessageIds?.([nativeResult.messageId]);
+          } catch (error) {
+            params.log.warn?.("failed to record sent Teams message id", {
+              error: formatUnknownError(error),
+            });
+          }
+        }
+      })
+      .finally(() => {
+        pendingSettlement = undefined;
+      }));
+
+  const shouldSuppressDefaultToolProgressMessages =
+    streamController.hasStream() && teamsStreamMode === "progress";
+
+  type PipelinePayload = Record<string, unknown>;
+
+  const progressCallbacks = streamController.hasStream()
+    ? {
+        onReasoningStream: async (payload: PipelinePayload) => {
+          const text = typeof payload?.text === "string" ? payload.text : undefined;
+          await streamController.pushReasoningProgress(text, {
+            snapshot: payload?.isReasoningSnapshot === true,
+          });
+          return false;
+        },
+        onReasoningEnd: () => {
+          streamController.resetReasoningProgress();
+          return false;
+        },
+        onToolStart: streamController.pushToolEvent,
+        onItemEvent: streamController.pushItemEvent,
+        onPlanUpdate: async (payload: PipelinePayload) => {
+          if (payload?.phase !== "update") {
+            return false;
+          }
+          await streamController.pushPlanProgress(normalizeAgentPlanSteps(payload.steps), {
+            explanation: typeof payload.explanation === "string" ? payload.explanation : undefined,
+            explanationFormat: payload.explanationFormat === "plain" ? "plain" : undefined,
+          });
+          return false;
+        },
+        onApprovalEvent: async (payload: PipelinePayload) => {
+          await streamController.pushApprovalEvent({
+            ...(typeof payload?.phase === "string" ? { phase: payload.phase } : {}),
+            ...(typeof payload?.approvalId === "string" ? { approvalId: payload.approvalId } : {}),
+            ...(typeof payload?.title === "string" ? { title: payload.title } : {}),
+            ...(typeof payload?.command === "string" ? { command: payload.command } : {}),
+            ...(typeof payload?.reason === "string" ? { reason: payload.reason } : {}),
+            ...(typeof payload?.message === "string" ? { message: payload.message } : {}),
+          });
+          return false;
+        },
+      }
+    : {};
+
   return {
-    dispatcher,
+    dispatcherOptions: {
+      ...dispatcherOptions,
+      onSettled: settleDelivery,
+    },
+    delivery,
     replyOptions: {
-      ...replyOptions,
+      progressPreambleEnabled: shouldSuppressDefaultToolProgressMessages,
+      commentaryProgressEnabled: shouldSuppressDefaultToolProgressMessages,
       ...(streamController.hasStream()
         ? {
-            onPartialReply: (payload: { text?: string }) =>
-              streamController.onPartialReply(payload),
+            onPartialReply: (payload: { text?: string }) => {
+              streamController.onPartialReply(payload);
+              return false;
+            },
           }
         : {}),
-      disableBlockStreaming:
-        typeof msteamsCfg?.blockStreaming === "boolean" ? !msteamsCfg.blockStreaming : undefined,
+      ...progressCallbacks,
+      // Progress is already visible in the native card.
+      ...(shouldSuppressDefaultToolProgressMessages
+        ? { suppressDefaultToolProgressMessages: true }
+        : {}),
+      disableBlockStreaming: blockStreamingResolved == null ? undefined : !blockStreamingResolved,
       onModelSelected,
     },
-    markDispatchIdle,
   };
 }

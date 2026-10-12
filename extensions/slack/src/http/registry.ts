@@ -15,18 +15,38 @@ type RegisterSlackHttpHandlerArgs = {
   accountId?: string;
 };
 
-const slackHttpRoutes = new Map<string, SlackHttpRequestHandler>();
+const SLACK_HTTP_ROUTES_GLOBAL_KEY = Symbol.for("openclaw.slack.httpRoutes.v1");
+
+function getSlackHttpRoutes(): Map<string, SlackHttpRequestHandler> {
+  const globalStore = globalThis as Record<PropertyKey, unknown>;
+  const existing = globalStore[SLACK_HTTP_ROUTES_GLOBAL_KEY];
+  if (existing instanceof Map) {
+    return existing as Map<string, SlackHttpRequestHandler>;
+  }
+  const routes = new Map<string, SlackHttpRequestHandler>();
+  globalStore[SLACK_HTTP_ROUTES_GLOBAL_KEY] = routes;
+  return routes;
+}
 
 export function registerSlackHttpHandler(params: RegisterSlackHttpHandlerArgs): () => void {
   const normalizedPath = normalizeSlackWebhookPath(params.path);
-  if (slackHttpRoutes.has(normalizedPath)) {
+  const routes = getSlackHttpRoutes();
+  if (routes.has(normalizedPath)) {
     const suffix = params.accountId ? ` for account "${params.accountId}"` : "";
     params.log?.(`slack: webhook path ${normalizedPath} already registered${suffix}`);
     return () => {};
   }
-  slackHttpRoutes.set(normalizedPath, params.handler);
+  const handler = params.handler;
+  routes.set(normalizedPath, handler);
+  let registered = true;
   return () => {
-    slackHttpRoutes.delete(normalizedPath);
+    if (!registered) {
+      return;
+    }
+    registered = false;
+    if (routes.get(normalizedPath) === handler) {
+      routes.delete(normalizedPath);
+    }
   };
 }
 
@@ -35,7 +55,7 @@ export async function handleSlackHttpRequest(
   res: ServerResponse,
 ): Promise<boolean> {
   const url = new URL(req.url ?? "/", "http://localhost");
-  const handler = slackHttpRoutes.get(url.pathname);
+  const handler = getSlackHttpRoutes().get(url.pathname);
   if (!handler) {
     return false;
   }

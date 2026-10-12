@@ -1,7 +1,35 @@
 {
   "id": "amazon-bedrock",
+  "categories": ["models"],
+  "name": "Amazon Bedrock",
+  "description": "OpenClaw Amazon Bedrock provider plugin with model discovery, embeddings, and guardrail support.",
+  "activation": {
+    "onStartup": false
+  },
   "enabledByDefault": true,
   "providers": ["amazon-bedrock"],
+  "modelCatalog": {
+    "discovery": {
+      "amazon-bedrock": "refreshable"
+    }
+  },
+  "contracts": {
+    "embeddingProviders": ["bedrock"]
+  },
+  "configGroups": [
+    {
+      "id": "model-discovery",
+      "title": "Model discovery",
+      "order": 10,
+      "properties": ["discovery"]
+    },
+    {
+      "id": "guardrails",
+      "title": "Guardrails",
+      "order": 20,
+      "properties": ["guardrail"]
+    }
+  ],
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
@@ -33,6 +61,9 @@
         "required": ["guardrailIdentifier", "guardrailVersion"]
       }
     }
+  },
+  "configContracts": {
+    "compatibilityMigrationPaths": ["models.bedrockDiscovery"]
   },
   "uiHints": {
     "discovery": {

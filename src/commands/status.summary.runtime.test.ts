@@ -1,95 +1,92 @@
 import { describe, expect, it } from "vitest";
-import { statusSummaryRuntime } from "./status.summary.runtime.js";
+import { statusSummaryRuntime } from "../status/summary.runtime.js";
 
-describe("statusSummaryRuntime.resolveContextTokensForModel", () => {
-  it("matches provider context window overrides across canonical provider aliases", () => {
-    const contextTokens = statusSummaryRuntime.resolveContextTokensForModel({
-      cfg: {
-        models: {
-          providers: {
-            "z.ai": {
-              models: [{ id: "glm-4.7", contextWindow: 123_456 }],
-            },
-          },
-        },
-      } as never,
-      provider: "z-ai",
-      model: "glm-4.7",
-      fallbackContextTokens: 999,
-    });
+function runtimeConfig(id: "codex" | "openclaw") {
+  return { agents: { defaults: { models: { "openai/gpt-5.5": { agentRuntime: { id } } } } } };
+}
 
-    expect(contextTokens).toBe(123_456);
-  });
-
-  it("prefers per-model contextTokens over contextWindow", () => {
-    const contextTokens = statusSummaryRuntime.resolveContextTokensForModel({
-      cfg: {
-        models: {
-          providers: {
-            "openai-codex": {
-              models: [{ id: "gpt-5.4", contextWindow: 1_050_000, contextTokens: 272_000 }],
-            },
-          },
-        },
-      } as never,
-      provider: "openai-codex",
-      model: "gpt-5.4",
-      fallbackContextTokens: 999,
-    });
-
-    expect(contextTokens).toBe(272_000);
-  });
-});
-
-describe("statusSummaryRuntime.resolveSessionModelRef", () => {
-  const cfg = {
-    agents: {
-      defaults: {
-        model: { primary: "anthropic/claude-sonnet-4-6" },
-      },
-    },
-  } as never;
-
-  it("preserves explicit runtime providers for vendor-prefixed model ids", () => {
+describe("statusSummaryRuntime", () => {
+  it("classifies cron history sessions distinctly", () => {
+    expect(statusSummaryRuntime.classifySessionKey("agent:main:cron:daily-digest")).toBe("cron");
     expect(
-      statusSummaryRuntime.resolveSessionModelRef(cfg, {
-        modelProvider: "openrouter",
-        model: "anthropic/claude-haiku-4.5",
-      }),
-    ).toEqual({
-      provider: "openrouter",
-      model: "anthropic/claude-haiku-4.5",
-    });
+      statusSummaryRuntime.classifySessionKey("agent:avery:cron:daily-digest:run:abc123"),
+    ).toBe("cron");
   });
 
-  it("splits legacy combined overrides when provider is missing", () => {
+  it("preserves configured agent model runtimes before harness selection", () => {
     expect(
-      statusSummaryRuntime.resolveSessionModelRef(cfg, {
-        modelOverride: "ollama-beelink2/qwen2.5-coder:7b",
-      }),
-    ).toEqual({
-      provider: "ollama-beelink2",
-      model: "qwen2.5-coder:7b",
-    });
-  });
-
-  it("uses the configured default provider for providerless runtime models", () => {
-    expect(
-      statusSummaryRuntime.resolveSessionModelRef(
-        {
+      statusSummaryRuntime.resolveSessionRuntime({
+        cfg: {
           agents: {
-            defaults: {
-              model: { primary: "openai/gpt-5.4" },
+            ...runtimeConfig("openclaw").agents,
+            entries: {
+              research: {
+                models: {
+                  "openai/gpt-5.5": { agentRuntime: { id: "codex" } },
+                },
+              },
             },
           },
-        } as never,
-        {
-          model: "gpt-5.4",
         },
-      ),
+        entry: {
+          sessionId: "session-1",
+          updatedAt: 0,
+        },
+        provider: "openai",
+        model: "gpt-5.5",
+        agentId: "research",
+        sessionKey: "agent:research:main",
+      }),
+    ).toEqual({ id: "codex", label: "OpenAI Codex" });
+  });
+
+  it("does not treat an unlocked producing harness as the current runtime", () => {
+    expect(
+      statusSummaryRuntime.resolveSessionRuntime({
+        cfg: runtimeConfig("codex"),
+        entry: {
+          sessionId: "openclaw-produced-session",
+          updatedAt: 0,
+          agentHarnessId: "openclaw",
+        },
+        provider: "openai",
+        model: "gpt-5.5",
+        sessionKey: "agent:main:main",
+      }),
+    ).toEqual({ id: "codex", label: "OpenAI Codex (previous runtime: OpenClaw Default)" });
+  });
+
+  it("reports the owning Codex harness for a locked session with stale OpenClaw metadata", () => {
+    expect(
+      statusSummaryRuntime.resolveSessionRuntime({
+        cfg: runtimeConfig("openclaw"),
+        entry: {
+          sessionId: "locked-codex-session",
+          updatedAt: 0,
+          agentHarnessId: "codex",
+          agentRuntimeOverride: "openclaw",
+          modelSelectionLocked: true,
+        },
+        provider: "openai",
+        model: "gpt-5.5",
+        sessionKey: "agent:main:main",
+      }),
+    ).toEqual({ id: "codex", label: "OpenAI Codex" });
+  });
+
+  const configured = { provider: "anthropic", model: "claude-sonnet-4-6" };
+
+  it("falls back to configured defaults when persisted session model fields are malformed", () => {
+    expect(
+      statusSummaryRuntime.resolveSessionModelRef(configured, {
+        modelProvider: { provider: "openai" },
+        model: false,
+        providerOverride: ["anthropic"],
+        modelOverride: 123,
+      } as never),
     ).toEqual({
-      provider: "openai",
-      model: "gpt-5.4",
+      provider: "anthropic",
+      model: "claude-sonnet-4-6",
     });
   });
 });

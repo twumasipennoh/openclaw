@@ -1,18 +1,16 @@
-import type { OpenClawConfig } from "../config/config.js";
+/**
+ * Tool filesystem policy resolver.
+ *
+ * Combines global and agent fs/tool policy into workspace-only and root-expansion decisions.
+ */
+import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { resolveAgentConfig } from "./agent-scope.js";
 import { pickSandboxToolPolicy } from "./sandbox-tool-policy.js";
 import { isToolAllowedByPolicies } from "./tool-policy-match.js";
 import { mergeAlsoAllowPolicy, resolveToolProfilePolicy } from "./tool-policy.js";
 
-export type ToolFsPolicy = {
-  workspaceOnly: boolean;
-};
-
-export function createToolFsPolicy(params: { workspaceOnly?: boolean }): ToolFsPolicy {
-  return {
-    workspaceOnly: params.workspaceOnly === true,
-  };
-}
+export type { PreparedSessionPermissionPolicy, ToolFsPolicy } from "./tool-fs-policy.types.js";
+export { resolveSessionPermissionExecMode } from "./session-permission-exec-mode.js";
 
 export function resolveToolFsConfig(params: { cfg?: OpenClawConfig; agentId?: string }): {
   workspaceOnly?: boolean;
@@ -36,7 +34,11 @@ export function resolveEffectiveToolFsWorkspaceOnly(params: {
 export function resolveEffectiveToolFsRootExpansionAllowed(params: {
   cfg?: OpenClawConfig;
   agentId?: string;
+  workspaceOnly?: boolean;
 }): boolean {
+  if ((params.workspaceOnly ?? resolveToolFsConfig(params).workspaceOnly) === true) {
+    return false;
+  }
   const cfg = params.cfg;
   if (!cfg) {
     return true;
@@ -45,16 +47,7 @@ export function resolveEffectiveToolFsRootExpansionAllowed(params: {
   const globalTools = cfg.tools;
   const profile = agentTools?.profile ?? globalTools?.profile;
   const profileAlsoAllow = new Set(agentTools?.alsoAllow ?? globalTools?.alsoAllow ?? []);
-  const fsConfig = resolveToolFsConfig(params);
-  const hasExplicitFsConfig = agentTools?.fs !== undefined || globalTools?.fs !== undefined;
-  if (fsConfig.workspaceOnly === true) {
-    return false;
-  }
-  if (hasExplicitFsConfig) {
-    profileAlsoAllow.add("read");
-    profileAlsoAllow.add("write");
-    profileAlsoAllow.add("edit");
-  }
+  // tools.fs presence does not grant access; require profile or alsoAllow (#47487).
   const profilePolicy = mergeAlsoAllowPolicy(
     resolveToolProfilePolicy(profile),
     profileAlsoAllow.size > 0 ? Array.from(profileAlsoAllow) : undefined,

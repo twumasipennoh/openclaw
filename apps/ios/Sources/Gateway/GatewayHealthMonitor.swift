@@ -3,7 +3,7 @@ import OpenClawKit
 
 @MainActor
 final class GatewayHealthMonitor {
-    struct Config: Sendable {
+    struct Config {
         var intervalSeconds: Double
         var timeoutSeconds: Double
         var maxFailures: Int
@@ -17,8 +17,8 @@ final class GatewayHealthMonitor {
         config: Config = Config(intervalSeconds: 15, timeoutSeconds: 5, maxFailures: 3),
         sleep: @escaping @Sendable (UInt64) async -> Void = { nanoseconds in
             try? await Task.sleep(nanoseconds: nanoseconds)
-        }
-    ) {
+        })
+    {
         self.config = config
         self.sleep = sleep
     }
@@ -34,6 +34,7 @@ final class GatewayHealthMonitor {
             var failures = 0
             while !Task.isCancelled {
                 let ok = await Self.runCheck(check: check, timeoutSeconds: config.timeoutSeconds)
+                guard !Task.isCancelled else { return }
                 if ok {
                     failures = 0
                 } else {
@@ -67,19 +68,15 @@ final class GatewayHealthMonitor {
     {
         let timeout = max(0.0, timeoutSeconds)
         if timeout == 0 {
-            return (try? await check()) ?? false
+            return await (try? check()) ?? false
         }
-        do {
-            let timeoutError = NSError(
-                domain: "GatewayHealthMonitor",
-                code: 1,
-                userInfo: [NSLocalizedDescriptionKey: "health check timed out"])
-            return try await AsyncTimeout.withTimeout(
-                seconds: timeout,
-                onTimeout: { timeoutError },
-                operation: check)
-        } catch {
-            return false
-        }
+        let timeoutError = NSError(
+            domain: "GatewayHealthMonitor",
+            code: 1,
+            userInfo: [NSLocalizedDescriptionKey: "health check timed out"])
+        return await (try? AsyncTimeout.withTimeout(
+            seconds: timeout,
+            onTimeout: { timeoutError },
+            operation: check)) ?? false
     }
 }

@@ -1,3 +1,4 @@
+// Slack tests cover registry plugin behavior.
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
@@ -84,5 +85,63 @@ describe("registerSlackHttpHandler", () => {
     expect(log).toHaveBeenCalledWith(
       'slack: webhook path /slack/events already registered for account "duplicate"',
     );
+  });
+
+  it("preserves registered handlers across module reloads", async () => {
+    const handler = vi.fn();
+    unregisters.push(
+      registerSlackHttpHandler({
+        path: "/slack/events/reload",
+        handler,
+      }),
+    );
+
+    vi.resetModules();
+    const reloadedRegistry = await import("./registry.js");
+    const req = { url: "/slack/events/reload" } as IncomingMessage;
+    const res = {} as ServerResponse;
+
+    const handled = await reloadedRegistry.handleSlackHttpRequest(req, res);
+
+    expect(handled).toBe(true);
+    expect(handler).toHaveBeenCalledWith(req, res);
+  });
+
+  it("keeps a replacement route alive when its previous registration is disposed again", async () => {
+    const path = "/slack/events/replaced";
+    const handler = vi.fn();
+    const unregisterPrevious = registerSlackHttpHandler({ path, handler });
+    unregisters.push(unregisterPrevious);
+    unregisterPrevious();
+    const unregisterCurrent = registerSlackHttpHandler({ path, handler });
+    unregisters.push(unregisterCurrent);
+
+    unregisterPrevious();
+    const req = { url: path } as IncomingMessage;
+    const res = {} as ServerResponse;
+    expect(await handleSlackHttpRequest(req, res)).toBe(true);
+    expect(handler).toHaveBeenCalledExactlyOnceWith(req, res);
+
+    unregisterCurrent();
+    expect(await handleSlackHttpRequest(req, res)).toBe(false);
+  });
+
+  it("recreates the shared registry if the global slot is corrupted", async () => {
+    const globalStore = globalThis as Record<PropertyKey, unknown>;
+    globalStore[Symbol.for("openclaw.slack.httpRoutes.v1")] = {};
+    const handler = vi.fn();
+    unregisters.push(
+      registerSlackHttpHandler({
+        path: "/slack/events/recovered",
+        handler,
+      }),
+    );
+    const req = { url: "/slack/events/recovered" } as IncomingMessage;
+    const res = {} as ServerResponse;
+
+    const handled = await handleSlackHttpRequest(req, res);
+
+    expect(handled).toBe(true);
+    expect(handler).toHaveBeenCalledWith(req, res);
   });
 });

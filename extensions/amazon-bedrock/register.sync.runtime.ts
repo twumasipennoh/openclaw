@@ -1,19 +1,45 @@
-import type { StreamFn } from "@mariozechner/pi-agent-core";
-import type { OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry";
+/**
+ * Synchronous Amazon Bedrock provider registration. It wires Bedrock streaming,
+ * model discovery, thinking policy, guardrails, and embedding integration.
+ */
+import type { BedrockClient } from "@aws-sdk/client-bedrock";
+import type { StreamFn } from "openclaw/plugin-sdk/agent-core";
+import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
+import { hasRuntimeContextMarker, type Context, type Model } from "openclaw/plugin-sdk/llm";
+import { resolvePluginConfigObject } from "openclaw/plugin-sdk/plugin-config-runtime";
+import type {
+  OpenClawPluginApi,
+  ProviderNormalizeResolvedModelContext,
+} from "openclaw/plugin-sdk/plugin-entry";
+import { resolveAwsSdkEnvVarName } from "openclaw/plugin-sdk/provider-auth-runtime";
+import { runLiveProviderCatalog } from "openclaw/plugin-sdk/provider-catalog-live-runtime";
 import {
   buildProviderReplayFamilyHooks,
   normalizeProviderId,
+  resolveClaudeFable5ModelIdentity,
+  resolveClaudeModelIdentity,
+  resolveClaudeMythos5ModelIdentity,
+  resolveClaudeOpus5ModelIdentity,
+  resolveClaudeSonnet5ModelIdentity,
+  type BedrockDiscoveryConfig,
 } from "openclaw/plugin-sdk/provider-model-shared";
+import { createPayloadPatchStreamWrapper } from "openclaw/plugin-sdk/provider-stream-shared";
+import { splitSystemPromptCacheBoundary } from "openclaw/plugin-sdk/provider-transport-runtime";
+import { asOptionalRecord } from "openclaw/plugin-sdk/string-coerce-runtime";
 import {
-  createBedrockNoCacheWrapper,
-  isAnthropicBedrockModel,
-  streamWithPayloadPatch,
-} from "openclaw/plugin-sdk/provider-stream-shared";
+  resolveBedrockPromptCachePolicy,
+  supportsBedrockClaudePromptCaching,
+} from "./bedrock-options.js";
+import { loadBedrockControlPlaneSdk, runBedrockControlPlaneRequest } from "./control-plane.js";
+import { bedrockMemoryEmbeddingProviderAdapter } from "./memory-embedding-adapter.js";
+import { streamSimpleBedrock } from "./stream.runtime.js";
 import {
-  mergeImplicitBedrockProvider,
-  resolveBedrockConfigApiKey,
-  resolveImplicitBedrockProvider,
-} from "./api.js";
+  isLatestAdaptiveBedrockModelRef,
+  isOpus47OrNewerBedrockModelRef,
+  resolveBedrockNativeThinkingLevelMap,
+  resolveBedrockClaudeThinkingProfile,
+  supportsBedrockNativeMaxEffort,
+} from "./thinking-policy.js";
 
 type GuardrailConfig = {
   guardrailIdentifier: string;
@@ -23,47 +49,268 @@ type GuardrailConfig = {
 };
 
 type AmazonBedrockPluginConfig = {
-  discovery?: {
-    enabled?: boolean;
-    region?: string;
-    providerFilter?: string[];
-    refreshInterval?: number;
-    defaultContextWindow?: number;
-    defaultMaxTokens?: number;
-  };
+  discovery?: BedrockDiscoveryConfig;
   guardrail?: GuardrailConfig;
 };
 
-function createGuardrailWrapStreamFn(
-  innerWrapStreamFn: (ctx: { modelId: string; streamFn?: StreamFn }) => StreamFn | null | undefined,
-  guardrailConfig: GuardrailConfig,
-): (ctx: { modelId: string; streamFn?: StreamFn }) => StreamFn | null | undefined {
-  return (ctx) => {
-    const inner = innerWrapStreamFn(ctx);
-    if (!inner) return inner;
-    return (model, context, options) => {
-      return streamWithPayloadPatch(inner, model, context, options, (payload) => {
-        const gc: Record<string, unknown> = {
-          guardrailIdentifier: guardrailConfig.guardrailIdentifier,
-          guardrailVersion: guardrailConfig.guardrailVersion,
-        };
-        if (guardrailConfig.streamProcessingMode) {
-          gc.streamProcessingMode = guardrailConfig.streamProcessingMode;
-        }
-        if (guardrailConfig.trace) {
-          gc.trace = guardrailConfig.trace;
-        }
-        payload.guardrailConfig = gc;
-      });
-    };
+function normalizeBedrockResolvedModel({ modelId, model }: ProviderNormalizeResolvedModelContext) {
+  const thinkingLevelMap = resolveBedrockNativeThinkingLevelMap(modelId, model.params);
+  if (!thinkingLevelMap) {
+    return undefined;
+  }
+  const reasoning =
+    model.reasoning ||
+    resolveClaudeFable5ModelIdentity({ id: modelId, params: model.params }) !== undefined ||
+    resolveClaudeMythos5ModelIdentity({ id: modelId, params: model.params }) !== undefined ||
+    resolveClaudeOpus5ModelIdentity({ id: modelId, params: model.params }) !== undefined;
+  const current = model.thinkingLevelMap;
+  const currentEfforts = current as Record<string, string | null | undefined> | undefined;
+  if (
+    reasoning === model.reasoning &&
+    Object.entries(thinkingLevelMap).every(([level, effort]) => currentEfforts?.[level] === effort)
+  ) {
+    return undefined;
+  }
+  return {
+    ...model,
+    reasoning,
+    thinkingLevelMap: { ...thinkingLevelMap, ...current },
   };
 }
 
+const BEDROCK_SERVICE_TIER_VALUES = ["flex", "priority", "default", "reserved"] as const;
+type BedrockServiceTier = (typeof BEDROCK_SERVICE_TIER_VALUES)[number];
+
+function isAnthropicBedrockModel(modelId: string): boolean {
+  const normalized = modelId.trim().toLowerCase();
+  if (normalized.includes("anthropic.claude") || normalized.includes("anthropic/claude")) {
+    return true;
+  }
+  if (
+    /^arn:aws(-cn|-us-gov)?:bedrock:/.test(normalized) &&
+    normalized.includes(":application-inference-profile/")
+  ) {
+    const profileId = normalized.split(":application-inference-profile/")[1] ?? "";
+    return profileId.includes("claude");
+  }
+  return false;
+}
+
+const bedrockStreamFn: StreamFn = (model, context, options) => {
+  if (model.api !== "bedrock-converse-stream") {
+    throw new Error(`Amazon Bedrock stream received unsupported API: ${model.api}`);
+  }
+  // The API check narrows the generic host model to the transport contract.
+  return streamSimpleBedrock(model as Parameters<typeof streamSimpleBedrock>[0], context, options);
+};
+
+function createBedrockNoCacheWrapper(baseStreamFn: StreamFn | undefined): StreamFn {
+  const underlying = baseStreamFn ?? bedrockStreamFn;
+  return (model, context, options) =>
+    underlying(model, context, {
+      ...options,
+      cacheRetention: "none",
+    });
+}
+
+function resolveBedrockServiceTier(
+  extraParams: Record<string, unknown> | undefined,
+  warn: (message: string) => void,
+): BedrockServiceTier | undefined {
+  const raw = extraParams?.serviceTier ?? extraParams?.service_tier;
+  if (typeof raw !== "string") {
+    return undefined;
+  }
+  const normalized = raw.trim().toLowerCase();
+  const tier = BEDROCK_SERVICE_TIER_VALUES.find((candidate) => candidate === normalized);
+  if (tier) {
+    return tier;
+  }
+  warn(`ignoring invalid Bedrock service_tier param: ${raw}`);
+  return undefined;
+}
+
+function createBedrockServiceTierWrapper(
+  underlying: StreamFn,
+  serviceTier: BedrockServiceTier,
+): StreamFn {
+  return createPayloadPatchStreamWrapper(
+    underlying,
+    ({ payload }) => {
+      payload.serviceTier ??= { type: serviceTier };
+    },
+    { shouldPatch: ({ model }) => model.api === "bedrock-converse-stream" },
+  );
+}
+
+function createGuardrailStreamWrapper(
+  streamFn: StreamFn,
+  guardrailConfig: GuardrailConfig,
+): StreamFn {
+  return createPayloadPatchStreamWrapper(streamFn, ({ payload }) => {
+    payload.guardrailConfig = {
+      guardrailIdentifier: guardrailConfig.guardrailIdentifier,
+      guardrailVersion: guardrailConfig.guardrailVersion,
+      ...(guardrailConfig.streamProcessingMode
+        ? { streamProcessingMode: guardrailConfig.streamProcessingMode }
+        : {}),
+      ...(guardrailConfig.trace ? { trace: guardrailConfig.trace } : {}),
+    };
+  });
+}
+
+/**
+ * Detect Bedrock application inference profile ARNs — these are the only IDs
+ * where model-name-based checks fail because the ARN is opaque.
+ * System-defined profiles (us., eu., global.) and base model IDs always
+ * contain the model name and are handled by the shared model runtime natively.
+ */
+const BEDROCK_APP_INFERENCE_PROFILE_RE =
+  /^arn:aws(-cn|-us-gov)?:bedrock:.*:application-inference-profile\//i;
+
+function isBedrockAppInferenceProfile(modelId: string): boolean {
+  return BEDROCK_APP_INFERENCE_PROFILE_RE.test(modelId);
+}
+
+/**
+ * Extract the region from a Bedrock ARN.
+ * e.g. "arn:aws:bedrock:us-east-1:123:application-inference-profile/abc" → "us-east-1"
+ */
+function extractRegionFromArn(arn: string): string | undefined {
+  const parts = arn.split(":");
+  // ARN format: arn:partition:service:region:account:resource
+  return parts.length >= 4 && parts[3] ? parts[3] : undefined;
+}
+
+/**
+ * Resolve the underlying foundation model for an application inference profile
+ * via GetInferenceProfile. Results are cached so we only call the API once per
+ * profile ARN. Returns traits needed for request shaping when the model id is
+ * otherwise opaque.
+ *
+ * Region is extracted from the profile ARN itself to avoid mismatches when
+ * the OpenClaw config region differs from the profile's home region.
+ */
+type BedrockAppProfileTraits = {
+  cacheEligible: boolean;
+  omitTemperature: boolean;
+};
+
+const appProfileTraitsCache = new Map<string, BedrockAppProfileTraits>();
+
+async function resolveAppProfileTraits(
+  modelId: string,
+  fallbackRegion: string | undefined,
+  signal: AbortSignal | undefined,
+): Promise<BedrockAppProfileTraits> {
+  const cached = appProfileTraitsCache.get(modelId);
+  if (cached) {
+    return cached;
+  }
+  let client: BedrockClient | undefined;
+  try {
+    signal?.throwIfAborted();
+    const region = extractRegionFromArn(modelId) ?? fallbackRegion;
+    const sdk = await loadBedrockControlPlaneSdk();
+    signal?.throwIfAborted();
+    const controlPlaneClient = sdk.createClient(region);
+    client = controlPlaneClient;
+    const command = sdk.createGetInferenceProfileCommand({ inferenceProfileIdentifier: modelId });
+    const resp = await runBedrockControlPlaneRequest({
+      operation: "Bedrock GetInferenceProfile",
+      signal,
+      send: (options) => controlPlaneClient.send(command, options),
+    });
+    const models = resp.models ?? [];
+    const modelArns = models.map((model) => model.modelArn ?? "");
+    const traits = {
+      cacheEligible:
+        models.length > 0 &&
+        modelArns.every((modelArn) => supportsBedrockClaudePromptCaching(modelArn)),
+      omitTemperature: modelArns.some(isOpus47OrNewerBedrockModelRef),
+    };
+    appProfileTraitsCache.set(modelId, traits);
+    return traits;
+  } catch {
+    // Caller cancellation is terminal; only provider/control-plane failures use heuristics.
+    signal?.throwIfAborted();
+    // Transient failures (throttling, network, IAM) should not be cached —
+    // return the heuristic fallback but allow retry on the next request.
+    return {
+      cacheEligible: isAnthropicBedrockModel(modelId),
+      omitTemperature: isOpus47OrNewerBedrockModelRef(modelId),
+    };
+  } finally {
+    client?.destroy();
+  }
+}
+
+type BedrockCachePoint = { cachePoint: { type: "default"; ttl?: string } };
+type BedrockContentBlock = Record<string, unknown>;
+type BedrockMessage = { role?: string; content?: BedrockContentBlock[] };
+
+function hasCachePoint(blocks: BedrockContentBlock[] | undefined): boolean {
+  return blocks?.some((b) => b.cachePoint != null) === true;
+}
+
+/**
+ * Inject Bedrock Converse cache points into the payload when the shared runtime skipped them
+ * because it didn't recognize the model ID (application inference profiles).
+ */
+function injectBedrockCachePoints(
+  payload: Record<string, unknown>,
+  cacheRetention: string | undefined,
+  context: Context,
+  model: Model,
+): void {
+  if (!cacheRetention || cacheRetention === "none" || resolveBedrockPromptCachePolicy(model)) {
+    return;
+  }
+  const point: BedrockCachePoint = {
+    cachePoint: { type: "default", ...(cacheRetention === "long" ? { ttl: "1h" } : {}) },
+  };
+
+  // Inject into system prompt if missing.
+  const system = payload.system as BedrockContentBlock[] | undefined;
+  if (Array.isArray(system) && system.length > 0 && !hasCachePoint(system)) {
+    const split = context.systemPrompt && splitSystemPromptCacheBoundary(context.systemPrompt);
+    if (!split || split.stablePrefix) {
+      system.splice(split ? 1 : system.length, 0, point);
+    }
+  }
+
+  // Unresolved profiles use transient carriers. Conversion has removed their
+  // flags, so fallback injection cannot safely select a conversation anchor.
+  if (context.messages.some(hasRuntimeContextMarker)) {
+    return;
+  }
+
+  // Inject into the last user message if missing.
+  // Bedrock Converse uses lowercase roles ("user" / "assistant").
+  const messages = payload.messages as BedrockMessage[] | undefined;
+  if (Array.isArray(messages)) {
+    const userContent = messages
+      .toReversed()
+      .find((msg) => msg.role === "user" && Array.isArray(msg.content))?.content;
+    if (userContent && !hasCachePoint(userContent)) {
+      userContent.push(point);
+    }
+  }
+}
+
+function patchMaxThinkingEffort(payload: Record<string, unknown>): void {
+  const fields = asOptionalRecord(payload.additionalModelRequestFields) ?? {};
+  const outputConfig = asOptionalRecord(fields.output_config) ?? {};
+  outputConfig.effort = "max";
+  fields.output_config = outputConfig;
+  payload.additionalModelRequestFields = fields;
+}
+
+/** Register Amazon Bedrock provider, discovery catalog, stream wrappers, and embeddings. */
 export function registerAmazonBedrockPlugin(api: OpenClawPluginApi): void {
   // Keep registration-local constants inside the function so partial module
   // initialization during test bootstrap cannot trip TDZ reads.
   const providerId = "amazon-bedrock";
-  const claude46ModelRe = /claude-(?:opus|sonnet)-4(?:\.|-)6(?:$|[-.])/i;
   // Match region from bedrock-runtime (Converse API) URLs.
   // e.g. https://bedrock-runtime.us-east-1.amazonaws.com
   const bedrockRegionRe = /bedrock-runtime\.([a-z0-9-]+)\.amazonaws\./;
@@ -72,35 +319,86 @@ export function registerAmazonBedrockPlugin(api: OpenClawPluginApi): void {
     /ValidationException.*(?:exceeds? the (?:maximum|max) (?:number of )?(?:input )?tokens)/i,
     /ModelStreamErrorException.*(?:Input is too long|too many input tokens)/i,
   ] as const;
+  const deprecatedTemperatureValidationRe =
+    /ValidationException[\s\S]*(?:invalid_request_error[\s\S]*)?temperature[\s\S]*deprecated|ValidationException[\s\S]*deprecated[\s\S]*temperature/i;
   const anthropicByModelReplayHooks = buildProviderReplayFamilyHooks({
     family: "anthropic-by-model",
   });
-  const pluginConfig = (api.pluginConfig ?? {}) as AmazonBedrockPluginConfig;
-  const guardrail = pluginConfig.guardrail;
+  const startupPluginConfig = (api.pluginConfig ?? {}) as AmazonBedrockPluginConfig;
 
-  const baseWrapStreamFn = ({ modelId, streamFn }: { modelId: string; streamFn?: StreamFn }) =>
-    isAnthropicBedrockModel(modelId) ? streamFn : createBedrockNoCacheWrapper(streamFn);
+  function resolveCurrentPluginConfig(
+    config: OpenClawConfig | undefined,
+  ): AmazonBedrockPluginConfig | undefined {
+    const runtimePluginConfig = resolvePluginConfigObject(config, providerId);
+    return (
+      (runtimePluginConfig as AmazonBedrockPluginConfig | undefined) ??
+      (config ? undefined : startupPluginConfig)
+    );
+  }
 
-  const cacheWrapStreamFn =
-    guardrail?.guardrailIdentifier && guardrail?.guardrailVersion
-      ? createGuardrailWrapStreamFn(baseWrapStreamFn, guardrail)
-      : baseWrapStreamFn;
+  api.registerEmbeddingProvider(bedrockMemoryEmbeddingProviderAdapter);
+
+  const baseWrapStreamFn = ({
+    modelId,
+    model,
+    streamFn,
+  }: {
+    modelId: string;
+    model?: { params?: Record<string, unknown> };
+    streamFn?: StreamFn;
+  }) => {
+    const modelRef = { id: modelId, params: model?.params };
+    if (
+      resolveBedrockPromptCachePolicy(modelRef) === "nova" ||
+      isAnthropicBedrockModel(modelId) ||
+      resolveClaudeModelIdentity(modelRef).startsWith("claude-")
+    ) {
+      return streamFn;
+    }
+    // For app inference profiles with opaque IDs, don't force cacheRetention: "none"
+    // yet — we may resolve them as Claude later via GetInferenceProfile.
+    if (isBedrockAppInferenceProfile(modelId)) {
+      return streamFn;
+    }
+    return createBedrockNoCacheWrapper(streamFn);
+  };
+
+  function omitUnsupportedClaudeTemperature<TOptions extends object>(
+    modelRef: { id: string; params?: Record<string, unknown> },
+    options: TOptions,
+  ): TOptions {
+    const canonicalModelId = resolveClaudeModelIdentity(modelRef);
+    const omitsTemperature =
+      isOpus47OrNewerBedrockModelRef(modelRef.id) ||
+      isOpus47OrNewerBedrockModelRef(canonicalModelId) ||
+      resolveClaudeFable5ModelIdentity(modelRef) !== undefined;
+    if (!omitsTemperature || !("temperature" in options)) {
+      return options;
+    }
+    const next = { ...options } as typeof options & { temperature?: unknown };
+    delete next.temperature;
+    return next;
+  }
+
+  function omitUnsupportedClaudePayloadTemperature(payload: Record<string, unknown>): void {
+    const inferenceConfig = payload.inferenceConfig;
+    if (!inferenceConfig || typeof inferenceConfig !== "object") {
+      return;
+    }
+    delete (inferenceConfig as Record<string, unknown>).temperature;
+  }
 
   /** Extract the AWS region from a bedrock-runtime baseUrl. */
   function extractRegionFromBaseUrl(baseUrl: string | undefined): string | undefined {
-    if (!baseUrl) return undefined;
+    if (!baseUrl) {
+      return undefined;
+    }
     return bedrockRegionRe.exec(baseUrl)?.[1];
   }
 
-  /**
-   * Resolve the AWS region for Bedrock API calls.
-   * Provider-specific baseUrl wins over global bedrockDiscovery to avoid signing
-   * with the wrong region when discovery and provider target different regions.
-   */
+  /** Resolve the AWS region for Bedrock API calls from provider-specific baseUrl. */
   function resolveBedrockRegion(
-    config:
-      | { models?: { bedrockDiscovery?: { region?: string }; providers?: Record<string, unknown> } }
-      | undefined,
+    config: { models?: { providers?: Record<string, unknown> } } | undefined,
   ): string | undefined {
     // Try provider-specific baseUrl first.
     const providers = config?.models?.providers;
@@ -108,16 +406,22 @@ export function registerAmazonBedrockPlugin(api: OpenClawPluginApi): void {
       const exact = (providers[providerId] as { baseUrl?: string } | undefined)?.baseUrl;
       if (exact) {
         const region = extractRegionFromBaseUrl(exact);
-        if (region) return region;
+        if (region) {
+          return region;
+        }
       }
       // Fall back to alias matches (e.g. "bedrock" instead of "amazon-bedrock").
       for (const [key, value] of Object.entries(providers)) {
-        if (key === providerId || normalizeProviderId(key) !== providerId) continue;
+        if (key === providerId || normalizeProviderId(key) !== providerId) {
+          continue;
+        }
         const region = extractRegionFromBaseUrl((value as { baseUrl?: string }).baseUrl);
-        if (region) return region;
+        if (region) {
+          return region;
+        }
       }
     }
-    return config?.models?.bedrockDiscovery?.region;
+    return undefined;
   }
 
   api.registerProvider({
@@ -127,46 +431,143 @@ export function registerAmazonBedrockPlugin(api: OpenClawPluginApi): void {
     auth: [],
     catalog: {
       order: "simple",
-      run: async (ctx) => {
-        const implicit = await resolveImplicitBedrockProvider({
-          config: ctx.config,
-          pluginConfig,
-          env: ctx.env,
-        });
-        if (!implicit) {
-          return null;
-        }
-        return {
-          provider: mergeImplicitBedrockProvider({
-            existing: ctx.config.models?.providers?.[providerId],
-            implicit,
-          }),
-        };
-      },
+      run: (ctx) =>
+        runLiveProviderCatalog({
+          providerId,
+          run: async () => {
+            const { resolveImplicitBedrockProvider } = await import("./discovery.js");
+            const currentPluginConfig = resolveCurrentPluginConfig(ctx.config);
+            const implicit = await resolveImplicitBedrockProvider({
+              discoveryMode: "strict",
+              pluginConfig: currentPluginConfig,
+              env: ctx.env,
+            });
+            return implicit ? { provider: implicit } : null;
+          },
+        }),
     },
-    resolveConfigApiKey: ({ env }) => resolveBedrockConfigApiKey(env),
+    resolveConfigApiKey: ({ env }) => resolveAwsSdkEnvVarName(env),
+    normalizeResolvedModel: normalizeBedrockResolvedModel,
+    supportsSystemPromptCacheBoundary: true,
+    createStreamFn: ({ model }) =>
+      model.api === "bedrock-converse-stream" ? bedrockStreamFn : undefined,
     ...anthropicByModelReplayHooks,
-    wrapStreamFn: ({ modelId, config, model, streamFn }) => {
-      // Apply cache + guardrail wrapping.
-      const wrapped = cacheWrapStreamFn({ modelId, streamFn });
-      const region = resolveBedrockRegion(config) ?? extractRegionFromBaseUrl(model?.baseUrl);
+    wrapStreamFn: ({ modelId, config, model, streamFn, thinkingLevel, extraParams }) => {
+      const currentPluginConfig = resolveCurrentPluginConfig(config);
+      const currentGuardrail = currentPluginConfig?.guardrail;
+      const modelRef = { id: modelId, params: model?.params };
+      const fable5 = resolveClaudeFable5ModelIdentity(modelRef) !== undefined;
+      const opus5 = resolveClaudeOpus5ModelIdentity(modelRef) !== undefined;
+      const sonnet5 = resolveClaudeSonnet5ModelIdentity(modelRef) !== undefined;
+      const canonicalModelId = resolveClaudeModelIdentity(modelRef);
+      const opus47OrNewer =
+        isOpus47OrNewerBedrockModelRef(modelId) || isOpus47OrNewerBedrockModelRef(canonicalModelId);
+      const supportsNativeMax = supportsBedrockNativeMaxEffort(modelId, model?.params);
+      let wrapped = baseWrapStreamFn({ modelId, model, streamFn });
+      if (wrapped && currentGuardrail?.guardrailIdentifier && currentGuardrail.guardrailVersion) {
+        wrapped = createGuardrailStreamWrapper(wrapped, currentGuardrail);
+      }
 
-      if (!region) {
+      const serviceTier = resolveBedrockServiceTier(extraParams, (message) =>
+        api.logger.warn(message),
+      );
+      if (serviceTier && wrapped) {
+        if ((fable5 || opus5 || sonnet5) && serviceTier !== "default") {
+          const modelLabel = fable5 ? "Fable 5" : opus5 ? "Opus 5" : "Sonnet 5";
+          api.logger.warn(
+            `ignoring unsupported ${modelLabel} Bedrock service tier: ${serviceTier}`,
+          );
+        } else {
+          wrapped = createBedrockServiceTierWrapper(wrapped, serviceTier);
+        }
+      }
+
+      const region =
+        resolveBedrockRegion(config) ??
+        extractRegionFromBaseUrl(model?.baseUrl) ??
+        currentPluginConfig?.discovery?.region;
+      const mayNeedCacheInjection =
+        isBedrockAppInferenceProfile(modelId) && !supportsBedrockClaudePromptCaching(modelId);
+      const shouldOmitTemperature =
+        opus47OrNewer || fable5 || isLatestAdaptiveBedrockModelRef(modelId, model?.params);
+      const shouldPatchMaxThinking = supportsNativeMax && thinkingLevel === "max";
+      const shouldPatchPayload = shouldOmitTemperature || shouldPatchMaxThinking;
+
+      // For known Anthropic models (heuristic match), enable injection immediately.
+      // For opaque profile IDs, we'll resolve via GetInferenceProfile on first call.
+      const heuristicMatch = isAnthropicBedrockModel(modelId);
+
+      if (!region && !mayNeedCacheInjection && !shouldOmitTemperature && !shouldPatchMaxThinking) {
         return wrapped;
       }
 
-      // Wrap to inject the region into every stream call so pi-ai's Bedrock
-      // client connects to the right region for inference profile IDs.
       const underlying = wrapped ?? streamFn;
       if (!underlying) {
         return wrapped;
       }
       return (streamModel, context, options) => {
-        // pi-ai's bedrock provider reads `options.region` at runtime but the
-        // StreamFn type does not declare it. Merge via Object.assign to avoid
-        // an unsafe type assertion.
-        const merged = Object.assign({}, options, { region });
-        return underlying(streamModel, context, merged);
+        const merged = omitUnsupportedClaudeTemperature(
+          modelRef,
+          Object.assign({}, options, region ? { region } : {}),
+        );
+
+        const originalOnPayload = merged.onPayload as
+          | ((payload: unknown, model: unknown) => unknown)
+          | undefined;
+
+        if (!mayNeedCacheInjection) {
+          return underlying(streamModel, context, {
+            ...merged,
+            ...(shouldPatchPayload
+              ? {
+                  onPayload: (payload: unknown, payloadModel: unknown) => {
+                    if (payload && typeof payload === "object") {
+                      const payloadRecord = payload as Record<string, unknown>;
+                      if (shouldPatchMaxThinking) {
+                        patchMaxThinkingEffort(payloadRecord);
+                      }
+                      if (shouldOmitTemperature) {
+                        omitUnsupportedClaudePayloadTemperature(payloadRecord);
+                      }
+                    }
+                    return originalOnPayload?.(payload, payloadModel);
+                  },
+                }
+              : {}),
+          });
+        }
+
+        // Unresolved profiles retain the shared runtime's short-cache default.
+        const cacheRetention =
+          typeof merged.cacheRetention === "string" ? merged.cacheRetention : "short";
+        return underlying(streamModel, context, {
+          ...merged,
+          onPayload: async (payload: unknown, payloadModel: unknown) => {
+            // Opaque profiles need resolved traits even when no payload is produced.
+            // Named Claude profiles only need a lookup for an unresolved temperature rule.
+            const traits = heuristicMatch
+              ? undefined
+              : await resolveAppProfileTraits(modelId, region, merged.signal);
+            if (payload && typeof payload === "object") {
+              const payloadRecord = payload as Record<string, unknown>;
+              if (heuristicMatch || traits?.cacheEligible) {
+                injectBedrockCachePoints(payloadRecord, cacheRetention, context, streamModel);
+              }
+              if (shouldPatchMaxThinking) {
+                patchMaxThinkingEffort(payloadRecord);
+              }
+              const omitTemperature = heuristicMatch
+                ? shouldOmitTemperature ||
+                  ("temperature" in merged &&
+                    (await resolveAppProfileTraits(modelId, region, merged.signal)).omitTemperature)
+                : traits?.omitTemperature;
+              if (omitTemperature) {
+                omitUnsupportedClaudePayloadTemperature(payloadRecord);
+              }
+            }
+            return originalOnPayload?.(payload, payloadModel);
+          },
+        });
       };
     },
     matchesContextOverflowError: ({ errorMessage }) =>
@@ -178,9 +579,12 @@ export function registerAmazonBedrockPlugin(api: OpenClawPluginApi): void {
       if (/ModelNotReadyException/i.test(errorMessage)) {
         return "overloaded";
       }
+      if (deprecatedTemperatureValidationRe.test(errorMessage)) {
+        return "format";
+      }
       return undefined;
     },
-    resolveDefaultThinkingLevel: ({ modelId }) =>
-      claude46ModelRe.test(modelId.trim()) ? "adaptive" : undefined,
+    resolveThinkingProfile: ({ modelId, params }) =>
+      resolveBedrockClaudeThinkingProfile(modelId, params),
   });
 }

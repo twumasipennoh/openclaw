@@ -1,40 +1,45 @@
+import { getDeferredPluginMigrationConfigFacts } from "../../../config/deferred-plugin-migration-config.js";
+import { inheritLegacyDefaultAgentId } from "../../../config/legacy.default-agent-owner.js";
+// Validating legacy config migration wrapper used by doctor config flow.
 import type { OpenClawConfig } from "../../../config/types.js";
-import { validateConfigObjectWithPlugins } from "../../../config/validation.js";
-import { applyChannelDoctorCompatibilityMigrations } from "./channel-legacy-config-migrate.js";
-import { LEGACY_CONFIG_MIGRATIONS } from "./legacy-config-migrations.js";
+import { validateConfigObjectRawWithPlugins } from "../../../config/validation.js";
+import {
+  applyLegacyDoctorMigrations,
+  type LegacyDoctorMigrationOptions,
+} from "./legacy-config-compat.js";
 
-export function applyLegacyDoctorMigrations(raw: unknown): {
-  next: Record<string, unknown> | null;
-  changes: string[];
-} {
-  if (!raw || typeof raw !== "object") {
-    return { next: null, changes: [] };
-  }
-  const next = structuredClone(raw) as Record<string, unknown>;
-  const changes: string[] = [];
-  for (const migration of LEGACY_CONFIG_MIGRATIONS) {
-    migration.apply(next, changes);
-  }
-  const compat = applyChannelDoctorCompatibilityMigrations(next);
-  changes.push(...compat.changes);
-  if (changes.length === 0) {
-    return { next: null, changes: [] };
-  }
-  return { next: compat.next, changes };
-}
-
-export function migrateLegacyConfig(raw: unknown): {
+/** Apply legacy migrations and validate the resulting OpenClaw config shape when possible. */
+export function migrateLegacyConfig(
+  raw: unknown,
+  options: LegacyDoctorMigrationOptions,
+): {
   config: OpenClawConfig | null;
+  sourceConfig?: OpenClawConfig;
   changes: string[];
+  warnings?: string[];
+  partiallyValid?: boolean;
 } {
-  const { next, changes } = applyLegacyDoctorMigrations(raw);
+  const { context } = options;
+  const { next, changes, warnings } = applyLegacyDoctorMigrations(raw, options);
+  const diagnostics = { changes, ...(warnings?.length ? { warnings } : {}) };
   if (!next) {
-    return { config: null, changes: [] };
+    return { config: null, ...diagnostics };
   }
-  const validated = validateConfigObjectWithPlugins(next);
+  const resolvedCandidate = context
+    ? (applyLegacyDoctorMigrations(context.resolvedRaw, options).next ?? context.resolvedRaw)
+    : next;
+  // Runtime defaults create unrelated plugin entries that Doctor would then load
+  // and persist. Validate repair candidates without materializing those defaults.
+  const validated = validateConfigObjectRawWithPlugins(resolvedCandidate, {
+    deferredPluginMigrations: getDeferredPluginMigrationConfigFacts(context?.resolvedRaw ?? raw),
+  });
   if (!validated.ok) {
-    changes.push("Migration applied, but config still invalid; fix remaining issues manually.");
-    return { config: null, changes };
+    changes.push("Migration applied; other validation issues remain — run doctor to review.");
+    return { config: next as OpenClawConfig, ...diagnostics, partiallyValid: true };
   }
-  return { config: validated.config, changes };
+  return {
+    config: inheritLegacyDefaultAgentId(resolvedCandidate, validated.config),
+    sourceConfig: next as OpenClawConfig,
+    ...diagnostics,
+  };
 }

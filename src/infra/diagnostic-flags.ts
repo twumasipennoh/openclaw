@@ -1,65 +1,35 @@
-import type { OpenClawConfig } from "../config/config.js";
+import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
+import { normalizeUniqueStringEntriesLower } from "@openclaw/normalization-core/string-normalization";
+import type { OpenClawConfig } from "../config/types.openclaw.js";
+import { parseDiagnosticEnvFlags } from "./diagnostic-flags-env.js";
 
 const DIAGNOSTICS_ENV = "OPENCLAW_DIAGNOSTICS";
 
-function normalizeFlag(value: string): string {
-  return value.trim().toLowerCase();
-}
-
-function parseEnvFlags(raw?: string): string[] {
-  if (!raw) {
-    return [];
-  }
-  const trimmed = raw.trim();
-  if (!trimmed) {
-    return [];
-  }
-  const lowered = trimmed.toLowerCase();
-  if (["0", "false", "off", "none"].includes(lowered)) {
-    return [];
-  }
-  if (["1", "true", "all", "*"].includes(lowered)) {
-    return ["*"];
-  }
-  return trimmed
-    .split(/[,\s]+/)
-    .map(normalizeFlag)
-    .filter(Boolean);
-}
-
-function uniqueFlags(flags: string[]): string[] {
-  const seen = new Set<string>();
-  const out: string[] = [];
-  for (const flag of flags) {
-    const normalized = normalizeFlag(flag);
-    if (!normalized || seen.has(normalized)) {
-      continue;
-    }
-    seen.add(normalized);
-    out.push(normalized);
-  }
-  return out;
-}
-
-export function resolveDiagnosticFlags(
+/** Resolves enabled diagnostic flags from config plus `OPENCLAW_DIAGNOSTICS` overrides. */
+function resolveDiagnosticFlags(
   cfg?: OpenClawConfig,
   env: NodeJS.ProcessEnv = process.env,
 ): string[] {
   const configFlags = Array.isArray(cfg?.diagnostics?.flags) ? cfg?.diagnostics?.flags : [];
-  const envFlags = parseEnvFlags(env[DIAGNOSTICS_ENV]);
-  return uniqueFlags([...configFlags, ...envFlags]);
+  const envFlags = parseDiagnosticEnvFlags(env[DIAGNOSTICS_ENV]);
+  if (envFlags.disablesAll) {
+    return [];
+  }
+  return normalizeUniqueStringEntriesLower([...configFlags, ...envFlags.flags]);
 }
 
-export function matchesDiagnosticFlag(flag: string, enabledFlags: string[]): boolean {
-  const target = normalizeFlag(flag);
+/** Returns whether a diagnostic flag is enabled after config/env resolution. */
+export function isDiagnosticFlagEnabled(
+  flag: string,
+  cfg?: OpenClawConfig,
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  const enabledFlags = resolveDiagnosticFlags(cfg, env);
+  const target = normalizeLowercaseStringOrEmpty(flag);
   if (!target) {
     return false;
   }
-  for (const raw of enabledFlags) {
-    const enabled = normalizeFlag(raw);
-    if (!enabled) {
-      continue;
-    }
+  for (const enabled of enabledFlags) {
     if (enabled === "*" || enabled === "all") {
       return true;
     }
@@ -80,13 +50,4 @@ export function matchesDiagnosticFlag(flag: string, enabledFlags: string[]): boo
     }
   }
   return false;
-}
-
-export function isDiagnosticFlagEnabled(
-  flag: string,
-  cfg?: OpenClawConfig,
-  env: NodeJS.ProcessEnv = process.env,
-): boolean {
-  const flags = resolveDiagnosticFlags(cfg, env);
-  return matchesDiagnosticFlag(flag, flags);
 }

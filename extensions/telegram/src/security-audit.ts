@@ -1,23 +1,9 @@
-import { resolveNativeSkillsEnabled } from "openclaw/plugin-sdk/config-runtime";
-import type { OpenClawConfig } from "openclaw/plugin-sdk/config-runtime";
 import { readChannelAllowFromStore } from "openclaw/plugin-sdk/conversation-runtime";
+import { resolveNativeSkillsEnabled } from "openclaw/plugin-sdk/native-command-config-runtime";
+import { normalizeOptionalString } from "openclaw/plugin-sdk/string-coerce-runtime";
+import type { OpenClawConfig } from "../runtime-api.js";
 import type { ResolvedTelegramAccount } from "./accounts.js";
-import { isNumericTelegramUserId, normalizeTelegramAllowFromEntry } from "./allow-from.js";
-
-function collectInvalidTelegramAllowFromEntries(params: { entries: unknown; target: Set<string> }) {
-  if (!Array.isArray(params.entries)) {
-    return;
-  }
-  for (const entry of params.entries) {
-    const normalized = normalizeTelegramAllowFromEntry(entry);
-    if (!normalized || normalized === "*") {
-      continue;
-    }
-    if (!isNumericTelegramUserId(normalized)) {
-      params.target.add(normalized);
-    }
-  }
-}
+import { isNumericTelegramSenderUserId, normalizeTelegramAllowFromEntry } from "./allow-from.js";
 
 export async function collectTelegramSecurityAuditFindings(params: {
   cfg: OpenClawConfig;
@@ -31,85 +17,26 @@ export async function collectTelegramSecurityAuditFindings(params: {
     detail: string;
     remediation?: string;
   }> = [];
-  if (params.cfg.commands?.text === false) {
-    return findings;
-  }
 
   const telegramCfg = params.account.config ?? {};
-  const accountId = params.accountId?.trim() || params.account.accountId || "default";
-  const defaultGroupPolicy = params.cfg.channels?.defaults?.groupPolicy;
-  const groupPolicy =
-    (telegramCfg.groupPolicy as string | undefined) ?? defaultGroupPolicy ?? "allowlist";
-  const groups = telegramCfg.groups as Record<string, unknown> | undefined;
-  const groupsConfigured = Boolean(groups) && Object.keys(groups ?? {}).length > 0;
-  const groupAccessPossible =
-    groupPolicy === "open" || (groupPolicy === "allowlist" && groupsConfigured);
-  if (!groupAccessPossible) {
-    return findings;
-  }
-
-  const storeAllowFrom = await readChannelAllowFromStore("telegram", process.env, accountId).catch(
-    () => [],
-  );
-  const storeHasWildcard = storeAllowFrom.some((value) => String(value).trim() === "*");
+  const accountId =
+    normalizeOptionalString(params.accountId) ?? params.account.accountId ?? "default";
   const invalidTelegramAllowFromEntries = new Set<string>();
-  collectInvalidTelegramAllowFromEntries({
-    entries: storeAllowFrom,
-    target: invalidTelegramAllowFromEntries,
-  });
-  const groupAllowFrom = Array.isArray(telegramCfg.groupAllowFrom)
-    ? telegramCfg.groupAllowFrom
-    : [];
-  const groupAllowFromHasWildcard = groupAllowFrom.some((value) => String(value).trim() === "*");
-  collectInvalidTelegramAllowFromEntries({
-    entries: groupAllowFrom,
-    target: invalidTelegramAllowFromEntries,
-  });
-  collectInvalidTelegramAllowFromEntries({
-    entries: Array.isArray(telegramCfg.allowFrom) ? telegramCfg.allowFrom : [],
-    target: invalidTelegramAllowFromEntries,
-  });
-
-  let anyGroupOverride = false;
-  if (groups) {
-    for (const value of Object.values(groups)) {
-      if (!value || typeof value !== "object") {
-        continue;
-      }
-      const group = value as Record<string, unknown>;
-      const allowFrom = Array.isArray(group.allowFrom) ? group.allowFrom : [];
-      if (allowFrom.length > 0) {
-        anyGroupOverride = true;
-        collectInvalidTelegramAllowFromEntries({
-          entries: allowFrom,
-          target: invalidTelegramAllowFromEntries,
-        });
-      }
-      const topics = group.topics;
-      if (!topics || typeof topics !== "object") {
-        continue;
-      }
-      for (const topicValue of Object.values(topics as Record<string, unknown>)) {
-        if (!topicValue || typeof topicValue !== "object") {
-          continue;
-        }
-        const topic = topicValue as Record<string, unknown>;
-        const topicAllow = Array.isArray(topic.allowFrom) ? topic.allowFrom : [];
-        if (topicAllow.length > 0) {
-          anyGroupOverride = true;
-        }
-        collectInvalidTelegramAllowFromEntries({
-          entries: topicAllow,
-          target: invalidTelegramAllowFromEntries,
-        });
+  const collectInvalidAllowFrom = (entries: unknown) => {
+    if (!Array.isArray(entries)) {
+      return;
+    }
+    for (const entry of entries) {
+      const normalized = normalizeTelegramAllowFromEntry(entry);
+      if (normalized && normalized !== "*" && !isNumericTelegramSenderUserId(normalized)) {
+        invalidTelegramAllowFromEntries.add(normalized);
       }
     }
-  }
-
-  const hasAnySenderAllowlist =
-    storeAllowFrom.length > 0 || groupAllowFrom.length > 0 || anyGroupOverride;
-
-  if (invalidTelegramAllowFromEntries.size > 0) {
+  };
+  const appendInvalidAllowFromFinding = () => {
+    if (invalidTelegramAllowFromEntries.size === 0) {
+      return;
+    }
     const examples = Array.from(invalidTelegramAllowFromEntries).slice(0, 5);
     const more =
       invalidTelegramAllowFromEntries.size > examples.length
@@ -125,7 +52,73 @@ export async function collectTelegramSecurityAuditFindings(params: {
       remediation:
         "Replace @username entries with numeric Telegram user IDs (use setup to resolve), then re-run the audit.",
     });
+  };
+  collectInvalidAllowFrom(telegramCfg.allowFrom);
+  if (params.cfg.commands?.text === false) {
+    appendInvalidAllowFromFinding();
+    return findings;
   }
+
+  const defaultGroupPolicy = params.cfg.channels?.defaults?.groupPolicy;
+  const groupPolicy = telegramCfg.groupPolicy ?? defaultGroupPolicy ?? "allowlist";
+  const groups = telegramCfg.groups as Record<string, unknown> | undefined;
+  const groupsConfigured = Boolean(groups) && Object.keys(groups ?? {}).length > 0;
+  const groupAccessPossible =
+    groupPolicy === "open" || (groupPolicy === "allowlist" && groupsConfigured);
+  if (!groupAccessPossible) {
+    appendInvalidAllowFromFinding();
+    return findings;
+  }
+
+  const storeAllowFrom = await readChannelAllowFromStore("telegram", process.env, accountId).catch(
+    () => [],
+  );
+  const storeHasWildcard = storeAllowFrom.some(
+    (value) => (normalizeOptionalString(value) ?? "") === "*",
+  );
+  collectInvalidAllowFrom(storeAllowFrom);
+  const groupAllowFrom = Array.isArray(telegramCfg.groupAllowFrom)
+    ? telegramCfg.groupAllowFrom
+    : [];
+  const groupAllowFromHasWildcard = groupAllowFrom.some(
+    (value) => (normalizeOptionalString(String(value)) ?? "") === "*",
+  );
+  collectInvalidAllowFrom(groupAllowFrom);
+
+  let anyGroupOverride = false;
+  if (groups) {
+    for (const value of Object.values(groups)) {
+      if (!value || typeof value !== "object") {
+        continue;
+      }
+      const group = value as Record<string, unknown>;
+      const allowFrom = Array.isArray(group.allowFrom) ? group.allowFrom : [];
+      if (allowFrom.length > 0) {
+        anyGroupOverride = true;
+        collectInvalidAllowFrom(allowFrom);
+      }
+      const topics = group.topics;
+      if (!topics || typeof topics !== "object") {
+        continue;
+      }
+      for (const topicValue of Object.values(topics as Record<string, unknown>)) {
+        if (!topicValue || typeof topicValue !== "object") {
+          continue;
+        }
+        const topic = topicValue as Record<string, unknown>;
+        const topicAllow = Array.isArray(topic.allowFrom) ? topic.allowFrom : [];
+        if (topicAllow.length > 0) {
+          anyGroupOverride = true;
+        }
+        collectInvalidAllowFrom(topicAllow);
+      }
+    }
+  }
+
+  const hasAnySenderAllowlist =
+    storeAllowFrom.length > 0 || groupAllowFrom.length > 0 || anyGroupOverride;
+
+  appendInvalidAllowFromFinding();
 
   if (storeHasWildcard || groupAllowFromHasWildcard) {
     findings.push({
@@ -143,8 +136,7 @@ export async function collectTelegramSecurityAuditFindings(params: {
   if (!hasAnySenderAllowlist) {
     const skillsEnabled = resolveNativeSkillsEnabled({
       providerId: "telegram",
-      providerSetting: (telegramCfg.commands as { nativeSkills?: unknown } | undefined)
-        ?.nativeSkills as boolean | "auto" | undefined,
+      providerSetting: telegramCfg.commands?.nativeSkills,
       globalSetting: params.cfg.commands?.nativeSkills,
     });
     findings.push({

@@ -1,129 +1,34 @@
-import { randomUUID } from "node:crypto";
+// Loads and saves JSON files with symlink backup handling.
 import fs from "node:fs";
 import path from "node:path";
+import { resolvePathPrefixSync } from "@openclaw/fs-safe/advanced";
+import { tryReadJsonSync, writeJsonSync } from "@openclaw/fs-safe/json";
+import { hasNodeErrorCode } from "@openclaw/fs-safe/path";
 
-const JSON_FILE_MODE = 0o600;
-const JSON_DIR_MODE = 0o700;
-
-function trySetSecureMode(pathname: string) {
-  try {
-    fs.chmodSync(pathname, JSON_FILE_MODE);
-  } catch {
-    // best-effort on platforms without chmod support
+export function resolveJsonSaveTarget(pathname: string): string {
+  if (!fs.lstatSync(pathname, { throwIfNoEntry: false })?.isSymbolicLink()) {
+    return pathname;
   }
+  const resolved = resolvePathPrefixSync(pathname);
+  const target = [resolved.existingPath, ...resolved.unresolvedSegments].join(path.sep);
+  fs.statSync(path.dirname(target));
+  return target;
 }
 
-function trySyncDirectory(pathname: string) {
-  let fd: number | undefined;
+export function writeJsonTarget(pathname: string, data: unknown): void {
+  writeJsonSync(resolveJsonSaveTarget(pathname), data);
+}
+
+// oxlint-disable-next-line typescript-eslint/no-unnecessary-type-parameters -- legacy typed JSON loader alias.
+export function loadJsonFileThroughSymlink<T = unknown>(pathname: string): T | undefined {
+  let resolved: string;
   try {
-    fd = fs.openSync(path.dirname(pathname), "r");
-    fs.fsyncSync(fd);
-  } catch {
-    // best-effort; some platforms/filesystems do not support syncing directories.
-  } finally {
-    if (fd !== undefined) {
-      try {
-        fs.closeSync(fd);
-      } catch {
-        // best-effort cleanup
-      }
-    }
-  }
-}
-
-function readSymlinkTargetPath(linkPath: string): string {
-  const target = fs.readlinkSync(linkPath);
-  return path.resolve(path.dirname(linkPath), target);
-}
-
-function resolveJsonWriteTarget(pathname: string): { targetPath: string; followsSymlink: boolean } {
-  let currentPath = pathname;
-  const visited = new Set<string>();
-  let followsSymlink = false;
-
-  for (;;) {
-    let stat: fs.Stats;
-    try {
-      stat = fs.lstatSync(currentPath);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-        throw error;
-      }
-      return { targetPath: currentPath, followsSymlink };
-    }
-
-    if (!stat.isSymbolicLink()) {
-      return { targetPath: currentPath, followsSymlink };
-    }
-
-    if (visited.has(currentPath)) {
-      const err = new Error(
-        `Too many symlink levels while resolving ${pathname}`,
-      ) as NodeJS.ErrnoException;
-      err.code = "ELOOP";
-      throw err;
-    }
-
-    visited.add(currentPath);
-    followsSymlink = true;
-    currentPath = readSymlinkTargetPath(currentPath);
-  }
-}
-
-function renameJsonFileWithFallback(tmpPath: string, pathname: string) {
-  try {
-    fs.renameSync(tmpPath, pathname);
-    return;
+    resolved = fs.realpathSync(pathname);
   } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code;
-    // Windows does not reliably support rename-based overwrite for existing files.
-    if (code === "EPERM" || code === "EEXIST") {
-      fs.copyFileSync(tmpPath, pathname);
-      fs.rmSync(tmpPath, { force: true });
-      return;
+    if (hasNodeErrorCode(error, "ENOENT") || hasNodeErrorCode(error, "ELOOP")) {
+      return undefined;
     }
     throw error;
   }
-}
-
-function writeTempJsonFile(pathname: string, payload: string) {
-  const fd = fs.openSync(pathname, "w", JSON_FILE_MODE);
-  try {
-    fs.writeFileSync(fd, payload, "utf8");
-    fs.fsyncSync(fd);
-  } finally {
-    fs.closeSync(fd);
-  }
-}
-
-export function loadJsonFile<T = unknown>(pathname: string): T | undefined {
-  try {
-    const raw = fs.readFileSync(pathname, "utf8");
-    return JSON.parse(raw) as T;
-  } catch {
-    return undefined;
-  }
-}
-
-export function saveJsonFile(pathname: string, data: unknown) {
-  const { targetPath, followsSymlink } = resolveJsonWriteTarget(pathname);
-  const tmpPath = `${targetPath}.${randomUUID()}.tmp`;
-  const payload = `${JSON.stringify(data, null, 2)}\n`;
-
-  if (!followsSymlink) {
-    fs.mkdirSync(path.dirname(targetPath), { recursive: true, mode: JSON_DIR_MODE });
-  }
-  try {
-    writeTempJsonFile(tmpPath, payload);
-    trySetSecureMode(tmpPath);
-    renameJsonFileWithFallback(tmpPath, targetPath);
-    trySetSecureMode(targetPath);
-    trySyncDirectory(targetPath);
-  } finally {
-    try {
-      fs.rmSync(tmpPath, { force: true });
-    } catch {
-      // best-effort cleanup when rename does not happen
-    }
-  }
+  return tryReadJsonSync<T>(resolved) ?? undefined;
 }

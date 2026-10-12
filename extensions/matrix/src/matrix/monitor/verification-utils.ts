@@ -1,3 +1,5 @@
+import { normalizeOptionalString } from "openclaw/plugin-sdk/string-coerce-runtime";
+
 const VERIFICATION_EVENT_PREFIX = "m.key.verification.";
 const VERIFICATION_REQUEST_MSGTYPE = "m.key.verification.request";
 
@@ -10,20 +12,16 @@ const VERIFICATION_NOTICE_PREFIXES = [
   "Matrix verification SAS with ",
 ];
 
-function trimMaybeString(input: unknown): string {
-  return typeof input === "string" ? input.trim() : "";
-}
-
 export function isMatrixVerificationEventType(type: unknown): boolean {
-  return trimMaybeString(type).startsWith(VERIFICATION_EVENT_PREFIX);
+  return normalizeOptionalString(type)?.startsWith(VERIFICATION_EVENT_PREFIX) === true;
 }
 
 export function isMatrixVerificationRequestMsgType(msgtype: unknown): boolean {
-  return trimMaybeString(msgtype) === VERIFICATION_REQUEST_MSGTYPE;
+  return normalizeOptionalString(msgtype) === VERIFICATION_REQUEST_MSGTYPE;
 }
 
-export function isMatrixVerificationNoticeBody(body: unknown): boolean {
-  const text = trimMaybeString(body);
+function isMatrixVerificationNoticeBody(body: unknown): boolean {
+  const text = normalizeOptionalString(body) ?? "";
   return VERIFICATION_NOTICE_PREFIXES.some((prefix) => text.startsWith(prefix));
 }
 
@@ -33,7 +31,7 @@ export function isMatrixVerificationRoomMessage(content: {
 }): boolean {
   return (
     isMatrixVerificationRequestMsgType(content.msgtype) ||
-    (trimMaybeString(content.msgtype) === "m.notice" &&
+    (normalizeOptionalString(content.msgtype) === "m.notice" &&
       isMatrixVerificationNoticeBody(content.body))
   );
 }

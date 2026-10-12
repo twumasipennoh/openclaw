@@ -1,30 +1,50 @@
 import fs from "node:fs";
 import path from "node:path";
-import type { BrowserProfileConfig, OpenClawConfig } from "../config/config.js";
-import { loadConfig, writeConfigFile } from "../config/config.js";
-import { deriveDefaultBrowserCdpPortRange } from "../config/port-defaults.js";
-import { resolveUserPath } from "../utils.js";
-import { assertCdpEndpointAllowed } from "./cdp.helpers.js";
+import {
+  getRuntimeConfig,
+  getRuntimeConfigSourceSnapshot,
+} from "openclaw/plugin-sdk/runtime-config-snapshot";
+import { formatErrorMessage } from "openclaw/plugin-sdk/security-runtime";
+import { normalizeOptionalString } from "openclaw/plugin-sdk/string-coerce-runtime";
+import { resolveUserPath } from "openclaw/plugin-sdk/text-utility-runtime";
+import { assertCdpEndpointAllowed, redactCdpUrl } from "./cdp.helpers.js";
 import { resolveOpenClawUserDataDir } from "./chrome.js";
-import { parseHttpUrl, resolveProfile } from "./config.js";
+import type { BrowserCreateProfileResult, BrowserDeleteProfileResult } from "./client.js";
+import {
+  createBrowserProfileConfig,
+  deleteBrowserProfileConfig,
+  setDefaultBrowserProfile,
+} from "./config-mutations.js";
+import {
+  getOwnBrowserProfile,
+  parseHttpUrl,
+  resolveBrowserConfig,
+  resolveProfile,
+} from "./config.js";
 import {
   BrowserConflictError,
   BrowserProfileNotFoundError,
-  BrowserResourceExhaustedError,
   BrowserValidationError,
 } from "./errors.js";
 import { getBrowserProfileCapabilities } from "./profile-capabilities.js";
+import { isValidProfileName } from "./profiles.js";
+import type { BrowserRouteContext } from "./server-context.js";
+import { beginProfileTransition, getOrCreateProfileRuntime } from "./server-context.lifecycle.js";
 import {
-  allocateCdpPort,
-  allocateColor,
-  getUsedColors,
-  getUsedPorts,
-  isValidProfileName,
-} from "./profiles.js";
-import type { BrowserRouteContext, ProfileStatus } from "./server-context.js";
+  recordSystemProfileImport,
+  readSystemProfileImportState,
+  resolveSuggestedImportTarget,
+} from "./system-profile-import-state.js";
+import {
+  importSystemProfileCookies,
+  listSystemProfiles as discoverSystemProfiles,
+  type ImportSystemProfileParams,
+  type ImportSystemProfileResult,
+  type SystemProfileInfo,
+} from "./system-profiles.js";
 import { movePathToTrash } from "./trash.js";
 
-export type CreateProfileParams = {
+type CreateProfileParams = {
   name: string;
   color?: string;
   cdpUrl?: string;
@@ -32,58 +52,15 @@ export type CreateProfileParams = {
   driver?: "openclaw" | "existing-session";
 };
 
-export type CreateProfileResult = {
-  ok: true;
-  profile: string;
+type CreateProfileResult = BrowserCreateProfileResult & {
   transport: "cdp" | "chrome-mcp";
-  cdpPort: number | null;
-  cdpUrl: string | null;
-  userDataDir: string | null;
-  color: string;
-  isRemote: boolean;
-};
-
-export type DeleteProfileResult = {
-  ok: true;
-  profile: string;
-  deleted: boolean;
-};
-
-const HEX_COLOR_RE = /^#[0-9A-Fa-f]{6}$/;
-
-const cdpPortRange = (resolved: {
-  controlPort: number;
-  cdpPortRangeStart?: number;
-  cdpPortRangeEnd?: number;
-}): { start: number; end: number } => {
-  const start = resolved.cdpPortRangeStart;
-  const end = resolved.cdpPortRangeEnd;
-  if (
-    typeof start === "number" &&
-    Number.isFinite(start) &&
-    Number.isInteger(start) &&
-    typeof end === "number" &&
-    Number.isFinite(end) &&
-    Number.isInteger(end) &&
-    start > 0 &&
-    end >= start &&
-    end <= 65535
-  ) {
-    return { start, end };
-  }
-
-  return deriveDefaultBrowserCdpPortRange(resolved.controlPort);
 };
 
 export function createBrowserProfilesService(ctx: BrowserRouteContext) {
-  const listProfiles = async (): Promise<ProfileStatus[]> => {
-    return await ctx.listProfiles();
-  };
-
   const createProfile = async (params: CreateProfileParams): Promise<CreateProfileResult> => {
     const name = params.name.trim();
-    const rawCdpUrl = params.cdpUrl?.trim() || undefined;
-    const rawUserDataDir = params.userDataDir?.trim() || undefined;
+    const rawCdpUrl = normalizeOptionalString(params.cdpUrl);
+    const rawUserDataDir = normalizeOptionalString(params.userDataDir);
     const normalizedUserDataDir = rawUserDataDir ? resolveUserPath(rawUserDataDir) : undefined;
     const driver = params.driver === "existing-session" ? "existing-session" : undefined;
 
@@ -95,21 +72,17 @@ export function createBrowserProfilesService(ctx: BrowserRouteContext) {
 
     const state = ctx.state();
     const resolvedProfiles = state.resolved.profiles;
-    if (name in resolvedProfiles) {
+    if (getOwnBrowserProfile(resolvedProfiles, name)) {
       throw new BrowserConflictError(`profile "${name}" already exists`);
     }
 
-    const cfg = loadConfig();
+    const cfg = getRuntimeConfig();
     const rawProfiles = cfg.browser?.profiles ?? {};
-    if (name in rawProfiles) {
+    if (getOwnBrowserProfile(rawProfiles, name)) {
       throw new BrowserConflictError(`profile "${name}" already exists`);
     }
 
-    const usedColors = getUsedColors(resolvedProfiles);
-    const profileColor =
-      params.color && HEX_COLOR_RE.test(params.color) ? params.color : allocateColor(usedColors);
-
-    let profileConfig: BrowserProfileConfig;
+    let parsedCdpUrl: string | undefined;
     if (normalizedUserDataDir && driver !== "existing-session") {
       throw new BrowserValidationError(
         "driver=existing-session is required when userDataDir is provided",
@@ -127,55 +100,21 @@ export function createBrowserProfilesService(ctx: BrowserRouteContext) {
         parsed = parseHttpUrl(rawCdpUrl, "browser.profiles.cdpUrl");
         await assertCdpEndpointAllowed(parsed.normalized, state.resolved.ssrfPolicy);
       } catch (err) {
-        throw new BrowserValidationError(err instanceof Error ? err.message : String(err));
+        throw new BrowserValidationError(formatErrorMessage(err));
       }
-      if (driver === "existing-session") {
-        throw new BrowserValidationError(
-          "driver=existing-session does not accept cdpUrl; it attaches via the Chrome MCP auto-connect flow",
-        );
-      }
-      profileConfig = {
-        cdpUrl: parsed.normalized,
-        ...(driver ? { driver } : {}),
-        color: profileColor,
-      };
-    } else {
-      if (driver === "existing-session") {
-        // existing-session uses Chrome MCP auto-connect; no CDP port needed
-        profileConfig = {
-          driver,
-          attachOnly: true,
-          ...(normalizedUserDataDir ? { userDataDir: normalizedUserDataDir } : {}),
-          color: profileColor,
-        };
-      } else {
-        const usedPorts = getUsedPorts(resolvedProfiles);
-        const range = cdpPortRange(state.resolved);
-        const cdpPort = allocateCdpPort(usedPorts, range);
-        if (cdpPort === null) {
-          throw new BrowserResourceExhaustedError("no available CDP ports in range");
-        }
-        profileConfig = {
-          cdpPort,
-          ...(driver ? { driver } : {}),
-          color: profileColor,
-        };
-      }
+      parsedCdpUrl = parsed.normalized;
     }
 
-    const nextConfig: OpenClawConfig = {
-      ...cfg,
-      browser: {
-        ...cfg.browser,
-        profiles: {
-          ...rawProfiles,
-          [name]: profileConfig,
-        },
-      },
-    };
-
-    await writeConfigFile(nextConfig);
-
+    const profileConfig = await createBrowserProfileConfig({
+      name,
+      resolved: state.resolved,
+      ...(parsedCdpUrl ? { parsedCdpUrl } : {}),
+      ...(normalizedUserDataDir ? { userDataDir: normalizedUserDataDir } : {}),
+      ...(driver ? { driver } : {}),
+    });
+    if (!profileConfig) {
+      throw new BrowserProfileNotFoundError(`profile "${name}" not found after creation`);
+    }
     state.resolved.profiles[name] = profileConfig;
     const resolved = resolveProfile(state.resolved, name);
     if (!resolved) {
@@ -188,14 +127,72 @@ export function createBrowserProfilesService(ctx: BrowserRouteContext) {
       profile: name,
       transport: capabilities.usesChromeMcp ? "chrome-mcp" : "cdp",
       cdpPort: capabilities.usesChromeMcp ? null : resolved.cdpPort,
-      cdpUrl: capabilities.usesChromeMcp ? null : resolved.cdpUrl,
+      cdpUrl: resolved.cdpUrl ? (redactCdpUrl(resolved.cdpUrl) ?? null) : null,
       userDataDir: resolved.userDataDir ?? null,
       color: resolved.color,
       isRemote: !resolved.cdpIsLoopback,
     };
   };
 
-  const deleteProfile = async (nameRaw: string): Promise<DeleteProfileResult> => {
+  const listSystemProfiles = async (browser?: string): Promise<SystemProfileInfo[]> => {
+    if (process.platform !== "darwin") {
+      return [];
+    }
+    return discoverSystemProfiles(browser);
+  };
+
+  const importSystemProfile = async (
+    params: ImportSystemProfileParams,
+    options?: { signal?: AbortSignal },
+  ): Promise<ImportSystemProfileResult> => {
+    const state = ctx.state();
+    return await importSystemProfileCookies(params, {
+      ctx,
+      createProfile,
+      signal: options?.signal,
+      finalize: async (result) => {
+        if (result.cookies.imported === 0) {
+          if (params.makeDefault) {
+            throw new BrowserValidationError(
+              "no cookies could be imported from the selected profile",
+            );
+          }
+          return;
+        }
+        if (params.makeDefault) {
+          await setDefaultBrowserProfile(result.into);
+          state.resolved.defaultProfile = result.into;
+        }
+        await recordSystemProfileImport({
+          browser: result.browser,
+          systemProfile: result.systemProfile,
+          targetProfile: result.into,
+        });
+      },
+    });
+  };
+
+  const getSystemProfileImportStatus = async () => {
+    const enabled =
+      process.platform === "darwin" &&
+      getRuntimeConfig().browser?.allowSystemProfileImport !== false;
+    const [systemProfiles, state, profiles] = await Promise.all([
+      enabled ? listSystemProfiles() : Promise.resolve([]),
+      readSystemProfileImportState(),
+      ctx.listProfiles(),
+    ]);
+    return {
+      enabled,
+      systemProfiles,
+      state: state ?? null,
+      suggestedTarget: resolveSuggestedImportTarget({
+        profileNames: profiles.map((profile) => profile.name),
+        state,
+      }),
+    };
+  };
+
+  const deleteProfile = async (nameRaw: string): Promise<BrowserDeleteProfileResult> => {
     const name = nameRaw.trim();
     if (!name) {
       throw new BrowserValidationError("profile name is required");
@@ -205,7 +202,7 @@ export function createBrowserProfilesService(ctx: BrowserRouteContext) {
     }
 
     const state = ctx.state();
-    const cfg = loadConfig();
+    const cfg = getRuntimeConfig();
     const profiles = cfg.browser?.profiles ?? {};
     const defaultProfile = cfg.browser?.defaultProfile ?? state.resolved.defaultProfile;
     if (name === defaultProfile) {
@@ -213,48 +210,71 @@ export function createBrowserProfilesService(ctx: BrowserRouteContext) {
         `cannot delete the default profile "${name}"; change browser.defaultProfile first`,
       );
     }
-    if (!(name in profiles)) {
+    const runtimeProfile = getOwnBrowserProfile(profiles, name);
+    if (!runtimeProfile) {
       throw new BrowserProfileNotFoundError(`profile "${name}" not found`);
     }
+    const sourceProfile = getOwnBrowserProfile(
+      getRuntimeConfigSourceSnapshot()?.browser?.profiles,
+      name,
+    );
+    const expected = structuredClone(sourceProfile ?? runtimeProfile);
 
     let deleted = false;
-    const resolved = resolveProfile(state.resolved, name);
+    const configuredProfile = resolveProfile(resolveBrowserConfig(cfg.browser, cfg), name);
+    const resolved = configuredProfile ?? state.profiles.get(name)?.profile;
+    const runtime = resolved ? getOrCreateProfileRuntime(state, resolved) : undefined;
 
-    if (resolved?.cdpIsLoopback && resolved.driver === "openclaw") {
+    const persistDelete = async () => {
+      await deleteBrowserProfileConfig({ name, expected });
+      delete state.resolved.profiles[name];
       try {
-        await ctx.forProfile(name).stopRunningBrowser();
-      } catch {
-        // ignore
+        if (resolved?.cdpIsLoopback && resolved.driver === "openclaw" && !resolved.attachOnly) {
+          const userDataDir = resolveOpenClawUserDataDir(name);
+          const profileDir = path.dirname(userDataDir);
+          if (fs.existsSync(profileDir)) {
+            try {
+              await movePathToTrash(profileDir);
+              deleted = true;
+            } catch {
+              // Config deletion is already durable. Preserve user data and
+              // report deleted=false instead of returning an unretryable
+              // partial failure after the profile no longer exists.
+            }
+          }
+        }
+      } finally {
+        if (!runtime || state.profiles.get(name) === runtime) {
+          state.profiles.delete(name);
+        }
       }
-
-      const userDataDir = resolveOpenClawUserDataDir(name);
-      const profileDir = path.dirname(userDataDir);
-      if (fs.existsSync(profileDir)) {
-        await movePathToTrash(profileDir);
-        deleted = true;
-      }
-    }
-
-    const { [name]: _removed, ...remainingProfiles } = profiles;
-    const nextConfig: OpenClawConfig = {
-      ...cfg,
-      browser: {
-        ...cfg.browser,
-        profiles: remainingProfiles,
-      },
     };
 
-    await writeConfigFile(nextConfig);
-
-    delete state.resolved.profiles[name];
-    state.profiles.delete(name);
+    if (resolved && runtime) {
+      await beginProfileTransition({
+        state,
+        runtime,
+        reason: "profile deletion requested",
+        terminal: "deleted",
+        advanceConfigRevision: true,
+        closeRelay: resolved.driver === "extension",
+        managedChrome: "release-profile-data",
+        afterCleanup: persistDelete,
+        rollbackTerminalOnFailure: true,
+      });
+    } else {
+      await persistDelete();
+    }
 
     return { ok: true, profile: name, deleted };
   };
 
   return {
-    listProfiles,
+    listProfiles: () => ctx.listProfiles(),
+    listSystemProfiles,
     createProfile,
+    importSystemProfile,
+    getSystemProfileImportStatus,
     deleteProfile,
   };
 }

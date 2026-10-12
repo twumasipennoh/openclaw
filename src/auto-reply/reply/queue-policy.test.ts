@@ -1,17 +1,24 @@
+// Tests queue policy parsing and admission decisions.
 import { describe, expect, it } from "vitest";
 import { resolveActiveRunQueueAction } from "./queue-policy.js";
 
 describe("resolveActiveRunQueueAction", () => {
-  it("runs immediately when there is no active run", () => {
-    expect(
-      resolveActiveRunQueueAction({
-        isActive: false,
-        isHeartbeat: false,
-        shouldFollowup: true,
-        queueMode: "collect",
-      }),
-    ).toBe("run-now");
-  });
+  it.each([
+    { hasQueuedFollowups: false, action: "run-now" },
+    { hasQueuedFollowups: true, action: "enqueue-followup" },
+  ] as const)(
+    "keeps waiting followups ahead of new turns when idle (backlog=$hasQueuedFollowups)",
+    ({ hasQueuedFollowups, action }) => {
+      expect(
+        resolveActiveRunQueueAction({
+          hasQueuedFollowups,
+          isActive: false,
+          isHeartbeat: false,
+          shouldFollowup: true,
+        }),
+      ).toBe(action);
+    },
+  );
 
   it("drops heartbeat runs while another run is active", () => {
     expect(
@@ -19,7 +26,6 @@ describe("resolveActiveRunQueueAction", () => {
         isActive: true,
         isHeartbeat: true,
         shouldFollowup: true,
-        queueMode: "collect",
       }),
     ).toBe("drop");
   });
@@ -30,19 +36,40 @@ describe("resolveActiveRunQueueAction", () => {
         isActive: true,
         isHeartbeat: false,
         shouldFollowup: true,
-        queueMode: "collect",
       }),
     ).toBe("enqueue-followup");
   });
 
-  it("enqueues steer mode runs while active", () => {
+  it("runs reset-triggered turns immediately while another run is active", () => {
     expect(
       resolveActiveRunQueueAction({
         isActive: true,
         isHeartbeat: false,
-        shouldFollowup: false,
-        queueMode: "steer",
+        shouldFollowup: true,
+        resetTriggered: true,
       }),
-    ).toBe("enqueue-followup");
+    ).toBe("run-now");
+  });
+
+  it("keeps heartbeat drops ahead of reset-triggered turns", () => {
+    expect(
+      resolveActiveRunQueueAction({
+        isActive: true,
+        isHeartbeat: true,
+        shouldFollowup: true,
+        resetTriggered: true,
+      }),
+    ).toBe("drop");
+  });
+
+  it("ignores reset-triggered policy when there is no active run", () => {
+    expect(
+      resolveActiveRunQueueAction({
+        isActive: false,
+        isHeartbeat: false,
+        shouldFollowup: true,
+        resetTriggered: true,
+      }),
+    ).toBe("run-now");
   });
 });

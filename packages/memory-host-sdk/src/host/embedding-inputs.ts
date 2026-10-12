@@ -1,34 +1,14 @@
-export type EmbeddingInputTextPart = {
-  type: "text";
-  text: string;
-};
+// Public embedding input contract for text and inline multimodal parts.
 
-export type EmbeddingInputInlineDataPart = {
-  type: "inline-data";
-  mimeType: string;
-  data: string;
-};
-
-export type EmbeddingInputPart = EmbeddingInputTextPart | EmbeddingInputInlineDataPart;
-
+/** Provider-facing input while preserving the plain text fallback. */
 export type EmbeddingInput = {
   text: string;
-  parts?: EmbeddingInputPart[];
+  parts?: Array<
+    { type: "text"; text: string } | { type: "inline-data"; mimeType: string; data: string }
+  >;
 };
 
-export function buildTextEmbeddingInput(text: string): EmbeddingInput {
-  return { text };
-}
-
-export function isInlineDataEmbeddingInputPart(
-  part: EmbeddingInputPart,
-): part is EmbeddingInputInlineDataPart {
-  return part.type === "inline-data";
-}
-
+/** Return true when a chunk needs structured provider handling, not text splitting. */
 export function hasNonTextEmbeddingParts(input: EmbeddingInput | undefined): boolean {
-  if (!input?.parts?.length) {
-    return false;
-  }
-  return input.parts.some((part) => isInlineDataEmbeddingInputPart(part));
+  return input?.parts?.some((part) => part.type === "inline-data") ?? false;
 }

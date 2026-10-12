@@ -1,8 +1,10 @@
+import {
+  normalizeLowercaseStringOrEmpty,
+  normalizeStringEntries,
+} from "openclaw/plugin-sdk/string-coerce-runtime";
 import type { ChannelDirectoryEntry } from "../runtime-api.js";
 import { searchGraphUsers } from "./graph-users.js";
 import {
-  type GraphChannel,
-  type GraphGroup,
   listChannelsForTeam,
   listTeamsByName,
   normalizeQuery,
@@ -23,23 +25,23 @@ export async function listMSTeamsDirectoryPeersLive(params: {
 
   const users = await searchGraphUsers({ token, query, top: limit });
 
-  return users
-    .map((user) => {
-      const id = user.id?.trim();
-      if (!id) {
-        return null;
-      }
-      const name = user.displayName?.trim();
-      const handle = user.userPrincipalName?.trim() || user.mail?.trim();
-      return {
+  return users.flatMap((user): ChannelDirectoryEntry[] => {
+    const id = user.id?.trim();
+    if (!id) {
+      return [];
+    }
+    const name = user.displayName?.trim();
+    const handle = user.userPrincipalName?.trim() || user.mail?.trim();
+    return [
+      {
         kind: "user",
         id: `user:${id}`,
         name: name || undefined,
         handle: handle ? `@${handle}` : undefined,
         raw: user,
-      } satisfies ChannelDirectoryEntry;
-    })
-    .filter(Boolean) as ChannelDirectoryEntry[];
+      },
+    ];
+  });
 }
 
 export async function listMSTeamsDirectoryGroupsLive(params: {
@@ -54,10 +56,7 @@ export async function listMSTeamsDirectoryGroupsLive(params: {
   const token = await resolveGraphToken(params.cfg);
   const limit = typeof params.limit === "number" && params.limit > 0 ? params.limit : 20;
   const [teamQuery, channelQuery] = rawQuery.includes("/")
-    ? rawQuery
-        .split("/", 2)
-        .map((part) => part.trim())
-        .filter(Boolean)
+    ? normalizeStringEntries(rawQuery.split("/", 2))
     : [rawQuery, null];
 
   const teams = await listTeamsByName(token, teamQuery);
@@ -88,7 +87,11 @@ export async function listMSTeamsDirectoryGroupsLive(params: {
       if (!name) {
         continue;
       }
-      if (!name.toLowerCase().includes(channelQuery.toLowerCase())) {
+      if (
+        !normalizeLowercaseStringOrEmpty(name).includes(
+          normalizeLowercaseStringOrEmpty(channelQuery),
+        )
+      ) {
         continue;
       }
       results.push({

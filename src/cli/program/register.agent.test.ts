@@ -1,18 +1,21 @@
 import { Command } from "commander";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { registerAgentCommands } from "./register.agent.js";
+import { registerAgentTurnCommand } from "./register.agent-turn.js";
+import { registerAgentsCommands } from "./register.agent.js";
 
 const mocks = vi.hoisted(() => ({
   agentCliCommandMock: vi.fn(),
+  agentExecCommandMock: vi.fn(),
   agentsAddCommandMock: vi.fn(),
+  agentsTeamCreateCommandMock: vi.fn(),
   agentsBindingsCommandMock: vi.fn(),
   agentsBindCommandMock: vi.fn(),
   agentsDeleteCommandMock: vi.fn(),
   agentsListCommandMock: vi.fn(),
   agentsSetIdentityCommandMock: vi.fn(),
   agentsUnbindCommandMock: vi.fn(),
+  requestExitAfterOneShotOutputMock: vi.fn(),
   setVerboseMock: vi.fn(),
-  createDefaultDepsMock: vi.fn(() => ({ deps: true })),
   runtime: {
     log: vi.fn(),
     error: vi.fn(),
@@ -20,270 +23,236 @@ const mocks = vi.hoisted(() => ({
   },
 }));
 
-const agentCliCommandMock = mocks.agentCliCommandMock;
-const agentsAddCommandMock = mocks.agentsAddCommandMock;
-const agentsBindingsCommandMock = mocks.agentsBindingsCommandMock;
-const agentsBindCommandMock = mocks.agentsBindCommandMock;
-const agentsDeleteCommandMock = mocks.agentsDeleteCommandMock;
-const agentsListCommandMock = mocks.agentsListCommandMock;
-const agentsSetIdentityCommandMock = mocks.agentsSetIdentityCommandMock;
-const agentsUnbindCommandMock = mocks.agentsUnbindCommandMock;
-const setVerboseMock = mocks.setVerboseMock;
-const createDefaultDepsMock = mocks.createDefaultDepsMock;
-const runtime = mocks.runtime;
-
 vi.mock("../../commands/agent-via-gateway.js", () => ({
   agentCliCommand: mocks.agentCliCommandMock,
 }));
 
-vi.mock("../../commands/agents.js", () => ({
+vi.mock("../../commands/agent-exec.js", () => ({
+  agentExecCommand: mocks.agentExecCommandMock,
+}));
+
+vi.mock("../../commands/agents.commands.add.js", () => ({
   agentsAddCommand: mocks.agentsAddCommandMock,
+}));
+
+vi.mock("../../commands/agents.commands.team.js", () => ({
+  agentsTeamCreateCommand: mocks.agentsTeamCreateCommandMock,
+}));
+
+vi.mock("../../commands/agents.commands.bind.js", () => ({
   agentsBindingsCommand: mocks.agentsBindingsCommandMock,
   agentsBindCommand: mocks.agentsBindCommandMock,
-  agentsDeleteCommand: mocks.agentsDeleteCommandMock,
-  agentsListCommand: mocks.agentsListCommandMock,
-  agentsSetIdentityCommand: mocks.agentsSetIdentityCommandMock,
   agentsUnbindCommand: mocks.agentsUnbindCommandMock,
 }));
 
-vi.mock("../../globals.js", () => ({
+vi.mock("../../commands/agents.commands.delete.js", () => ({
+  agentsDeleteCommand: mocks.agentsDeleteCommandMock,
+}));
+
+vi.mock("../../commands/agents.commands.identity.js", () => ({
+  agentsSetIdentityCommand: mocks.agentsSetIdentityCommandMock,
+}));
+
+vi.mock("../../commands/agents.commands.list.js", () => ({
+  agentsListCommand: mocks.agentsListCommandMock,
+}));
+
+vi.mock("../../global-state.js", () => ({
   setVerbose: mocks.setVerboseMock,
 }));
 
-vi.mock("../deps.js", () => ({
-  createDefaultDeps: mocks.createDefaultDepsMock,
-}));
-
-vi.mock("../../runtime.js", () => ({
+vi.mock("../../runtime.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../runtime.js")>()),
   defaultRuntime: mocks.runtime,
 }));
 
-describe("registerAgentCommands", () => {
-  async function runCli(args: string[]) {
-    const program = new Command();
-    registerAgentCommands(program, { agentChannelOptions: "last|telegram|discord" });
-    await program.parseAsync(args, { from: "user" });
-  }
+vi.mock("../one-shot-exit.js", () => ({
+  requestExitAfterOneShotOutput: mocks.requestExitAfterOneShotOutputMock,
+}));
 
-  beforeEach(() => {
-    vi.clearAllMocks();
-    runtime.exit.mockImplementation(() => {});
-    agentCliCommandMock.mockResolvedValue(undefined);
-    agentsAddCommandMock.mockResolvedValue(undefined);
-    agentsBindingsCommandMock.mockResolvedValue(undefined);
-    agentsBindCommandMock.mockResolvedValue(undefined);
-    agentsDeleteCommandMock.mockResolvedValue(undefined);
-    agentsListCommandMock.mockResolvedValue(undefined);
-    agentsSetIdentityCommandMock.mockResolvedValue(undefined);
-    agentsUnbindCommandMock.mockResolvedValue(undefined);
-    createDefaultDepsMock.mockReturnValue({ deps: true });
+const { agentCliCommandMock, agentExecCommandMock, requestExitAfterOneShotOutputMock, runtime } =
+  mocks;
+
+async function runCli(args: string[]) {
+  const program = new Command().enablePositionalOptions();
+  registerAgentTurnCommand(program, { agentChannelOptions: "last|telegram|discord" });
+  registerAgentsCommands(program);
+  await program.parseAsync(args, { from: "user" });
+}
+
+beforeEach(() => {
+  vi.resetAllMocks();
+  agentExecCommandMock.mockResolvedValue({ exitCode: 0 });
+});
+
+describe("agent command registration", () => {
+  it("normalizes explicit verbosity", async () => {
+    await runCli("agent --message hi --verbose ON --json".split(" "));
+    expect(mocks.setVerboseMock).toHaveBeenCalledWith(true);
+    expect(agentCliCommandMock).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ message: "hi", verbose: "ON", json: true }),
+      runtime,
+    );
   });
 
-  it("runs agent command with deps and verbose enabled for --verbose on", async () => {
-    await runCli(["agent", "--message", "hi", "--verbose", "ON", "--json"]);
+  it("keeps exec-valued parent messages and failure status on the parent action", async () => {
+    const previousExitCode = process.exitCode;
+    agentCliCommandMock.mockImplementationOnce(async () => {
+      process.exitCode = 1;
+    });
+    try {
+      await runCli("agent --message exec --agent ops".split(" "));
+      expect(agentCliCommandMock).toHaveBeenCalledOnce();
+      expect(agentExecCommandMock).not.toHaveBeenCalled();
+      expect(requestExitAfterOneShotOutputMock).toHaveBeenCalledWith(runtime);
+      expect(process.exitCode).toBe(1);
+    } finally {
+      process.exitCode = previousExitCode;
+    }
+  });
 
-    expect(setVerboseMock).toHaveBeenCalledWith(true);
-    expect(createDefaultDepsMock).toHaveBeenCalledTimes(1);
-    expect(agentCliCommandMock).toHaveBeenCalledWith(
+  it("runs nested exec with ordered fallbacks and stored credentials by default", async () => {
+    await runCli(
+      "agent exec fix --cwd /tmp/project --model openai/gpt-5.6-luna --fallback anthropic/claude-sonnet-4-6 --fallback google/gemini-3.1-pro-preview --json".split(
+        " ",
+      ),
+    );
+    expect(agentCliCommandMock).not.toHaveBeenCalled();
+    expect(agentExecCommandMock).toHaveBeenCalledWith(
+      "fix",
       expect.objectContaining({
-        message: "hi",
-        verbose: "ON",
+        cwd: "/tmp/project",
+        model: "openai/gpt-5.6-luna",
+        fallback: ["anthropic/claude-sonnet-4-6", "google/gemini-3.1-pro-preview"],
+        authEnvOnly: false,
+        isolated: false,
+        timeout: "600",
         json: true,
       }),
       runtime,
-      { deps: true },
     );
   });
 
-  it("runs agent command with verbose disabled for --verbose off", async () => {
-    await runCli(["agent", "--message", "hi", "--verbose", "off"]);
-
-    expect(setVerboseMock).toHaveBeenCalledWith(false);
-    expect(agentCliCommandMock).toHaveBeenCalledWith(
-      expect.objectContaining({
-        message: "hi",
-        verbose: "off",
-      }),
+  it.each([
+    {
+      args: "agent --model openai/gpt-5.6-luna --timeout 30 exec fix".split(" "),
+      timeout: "30",
+    },
+    { args: "agent --timeout 30 exec fix --timeout 120".split(" "), timeout: "120" },
+  ])("resolves parent and leaf exec options for $args", async ({ args, timeout }) => {
+    await runCli(args);
+    expect(agentExecCommandMock).toHaveBeenCalledWith(
+      "fix",
+      expect.objectContaining({ timeout }),
       runtime,
-      { deps: true },
     );
+    expect(agentCliCommandMock).not.toHaveBeenCalled();
   });
 
-  it("runs agents add and computes hasFlags based on explicit options", async () => {
-    await runCli(["agents", "add", "alpha"]);
-    expect(agentsAddCommandMock).toHaveBeenNthCalledWith(
-      1,
-      expect.objectContaining({
-        name: "alpha",
-        workspace: undefined,
-        bind: [],
-      }),
-      runtime,
-      { hasFlags: false },
-    );
-
-    await runCli([
-      "agents",
-      "add",
-      "beta",
-      "--workspace",
-      "/tmp/ws",
-      "--bind",
-      "telegram",
-      "--bind",
-      "discord:acct",
-      "--non-interactive",
-      "--json",
-    ]);
-    expect(agentsAddCommandMock).toHaveBeenNthCalledWith(
-      2,
-      expect.objectContaining({
+  it.each([
+    {
+      args: ["alpha"],
+      options: { name: "alpha", bind: [] },
+      workspace: undefined,
+      hasAutomationFlags: false,
+    },
+    {
+      args: "editor --role writer --json".split(" "),
+      options: { name: "editor", role: "writer", json: true, nonInteractive: false },
+      workspace: undefined,
+      hasAutomationFlags: false,
+    },
+    {
+      args: "beta --workspace /tmp/ws --bind telegram --bind discord:acct --non-interactive --json".split(
+        " ",
+      ),
+      options: {
         name: "beta",
-        workspace: "/tmp/ws",
         bind: ["telegram", "discord:acct"],
         nonInteractive: true,
         json: true,
-      }),
-      runtime,
-      { hasFlags: true },
-    );
-  });
-
-  it("runs agents list when root agents command is invoked", async () => {
-    await runCli(["agents"]);
-    expect(agentsListCommandMock).toHaveBeenCalledWith({}, runtime);
-  });
-
-  it("forwards agents list options", async () => {
-    await runCli(["agents", "list", "--json", "--bindings"]);
-    expect(agentsListCommandMock).toHaveBeenCalledWith(
-      {
-        json: true,
-        bindings: true,
       },
-      runtime,
-    );
-  });
+      workspace: "/tmp/ws",
+      hasAutomationFlags: true,
+    },
+  ])(
+    "selects agent creation posture for $args",
+    async ({ args, options, workspace, hasAutomationFlags }) => {
+      await runCli(["agents", "add", ...args]);
+      expect(mocks.agentsAddCommandMock).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining(options),
+        runtime,
+        { hasAutomationFlags },
+      );
+      expect(mocks.agentsAddCommandMock.mock.calls[0]?.[0].workspace).toBe(workspace);
+    },
+  );
 
-  it("forwards agents bindings options", async () => {
-    await runCli(["agents", "bindings", "--agent", "ops", "--json"]);
-    expect(agentsBindingsCommandMock).toHaveBeenCalledWith(
+  it.each([
+    ["", mocks.agentsListCommandMock, {}],
+    [
+      "list --json --bindings --tree",
+      mocks.agentsListCommandMock,
+      { json: true, bindings: true, tree: true },
+    ],
+    ["bindings --agent ops --json", mocks.agentsBindingsCommandMock, { agent: "ops", json: true }],
+    [
+      "bind --agent ops --bind matrix:ops --bind telegram --json",
+      mocks.agentsBindCommandMock,
+      { agent: "ops", bind: ["matrix:ops", "telegram"], json: true },
+    ],
+    [
+      "unbind --agent ops --all --json",
+      mocks.agentsUnbindCommandMock,
+      { agent: "ops", bind: [], all: true, json: true },
+    ],
+    [
+      "delete worker-a --force --json",
+      mocks.agentsDeleteCommandMock,
+      { id: "worker-a", force: true, json: true },
+    ],
+    [
+      "team create --preset team --coordinator lead --prefix docs --workspace-root /tmp/team --non-interactive --json",
+      mocks.agentsTeamCreateCommandMock,
       {
-        agent: "ops",
-        json: true,
-      },
-      runtime,
-    );
-  });
-
-  it("forwards agents bind options", async () => {
-    await runCli([
-      "agents",
-      "bind",
-      "--agent",
-      "ops",
-      "--bind",
-      "matrix:ops",
-      "--bind",
-      "telegram",
-      "--json",
-    ]);
-    expect(agentsBindCommandMock).toHaveBeenCalledWith(
-      {
-        agent: "ops",
-        bind: ["matrix:ops", "telegram"],
-        json: true,
-      },
-      runtime,
-    );
-  });
-
-  it("documents bind accountId resolution behavior in help text", () => {
-    const program = new Command();
-    registerAgentCommands(program, { agentChannelOptions: "last|telegram|discord" });
-    const agents = program.commands.find((command) => command.name() === "agents");
-    const bind = agents?.commands.find((command) => command.name() === "bind");
-    const help = bind?.helpInformation() ?? "";
-    expect(help).toContain("accountId is resolved by channel defaults/hooks");
-  });
-
-  it("forwards agents unbind options", async () => {
-    await runCli(["agents", "unbind", "--agent", "ops", "--all", "--json"]);
-    expect(agentsUnbindCommandMock).toHaveBeenCalledWith(
-      {
-        agent: "ops",
-        bind: [],
-        all: true,
+        preset: "team",
+        coordinator: "lead",
+        prefix: "docs",
+        workspaceRoot: "/tmp/team",
+        nonInteractive: true,
         json: true,
       },
-      runtime,
-    );
-  });
-
-  it("forwards agents delete options", async () => {
-    await runCli(["agents", "delete", "worker-a", "--force", "--json"]);
-    expect(agentsDeleteCommandMock).toHaveBeenCalledWith(
-      expect.objectContaining({
-        id: "worker-a",
-        force: true,
-        json: true,
-      }),
-      runtime,
-    );
-  });
-
-  it("forwards set-identity options", async () => {
-    await runCli([
-      "agents",
-      "set-identity",
-      "--agent",
-      "main",
-      "--workspace",
-      "/tmp/ws",
-      "--identity-file",
-      "/tmp/ws/IDENTITY.md",
-      "--from-identity",
-      "--name",
-      "OpenClaw",
-      "--theme",
-      "ops",
-      "--emoji",
-      ":lobster:",
-      "--avatar",
-      "https://example.com/openclaw.png",
-      "--json",
-    ]);
-    expect(agentsSetIdentityCommandMock).toHaveBeenCalledWith(
+    ],
+    [
+      "set-identity --agent main --workspace /tmp/ws --identity-file /tmp/ws/IDENTITY.md --from-identity --json",
+      mocks.agentsSetIdentityCommandMock,
       {
         agent: "main",
         workspace: "/tmp/ws",
         identityFile: "/tmp/ws/IDENTITY.md",
         fromIdentity: true,
-        name: "OpenClaw",
-        theme: "ops",
-        emoji: ":lobster:",
-        avatar: "https://example.com/openclaw.png",
         json: true,
       },
-      runtime,
+    ],
+  ] as const)("dispatches agents %s", async (args, command, options) => {
+    await runCli(["agents", ...(args ? args.split(" ") : [])]);
+    expect(command).toHaveBeenCalledExactlyOnceWith(options, runtime);
+  });
+
+  it("renders Gateway request failures without internal class names", async () => {
+    const message =
+      "The selected model was not found by the provider. Check the model id or choose a different model.";
+    agentCliCommandMock.mockRejectedValueOnce(
+      Object.assign(new Error(message), {
+        name: "GatewayClientRequestError",
+        code: "UNAVAILABLE",
+        gatewayCode: "UNAVAILABLE",
+        details: { reason: "model_not_found" },
+      }),
     );
-  });
-
-  it("reports errors via runtime when a command fails", async () => {
-    agentsListCommandMock.mockRejectedValueOnce(new Error("list failed"));
-
-    await runCli(["agents"]);
-
-    expect(runtime.error).toHaveBeenCalledWith("Error: list failed");
-    expect(runtime.exit).toHaveBeenCalledWith(1);
-  });
-
-  it("reports errors via runtime when agent command fails", async () => {
-    agentCliCommandMock.mockRejectedValueOnce(new Error("agent failed"));
-
-    await runCli(["agent", "--message", "hello"]);
-
-    expect(runtime.error).toHaveBeenCalledWith("Error: agent failed");
+    await runCli("agent --message hello --json".split(" "));
+    expect(runtime.error).toHaveBeenCalledWith(message);
+    expect(runtime.error).not.toHaveBeenCalledWith(expect.stringContaining("Error:"));
     expect(runtime.exit).toHaveBeenCalledWith(1);
   });
 });

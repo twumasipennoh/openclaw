@@ -1,8 +1,8 @@
-import { requestHeartbeatNow } from "../../infra/heartbeat-wake.js";
-import { enqueueSystemEvent } from "../../infra/system-events.js";
+import { requestHeartbeat } from "../../infra/heartbeat-wake.js";
 import { runCommandWithTimeout } from "../../process/exec.js";
 import { createLazyRuntimeMethod, createLazyRuntimeModule } from "../../shared/lazy-runtime.js";
 import { formatNativeDependencyHint } from "./native-deps.js";
+import { enqueueSystemEventFromSdk } from "./system-events.js";
 import type { RunHeartbeatOnceOptions } from "./types-core.js";
 import type { PluginRuntime } from "./types.js";
 
@@ -14,9 +14,22 @@ const runHeartbeatOnceInternal = createLazyRuntimeMethod(
   (runtime) => runtime.runHeartbeatOnce,
 );
 
+/** Creates the plugin runtime system facade with heartbeat/event/process helpers. */
 export function createRuntimeSystem(): PluginRuntime["system"] {
+  const requestHeartbeatNow: PluginRuntime["system"]["requestHeartbeatNow"] = (opts) =>
+    requestHeartbeat({
+      source: opts?.source ?? "other",
+      intent: opts?.intent ?? "immediate",
+      reason: opts?.reason,
+      coalesceMs: opts?.coalesceMs,
+      agentId: opts?.agentId,
+      sessionKey: opts?.sessionKey,
+      heartbeat: opts?.heartbeat,
+    });
+
   return {
-    enqueueSystemEvent,
+    enqueueSystemEvent: enqueueSystemEventFromSdk,
+    requestHeartbeat,
     requestHeartbeatNow,
     runHeartbeatOnce: (opts?: RunHeartbeatOnceOptions) => {
       // Destructure to forward only the plugin-safe subset; prevent cfg/deps injection at runtime.

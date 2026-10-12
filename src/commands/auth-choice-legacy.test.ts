@@ -1,25 +1,56 @@
-import { describe, expect, it } from "vitest";
-import {
-  resolveLegacyAuthChoiceAliasesForCli,
-  formatDeprecatedNonInteractiveAuthChoiceError,
-  normalizeLegacyOnboardAuthChoice,
-  resolveDeprecatedAuthChoiceReplacement,
-} from "./auth-choice-legacy.js";
+// Legacy auth-choice tests cover deprecated choice detection and replacement messages.
+import { describe, expect, it, vi } from "vitest";
+
+const manifestAuthChoices = vi.hoisted(() => [
+  {
+    pluginId: "anthropic",
+    providerId: "anthropic",
+    methodId: "cli",
+    choiceId: "anthropic-cli",
+    choiceLabel: "Anthropic Claude CLI",
+    deprecatedChoiceIds: ["claude-cli"],
+  },
+  {
+    pluginId: "openai",
+    providerId: "openai",
+    methodId: "oauth",
+    choiceId: "openai",
+    choiceLabel: "ChatGPT Login",
+  },
+]);
+
+vi.mock("../plugins/provider-auth-choices.js", () => ({
+  resolveManifestProviderAuthChoices: () => manifestAuthChoices,
+  resolveManifestDeprecatedProviderAuthChoice: (choiceId: string) =>
+    manifestAuthChoices.find((choice) => choice.deprecatedChoiceIds?.includes(choiceId) === true),
+}));
+
+import { resolveLegacyOnboardAuthChoice } from "./auth-choice-legacy.js";
+
+function authChoiceManifestEnv(): NodeJS.ProcessEnv {
+  return {
+    OPENCLAW_BUNDLED_PLUGINS_DIR: "extensions",
+    OPENCLAW_DISABLE_BUNDLED_PLUGINS: "0",
+    VITEST: "1",
+  } as NodeJS.ProcessEnv;
+}
 
 describe("auth choice legacy aliases", () => {
-  it("maps codex-cli to the plugin-backed Codex choice", () => {
-    expect(normalizeLegacyOnboardAuthChoice("codex-cli")).toBe("openai-codex");
-    expect(resolveDeprecatedAuthChoiceReplacement("codex-cli")).toEqual({
-      normalized: "openai-codex",
-      message:
-        'Auth choice "codex-cli" is deprecated; using OpenAI Codex (ChatGPT OAuth) setup instead.',
+  it("maps claude-cli to the new anthropic cli choice", () => {
+    expect(resolveLegacyOnboardAuthChoice("claude-cli", { env: authChoiceManifestEnv() })).toEqual({
+      authChoice: "anthropic-cli",
+      deprecated: {
+        message:
+          'Auth choice "claude-cli" is deprecated; using Anthropic Claude CLI setup instead.',
+        nonInteractiveError:
+          'Auth choice "claude-cli" is deprecated.\nUse "--auth-choice anthropic-cli".',
+      },
     });
-    expect(formatDeprecatedNonInteractiveAuthChoiceError("codex-cli")).toBe(
-      'Auth choice "codex-cli" is deprecated.\nUse "--auth-choice openai-codex".',
-    );
   });
 
-  it("sources deprecated cli aliases from plugin manifests", () => {
-    expect(resolveLegacyAuthChoiceAliasesForCli()).toEqual(["codex-cli"]);
+  it("does not keep retired Codex setup choices alive outside doctor", () => {
+    const result = resolveLegacyOnboardAuthChoice("codex-cli", { env: authChoiceManifestEnv() });
+    expect(result.authChoice).toBe("codex-cli");
+    expect(result.deprecated).toBeUndefined();
   });
 });

@@ -1,139 +1,102 @@
-import { existsSync } from "node:fs";
-import os from "node:os";
-import path from "node:path";
-import { hasPotentialConfiguredChannels } from "../channels/config-presence.js";
-import { resolveConfigPath, resolveStateDir } from "../config/paths.js";
+import { GENERATED_BUNDLED_CHANNEL_CONFIG_METADATA } from "../config/bundled-channel-config-metadata.generated.js";
 import type { OpenClawConfig } from "../config/types.js";
-import { resolveOsSummary } from "../infra/os-summary.js";
 import type { RuntimeEnv } from "../runtime.js";
-import type { getAgentLocalStatuses as getAgentLocalStatusesFn } from "./status.agent-local.js";
-import type { StatusScanResult } from "./status.scan.js";
-import { scanStatusJsonCore } from "./status.scan.json-core.js";
-import {
-  resolveSharedMemoryStatusSnapshot,
-  type MemoryPluginStatus,
-  type MemoryStatusSnapshot,
-} from "./status.scan.shared.js";
-let configIoModulePromise: Promise<typeof import("../config/io.js")> | undefined;
-let commandSecretTargetsModulePromise:
-  | Promise<typeof import("../cli/command-secret-targets.js")>
-  | undefined;
-let commandSecretGatewayModulePromise:
-  | Promise<typeof import("../cli/command-secret-gateway.js")>
-  | undefined;
-let memorySearchModulePromise: Promise<typeof import("../agents/memory-search.js")> | undefined;
-let statusScanDepsRuntimeModulePromise:
-  | Promise<typeof import("./status.scan.deps.runtime.js")>
-  | undefined;
+import { createLazyImportLoader } from "../shared/lazy-promise.js";
+import { isRecord } from "../utils.js";
+import type { StatusGatewayProbeBudget } from "./status.gateway-probe-budget.js";
+import { executeStatusScanFromOverview } from "./status.scan-execute.ts";
+import { collectStatusScanOverview } from "./status.scan-overview.ts";
+import type { StatusJsonScanResult } from "./status.scan-result.ts";
 
-function loadConfigIoModule() {
-  configIoModulePromise ??= import("../config/io.js");
-  return configIoModulePromise;
-}
+const statusGatewayModuleLoader = createLazyImportLoader(() => import("./status.scan.gateway.js"));
 
-function loadCommandSecretTargetsModule() {
-  commandSecretTargetsModulePromise ??= import("../cli/command-secret-targets.js");
-  return commandSecretTargetsModulePromise;
-}
+const statusScanMemoryModuleLoader = createLazyImportLoader(
+  () => import("./status.scan-memory.js"),
+);
+const statusScanPluginStatusModuleLoader = createLazyImportLoader(
+  () => import("../plugins/status.js"),
+);
 
-function loadCommandSecretGatewayModule() {
-  commandSecretGatewayModulePromise ??= import("../cli/command-secret-gateway.js");
-  return commandSecretGatewayModulePromise;
-}
+const IGNORED_CHANNEL_CONFIG_KEYS = new Set(["defaults", "modelByChannel"]);
+const STATUS_JSON_CHANNEL_ENV_PREFIXES = GENERATED_BUNDLED_CHANNEL_CONFIG_METADATA.filter(
+  (entry) => entry.configurable !== false,
+).map((entry) => `${entry.channelId.replace(/[^a-z0-9]+/gi, "_").toUpperCase()}_`);
+const STATUS_JSON_CHANNEL_ENV_VARS = new Set(
+  GENERATED_BUNDLED_CHANNEL_CONFIG_METADATA.filter((entry) => entry.configurable !== false).flatMap(
+    (entry) => entry.channelEnvVars ?? [],
+  ),
+);
 
-function loadMemorySearchModule() {
-  memorySearchModulePromise ??= import("../agents/memory-search.js");
-  return memorySearchModulePromise;
-}
-
-function loadStatusScanDepsRuntimeModule() {
-  statusScanDepsRuntimeModulePromise ??= import("./status.scan.deps.runtime.js");
-  return statusScanDepsRuntimeModulePromise;
-}
-
-function shouldSkipMissingConfigFastPath(): boolean {
-  return (
-    process.env.VITEST === "true" ||
-    process.env.VITEST_POOL_ID !== undefined ||
-    process.env.NODE_ENV === "test"
+function hasExplicitStatusJsonChannelConfig(cfg: OpenClawConfig): boolean {
+  if (!isRecord(cfg.channels)) {
+    return false;
+  }
+  // `enabled` alone can be a default scaffold; require another configured field.
+  return Object.entries(cfg.channels).some(
+    ([key, value]) =>
+      !IGNORED_CHANNEL_CONFIG_KEYS.has(key) &&
+      isRecord(value) &&
+      Object.keys(value).some((field) => field !== "enabled"),
   );
 }
 
-function isMissingConfigColdStart(): boolean {
-  return !shouldSkipMissingConfigFastPath() && !existsSync(resolveConfigPath(process.env));
-}
-
-function resolveDefaultMemoryStorePath(agentId: string): string {
-  return path.join(resolveStateDir(process.env, os.homedir), "memory", `${agentId}.sqlite`);
-}
-
-async function resolveMemoryStatusSnapshot(params: {
-  cfg: OpenClawConfig;
-  agentStatus: Awaited<ReturnType<typeof getAgentLocalStatusesFn>>;
-  memoryPlugin: MemoryPluginStatus;
-}): Promise<MemoryStatusSnapshot | null> {
-  const { resolveMemorySearchConfig } = await loadMemorySearchModule();
-  const { getMemorySearchManager } = await loadStatusScanDepsRuntimeModule();
-  return await resolveSharedMemoryStatusSnapshot({
-    cfg: params.cfg,
-    agentStatus: params.agentStatus,
-    memoryPlugin: params.memoryPlugin,
-    resolveMemoryConfig: resolveMemorySearchConfig,
-    getMemorySearchManager,
-    requireDefaultStore: resolveDefaultMemoryStorePath,
-  });
-}
-
-async function readStatusSourceConfig(): Promise<OpenClawConfig> {
-  if (!shouldSkipMissingConfigFastPath() && !existsSync(resolveConfigPath(process.env))) {
-    return {};
-  }
-  const { readBestEffortConfig } = await loadConfigIoModule();
-  return await readBestEffortConfig();
-}
-
-async function resolveStatusConfig(params: {
-  sourceConfig: OpenClawConfig;
-  commandName: "status --json";
-}): Promise<{ resolvedConfig: OpenClawConfig; diagnostics: string[] }> {
-  if (!shouldSkipMissingConfigFastPath() && !existsSync(resolveConfigPath(process.env))) {
-    return { resolvedConfig: params.sourceConfig, diagnostics: [] };
-  }
-  const [{ resolveCommandSecretRefsViaGateway }, { getStatusCommandSecretTargetIds }] =
-    await Promise.all([loadCommandSecretGatewayModule(), loadCommandSecretTargetsModule()]);
-  return await resolveCommandSecretRefsViaGateway({
-    config: params.sourceConfig,
-    commandName: params.commandName,
-    targetIds: getStatusCommandSecretTargetIds(),
-    mode: "read_only_status",
-  });
+function hasStatusJsonChannelEnvConfig(env: NodeJS.ProcessEnv = process.env): boolean {
+  return Object.entries(env).some(
+    ([key, value]) =>
+      typeof value === "string" &&
+      value.trim().length > 0 &&
+      (STATUS_JSON_CHANNEL_ENV_VARS.has(key) ||
+        STATUS_JSON_CHANNEL_ENV_PREFIXES.some((prefix) => key.startsWith(prefix))),
+  );
 }
 
 export async function scanStatusJsonFast(
-  opts: {
-    timeoutMs?: number;
+  opts: StatusGatewayProbeBudget & {
     all?: boolean;
   },
   runtime: RuntimeEnv,
-): Promise<StatusScanResult> {
-  const coldStart = isMissingConfigColdStart();
-  const loadedRaw = await readStatusSourceConfig();
-  const { resolvedConfig: cfg, diagnostics: secretDiagnostics } = await resolveStatusConfig({
-    sourceConfig: loadedRaw,
+): Promise<StatusJsonScanResult> {
+  const online = await (await statusGatewayModuleLoader.load()).scanStatusJsonGateway(opts);
+  if (online.scan) {
+    return online.scan;
+  }
+  const overview = await collectStatusScanOverview({
+    env: process.env,
     commandName: "status --json",
-  });
-  return await scanStatusJsonCore({
-    coldStart,
-    cfg,
-    sourceConfig: loadedRaw,
-    secretDiagnostics,
-    hasConfiguredChannels: hasPotentialConfiguredChannels(cfg, process.env, {
-      includePersistedAuthState: false,
-    }),
     opts,
-    resolveOsSummary,
-    resolveMemory: async ({ cfg, agentStatus, memoryPlugin }) =>
-      opts.all ? await resolveMemoryStatusSnapshot({ cfg, agentStatus, memoryPlugin }) : null,
+    showSecrets: false,
     runtime,
+    allowMissingConfigFastPath: true,
+    resolveHasConfiguredChannels: (cfg) =>
+      hasExplicitStatusJsonChannelConfig(cfg) || hasStatusJsonChannelEnvConfig(),
+    includeChannelsData: false,
+    fetchGitUpdate: opts.all === true,
+    includeRegistryUpdate: opts.all === true,
+    includeLocalStatusRpcFallback: opts.all === true,
+    gatewaySnapshot: online.gatewaySnapshot,
+  });
+  const pluginCompatibility = opts.all
+    ? await statusScanPluginStatusModuleLoader
+        .load()
+        .then(({ buildPluginCompatibilitySnapshotNotices }) =>
+          buildPluginCompatibilitySnapshotNotices({ config: overview.cfg }),
+        )
+    : [];
+  return await executeStatusScanFromOverview({
+    overview,
+    resolveMemory: async ({ cfg, agentStatus, memoryPlugin }) => {
+      if (!opts.all) {
+        return null;
+      }
+      const { resolveDefaultMemoryDatabasePath, resolveStatusMemoryStatusSnapshot } =
+        await statusScanMemoryModuleLoader.load();
+      return await resolveStatusMemoryStatusSnapshot({
+        cfg,
+        agentStatus,
+        memoryPlugin,
+        requireDefaultDatabasePath: resolveDefaultMemoryDatabasePath,
+      });
+    },
+    pluginCompatibility,
   });
 }

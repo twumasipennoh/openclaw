@@ -1,122 +1,144 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import { note } from "../terminal/note.js";
-import { withEnvAsync } from "../test-utils/env.js";
-import { runDoctorConfigWithInput } from "./doctor-config-flow.test-utils.js";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { createAccountListHelpers } from "../channels/plugins/account-helpers.js";
+import type { OpenClawConfig } from "../config/config.js";
+import { resolveAgentRoute } from "../routing/resolve-route.js";
+import { repairUnownedChannelAccountBindings } from "./doctor/shared/legacy-config-binding-repair.js";
 
-vi.mock("../terminal/note.js", () => ({
-  note: vi.fn(),
+vi.mock("../channels/plugins/read-only.js", () => ({
+  resolveReadOnlyChannelPluginsForConfig: () => {
+    const { listAccountIds } = createAccountListHelpers("discord", {
+      implicitDefaultAccount: { channelKeys: ["token"], envVars: ["DISCORD_BOT_TOKEN"] },
+    });
+    return {
+      configuredChannelIds: ["discord"],
+      plugins: [{ id: "discord", config: { listAccountIds } }],
+    };
+  },
 }));
 
-vi.mock("./doctor-legacy-config.js", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("./doctor-legacy-config.js")>();
-  return {
-    ...actual,
-    normalizeCompatibilityConfigValues: (cfg: unknown) => ({
-      config: cfg,
-      changes: [],
-    }),
-  };
-});
+type OwnershipRepairCase = {
+  name: string;
+  agents?: OpenClawConfig["agents"];
+  envToken?: boolean;
+  discord: NonNullable<OpenClawConfig["channels"]>["discord"];
+  bindings: NonNullable<OpenClawConfig["bindings"]>;
+  added: NonNullable<OpenClawConfig["bindings"]>;
+  sourceConfig?: unknown;
+};
 
-import { loadAndMaybeMigrateDoctorConfig } from "./doctor-config-flow.js";
+describe("doctor channel account ownership repair", () => {
+  afterEach(() => vi.unstubAllEnvs());
 
-const noteSpy = vi.mocked(note);
-
-describe("doctor missing default account binding warning", () => {
-  beforeEach(() => {
-    noteSpy.mockClear();
-  });
-
-  it("emits a doctor warning when named accounts have no valid account-scoped bindings", async () => {
-    await withEnvAsync(
-      {
-        TELEGRAM_BOT_TOKEN: undefined,
-        TELEGRAM_BOT_TOKEN_FILE: undefined,
+  it.each<OwnershipRepairCase>([
+    {
+      name: "explicit fleet does not inherit legacy list order",
+      sourceConfig: {
+        agents: { ownership: "explicit", list: [{ id: "ops" }, { id: "research" }] },
       },
-      async () => {
-        await runDoctorConfigWithInput({
-          config: {
-            channels: {
-              telegram: {
-                accounts: {
-                  alerts: {},
-                  work: {},
-                },
-              },
-            },
-            bindings: [{ agentId: "ops", match: { channel: "telegram" } }],
-          },
-          run: loadAndMaybeMigrateDoctorConfig,
-        });
-      },
+      discord: {},
+      bindings: [],
+      added: [],
+    },
+    {
+      name: "legacy fallback preserves narrower route owners",
+      sourceConfig: { agents: { list: [{ id: "ops" }, { id: "research" }] } },
+      discord: {},
+      bindings: [
+        { agentId: "ops", match: { channel: "discord", guildId: "guild-a" } },
+        { agentId: "research", match: { channel: "discord", guildId: "guild-b" } },
+      ],
+      added: [{ agentId: "ops", match: { channel: "discord", accountId: "default" } }],
+    },
+    {
+      name: "environment-only default account alongside a named account",
+      sourceConfig: { agents: { list: [{ id: "ops" }, { id: "research" }] } },
+      envToken: true,
+      discord: { accounts: { alerts: {} } },
+      bindings: [
+        { agentId: "ops", match: { channel: "discord", accountId: "*", guildId: "guild-a" } },
+      ],
+      added: [
+        { agentId: "ops", match: { channel: "discord", accountId: "alerts" } },
+        { agentId: "ops", match: { channel: "discord", accountId: "default" } },
+      ],
+    },
+    {
+      name: "disabled default account alongside an active account",
+      sourceConfig: { agents: { list: [{ id: "research" }, { id: "ops" }] } },
+      discord: { accounts: { default: { enabled: false }, work: {} } },
+      bindings: [
+        { agentId: "ops", match: { channel: "discord", guildId: "guild-a" } },
+        {
+          agentId: "research",
+          match: { channel: "discord", accountId: "work", guildId: "guild-b" },
+        },
+      ],
+      added: [{ agentId: "research", match: { channel: "discord", accountId: "work" } }],
+    },
+    {
+      name: "disabled channel",
+      discord: { enabled: false },
+      bindings: [{ agentId: "ops", match: { channel: "discord", guildId: "guild-a" } }],
+      added: [],
+    },
+    {
+      name: "unconfigured legacy main owner",
+      discord: {},
+      bindings: [{ agentId: "main", match: { channel: "discord", guildId: "guild-a" } }],
+      added: [],
+    },
+    {
+      name: "blank owner even when main is configured",
+      agents: { ownership: "explicit", entries: { main: {}, research: {} } },
+      discord: {},
+      bindings: [{ agentId: "   ", match: { channel: "discord", guildId: "guild-a" } }],
+      added: [],
+    },
+    {
+      name: "existing channel-wide route",
+      discord: { accounts: { default: {}, work: {} } },
+      bindings: [
+        { agentId: "research", match: { channel: "discord", accountId: "*" } },
+        { agentId: "ops", match: { channel: "discord", guildId: "guild-a" } },
+      ],
+      added: [],
+    },
+  ])("repairs only proven ownership for $name", (testCase) => {
+    const { discord, bindings, added } = testCase;
+    vi.stubEnv(
+      "DISCORD_BOT_TOKEN",
+      "envToken" in testCase && testCase.envToken ? "synthetic-discord-token" : undefined,
     );
-
-    expect(noteSpy).toHaveBeenCalledWith(
-      expect.stringContaining("channels.telegram: accounts.default is missing"),
-      "Doctor warnings",
-    );
-  });
-
-  it("emits a warning when multiple accounts have no explicit default", async () => {
-    await withEnvAsync(
-      {
-        TELEGRAM_BOT_TOKEN: undefined,
-        TELEGRAM_BOT_TOKEN_FILE: undefined,
-      },
-      async () => {
-        await runDoctorConfigWithInput({
-          config: {
-            channels: {
-              telegram: {
-                accounts: {
-                  alerts: {},
-                  work: {},
-                },
-              },
-            },
-          },
-          run: loadAndMaybeMigrateDoctorConfig,
-        });
-      },
-    );
-
-    expect(noteSpy).toHaveBeenCalledWith(
-      expect.stringContaining(
-        "channels.telegram: multiple accounts are configured but no explicit default is set",
-      ),
-      "Doctor warnings",
-    );
-  });
-
-  it("emits a warning when defaultAccount does not match configured accounts", async () => {
-    await withEnvAsync(
-      {
-        TELEGRAM_BOT_TOKEN: undefined,
-        TELEGRAM_BOT_TOKEN_FILE: undefined,
-      },
-      async () => {
-        await runDoctorConfigWithInput({
-          config: {
-            channels: {
-              telegram: {
-                defaultAccount: "missing",
-                accounts: {
-                  alerts: {},
-                  work: {},
-                },
-              },
-            },
-          },
-          run: loadAndMaybeMigrateDoctorConfig,
-        });
-      },
-    );
-
-    expect(noteSpy).toHaveBeenCalledWith(
-      expect.stringContaining(
-        'channels.telegram: defaultAccount is set to "missing" but does not match configured accounts',
-      ),
-      "Doctor warnings",
-    );
+    const config: OpenClawConfig = {
+      agents: testCase.agents ?? { ownership: "explicit", entries: { ops: {}, research: {} } },
+      channels: { discord },
+      bindings,
+    };
+    const repaired = repairUnownedChannelAccountBindings({
+      config,
+      sourceConfigBeforeMigrations: testCase.sourceConfig,
+    });
+    expect(repaired.config.bindings).toEqual([...bindings, ...added]);
+    for (const binding of added) {
+      expect(resolveAgentRoute({ cfg: repaired.config, ...binding.match }).agentId).toBe(
+        binding.agentId,
+      );
+    }
+    if (testCase.name === "legacy fallback preserves narrower route owners") {
+      expect(
+        resolveAgentRoute({ cfg: repaired.config, channel: "discord", guildId: "guild-b" }).agentId,
+      ).toBe("research");
+    }
+    if (testCase.name === "explicit fleet does not inherit legacy list order") {
+      expect(repaired.warnings?.join("\n")).toContain(
+        '{"agentId":"<agentId>","match":{"channel":"discord","accountId":"default"}}',
+      );
+    }
+    const secondPass = repairUnownedChannelAccountBindings({
+      config: repaired.config,
+      sourceConfigBeforeMigrations: testCase.sourceConfig,
+    });
+    expect(secondPass.config).toBe(repaired.config);
+    expect(secondPass.changes).toEqual([]);
   });
 });

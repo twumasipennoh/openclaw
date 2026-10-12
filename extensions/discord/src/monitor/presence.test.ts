@@ -3,42 +3,50 @@ import { resolveDiscordPresenceUpdate } from "./presence.js";
 
 describe("resolveDiscordPresenceUpdate", () => {
   it("returns online presence when no config is provided", () => {
-    const result = resolveDiscordPresenceUpdate({});
-    expect(result).not.toBeNull();
-    expect(result!.status).toBe("online");
-    expect(result!.activities).toEqual([]);
+    expect(resolveDiscordPresenceUpdate({})).toEqual({
+      status: "online",
+      activities: [],
+      since: null,
+      afk: false,
+    });
   });
 
   it("uses configured status", () => {
-    const result = resolveDiscordPresenceUpdate({ status: "dnd" });
-    expect(result!.status).toBe("dnd");
+    expect(resolveDiscordPresenceUpdate({ status: "dnd" })).toEqual({
+      status: "dnd",
+      activities: [],
+      since: null,
+      afk: false,
+    });
   });
 
-  it("includes activity when configured", () => {
-    const result = resolveDiscordPresenceUpdate({ activity: "Helping humans" });
-    expect(result!.status).toBe("online");
-    expect(result!.activities).toHaveLength(1);
-    expect(result!.activities[0].state).toBe("Helping humans");
-  });
-
-  it("uses custom activity type by default", () => {
-    const result = resolveDiscordPresenceUpdate({ activity: "test" });
-    expect(result!.activities[0].type).toBe(4);
-    expect(result!.activities[0].name).toBe("Custom Status");
+  it("includes custom activity by default", () => {
+    expect(resolveDiscordPresenceUpdate({ activity: "Helping humans" })).toEqual({
+      status: "online",
+      activities: [{ type: 4, name: "Custom Status", state: "Helping humans" }],
+      since: null,
+      afk: false,
+    });
   });
 
   it("respects explicit activityType", () => {
-    const result = resolveDiscordPresenceUpdate({ activity: "test", activityType: 3 });
-    expect(result!.activities[0].type).toBe(3);
-    expect(result!.activities[0].name).toBe("test");
+    expect(resolveDiscordPresenceUpdate({ activity: "test", activityType: 3 })).toMatchObject({
+      activities: [{ type: 3, name: "test" }],
+    });
   });
 
   it("sets streaming URL for type 1", () => {
-    const result = resolveDiscordPresenceUpdate({
-      activity: "Live",
-      activityType: 1,
-      activityUrl: "https://twitch.tv/test",
+    expect(
+      resolveDiscordPresenceUpdate({
+        activity: "Live",
+        activityType: 1,
+        activityUrl: "https://twitch.tv/test",
+      }),
+    ).toEqual({
+      status: "online",
+      activities: [{ type: 1, name: "Live", url: "https://twitch.tv/test" }],
+      since: null,
+      afk: false,
     });
-    expect(result!.activities[0].url).toBe("https://twitch.tv/test");
   });
 });

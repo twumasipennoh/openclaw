@@ -1,31 +1,20 @@
+// Line helper module supports config adapter behavior.
 import { createScopedChannelConfigAdapter } from "openclaw/plugin-sdk/channel-config-helpers";
-import {
-  listLineAccountIds,
-  resolveDefaultLineAccountId,
-  resolveLineAccount,
-  type OpenClawConfig,
-  type ResolvedLineAccount,
-} from "./channel-api.js";
-
-export function normalizeLineAllowFrom(entry: string): string {
-  return entry.replace(/^line:(?:user:)?/i, "");
-}
+import { normalizeStringEntries } from "openclaw/plugin-sdk/string-coerce-runtime";
+import { listLineAccountIds, resolveDefaultLineAccountId, resolveLineAccount } from "./accounts.js";
+import { normalizeLineAllowEntry } from "./bot-access.js";
+import type { ResolvedLineAccount } from "./types.js";
 
 export const lineConfigAdapter = createScopedChannelConfigAdapter<
   ResolvedLineAccount,
-  ResolvedLineAccount,
-  OpenClawConfig
+  ResolvedLineAccount
 >({
   sectionKey: "line",
   listAccountIds: listLineAccountIds,
   resolveAccount: (cfg, accountId) =>
     resolveLineAccount({ cfg, accountId: accountId ?? undefined }),
   defaultAccountId: resolveDefaultLineAccountId,
-  clearBaseFields: ["channelSecret", "tokenFile", "secretFile"],
+  clearBaseFields: ["channelAccessToken", "channelSecret", "tokenFile", "secretFile", "name"],
   resolveAllowFrom: (account) => account.config.allowFrom,
-  formatAllowFrom: (allowFrom) =>
-    allowFrom
-      .map((entry) => String(entry).trim())
-      .filter(Boolean)
-      .map(normalizeLineAllowFrom),
+  formatAllowFrom: (allowFrom) => normalizeStringEntries(allowFrom).map(normalizeLineAllowEntry),
 });

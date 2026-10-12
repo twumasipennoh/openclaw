@@ -1,7 +1,8 @@
+// Matrix tests cover profile plugin behavior.
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const loadWebMediaMock = vi.fn();
-const syncMatrixOwnProfileMock = vi.fn();
+const syncMatrixOwnProfileMock = vi.fn<typeof import("../profile.js").syncMatrixOwnProfile>();
 const withResolvedActionClientMock = vi.fn();
 
 vi.mock("../../runtime.js", () => ({
@@ -13,7 +14,7 @@ vi.mock("../../runtime.js", () => ({
 }));
 
 vi.mock("../profile.js", () => ({
-  syncMatrixOwnProfile: (...args: unknown[]) => syncMatrixOwnProfileMock(...args),
+  syncMatrixOwnProfile: syncMatrixOwnProfileMock,
 }));
 
 vi.mock("./client.js", () => ({
@@ -41,10 +42,11 @@ describe("matrix profile actions", () => {
   });
 
   it("trims profile fields and persists through the action client wrapper", async () => {
+    const actionClient = {
+      getUserId: vi.fn(async () => "@bot:example.org"),
+    };
     withResolvedActionClientMock.mockImplementation(async (_opts, run) => {
-      return await run({
-        getUserId: vi.fn(async () => "@bot:example.org"),
-      });
+      return await run(actionClient);
     });
 
     await updateMatrixOwnProfile({
@@ -54,7 +56,7 @@ describe("matrix profile actions", () => {
       avatarPath: "  /tmp/avatar.png  ",
     });
 
-    expect(withResolvedActionClientMock).toHaveBeenCalledWith(
+    expect(withResolvedActionClientMock).toHaveBeenCalledExactlyOnceWith(
       {
         accountId: "ops",
         displayName: "  Ops Bot  ",
@@ -64,14 +66,16 @@ describe("matrix profile actions", () => {
       expect.any(Function),
       "persist",
     );
-    expect(syncMatrixOwnProfileMock).toHaveBeenCalledWith(
-      expect.objectContaining({
-        userId: "@bot:example.org",
-        displayName: "Ops Bot",
-        avatarUrl: "mxc://example/avatar",
-        avatarPath: "/tmp/avatar.png",
-      }),
-    );
+    expect(syncMatrixOwnProfileMock).toHaveBeenCalledExactlyOnceWith({
+      client: actionClient,
+      userId: "@bot:example.org",
+      displayName: "Ops Bot",
+      avatarUrl: "mxc://example/avatar",
+      avatarPath: "/tmp/avatar.png",
+      loadAvatarFromUrl: expect.any(Function),
+      loadAvatarFromPath: expect.any(Function),
+    });
+    expect(syncMatrixOwnProfileMock.mock.calls[0]?.[0].client).toBe(actionClient);
   });
 
   it("bridges avatar loaders through Matrix runtime media helpers", async () => {
@@ -86,15 +90,10 @@ describe("matrix profile actions", () => {
       avatarPath: "/tmp/avatar.png",
     });
 
-    const call = syncMatrixOwnProfileMock.mock.calls[0]?.[0] as
-      | {
-          loadAvatarFromUrl: (url: string, maxBytes: number) => Promise<unknown>;
-          loadAvatarFromPath: (path: string, maxBytes: number) => Promise<unknown>;
-        }
-      | undefined;
+    const call = syncMatrixOwnProfileMock.mock.calls[0]?.[0];
 
-    if (!call) {
-      throw new Error("syncMatrixOwnProfile was not called");
+    if (!call?.loadAvatarFromUrl || !call.loadAvatarFromPath) {
+      throw new Error("Expected profile avatar loaders");
     }
 
     await call.loadAvatarFromUrl("https://cdn.example.org/avatar.png", 123);

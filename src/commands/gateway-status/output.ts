@@ -1,20 +1,57 @@
+import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
+import { colorize, theme } from "../../../packages/terminal-core/src/theme.js";
 import type { RuntimeEnv } from "../../runtime.js";
 import { writeRuntimeJson } from "../../runtime.js";
-import { colorize, theme } from "../../terminal/theme.js";
 import { serializeGatewayDiscoveryBeacon } from "./discovery.js";
 import {
   isProbeReachable,
+  isPostConnectProbeFailure,
   isScopeLimitedProbeFailure,
+  summarizeGatewayProbeCapability,
   renderProbeSummaryLine,
   renderTargetHeader,
 } from "./helpers.js";
 import type { GatewayStatusProbedTarget } from "./probe-run.js";
 
-export type GatewayStatusWarning = {
+type GatewayStatusWarning = {
   code: string;
   message: string;
+  details?: string[];
   targetIds?: string[];
 };
+
+const noReachableGatewayDiagnostic =
+  "No gateway answered any probe and Bonjour discovery returned no local gateways. Run `openclaw gateway status --deep --require-rpc` to inspect service state, config paths, listener owners, and logs; include `ss -ltnp` or `lsof -nP -iTCP:<port> -sTCP:LISTEN` for the configured port when filing a report.";
+
+function gatewaySelfIdentityKey(entry: GatewayStatusProbedTarget): string | null {
+  if (!entry.self) {
+    return null;
+  }
+  const host = normalizeLowercaseStringOrEmpty(entry.self.host);
+  const ip = normalizeLowercaseStringOrEmpty(entry.self.ip);
+  const instanceId = normalizeLowercaseStringOrEmpty(entry.self.instanceId);
+  const deviceId = normalizeLowercaseStringOrEmpty(entry.self.deviceId);
+  const discriminator = instanceId
+    ? `instance:${instanceId}`
+    : deviceId
+      ? `device:${deviceId}`
+      : "";
+  if ((!host && !ip) || !discriminator) {
+    return null;
+  }
+  return `${host}\0${ip}\0${discriminator}`;
+}
+
+function hasMultipleReachableGatewayIdentities(reachable: GatewayStatusProbedTarget[]): boolean {
+  if (reachable.length <= 1) {
+    return false;
+  }
+  const identityKeys = reachable.map(gatewaySelfIdentityKey);
+  if (identityKeys.some((key) => key === null)) {
+    return true;
+  }
+  return new Set(identityKeys).size > 1;
+}
 
 export function pickPrimaryProbedTarget(probed: GatewayStatusProbedTarget[]) {
   const reachable = probed.filter((entry) => isProbeReachable(entry.probe));
@@ -32,25 +69,46 @@ export function buildGatewayStatusWarnings(params: {
   sshTarget: string | null;
   sshTunnelStarted: boolean;
   sshTunnelError: string | null;
+  localTlsLoadError?: string | null;
+  discoveryCount?: number;
 }): GatewayStatusWarning[] {
   const reachable = params.probed.filter((entry) => isProbeReachable(entry.probe));
   const degradedScopeLimited = params.probed.filter((entry) =>
     isScopeLimitedProbeFailure(entry.probe),
+  );
+  const degradedDetailFailed = params.probed.filter(
+    (entry) => isPostConnectProbeFailure(entry.probe) && !isScopeLimitedProbeFailure(entry.probe),
   );
   const warnings: GatewayStatusWarning[] = [];
   if (params.sshTarget && !params.sshTunnelStarted) {
     warnings.push({
       code: "ssh_tunnel_failed",
       message: params.sshTunnelError
-        ? `SSH tunnel failed: ${String(params.sshTunnelError)}`
+        ? `SSH tunnel failed: ${params.sshTunnelError}`
         : "SSH tunnel failed to start; falling back to direct probes.",
     });
   }
-  if (reachable.length > 1) {
+  if (params.localTlsLoadError) {
+    warnings.push({
+      code: "local_tls_runtime_unavailable",
+      message: `Local gateway TLS is enabled but OpenClaw could not load the local certificate fingerprint: ${params.localTlsLoadError}`,
+      targetIds: ["localLoopback"],
+    });
+  }
+  if (reachable.length === 0 && params.discoveryCount === 0) {
+    warnings.push({
+      code: "no_gateway_reachable",
+      message: noReachableGatewayDiagnostic,
+      targetIds: params.probed.map((entry) => entry.target.id),
+    });
+  }
+  if (hasMultipleReachableGatewayIdentities(reachable)) {
+    // Multiple reachable gateways are valid for isolated profiles but surprising
+    // enough to call out before users debug against the wrong process.
     warnings.push({
       code: "multiple_gateways",
       message:
-        "Unconventional setup: multiple reachable gateways detected. Usually one gateway per network is recommended unless you intentionally run isolated profiles, like a rescue bot (see docs: /gateway#multiple-gateways-same-host).",
+        "Unconventional setup: multiple reachable gateway identities detected. Usually one gateway per network is recommended unless you intentionally run isolated profiles, like a rescue bot (see docs: /gateway#multiple-gateways-same-host).",
       targetIds: reachable.map((entry) => entry.target.id),
     });
   }
@@ -70,7 +128,15 @@ export function buildGatewayStatusWarnings(params: {
     warnings.push({
       code: "probe_scope_limited",
       message:
-        "Probe diagnostics are limited by gateway scopes (missing operator.read). Connection succeeded, but status details may be incomplete. Hint: pair device identity or use credentials with operator.read.",
+        "Read-probe diagnostics are limited by gateway scopes (missing operator.read). Connection succeeded, but read-only status calls are incomplete. Hint: pair device identity or use credentials with operator.read.",
+      targetIds: [result.target.id],
+    });
+  }
+  for (const result of degradedDetailFailed) {
+    const detail = result.probe.error ? `: ${result.probe.error}` : ".";
+    warnings.push({
+      code: "probe_detail_failed",
+      message: `Gateway accepted the WebSocket connection, but follow-up read diagnostics failed${detail}`,
       targetIds: [result.target.id],
     });
   }
@@ -89,10 +155,12 @@ export function writeGatewayStatusJson(params: {
   primaryTargetId: string | null;
 }) {
   const reachable = params.probed.filter((entry) => isProbeReachable(entry.probe));
-  const degraded = params.probed.some((entry) => isScopeLimitedProbeFailure(entry.probe));
+  const degraded = params.probed.some((entry) => isPostConnectProbeFailure(entry.probe));
+  const capability = summarizeGatewayProbeCapability(reachable.map((entry) => entry.probe));
   writeRuntimeJson(params.runtime, {
     ok: reachable.length > 0,
     degraded,
+    capability,
     ts: Date.now(),
     durationMs: Date.now() - params.startedAt,
     timeoutMs: params.overallTimeoutMs,
@@ -102,7 +170,7 @@ export function writeGatewayStatusJson(params: {
     discovery: {
       timeoutMs: params.discoveryTimeoutMs,
       count: params.discovery.length,
-      beacons: params.discovery.map((beacon) => serializeGatewayDiscoveryBeacon(beacon)),
+      beacons: params.discovery.map(serializeGatewayDiscoveryBeacon),
     },
     targets: params.probed.map((entry) => ({
       id: entry.target.id,
@@ -118,6 +186,8 @@ export function writeGatewayStatusJson(params: {
         error: entry.probe.error,
         close: entry.probe.close,
       },
+      auth: entry.probe.auth,
+      server: entry.probe.server,
       self: entry.self,
       config: entry.configSummary,
       health: entry.probe.health,
@@ -141,11 +211,15 @@ export function writeGatewayStatusText(params: {
 }) {
   const reachable = params.probed.filter((entry) => isProbeReachable(entry.probe));
   const ok = reachable.length > 0;
+  const capability = summarizeGatewayProbeCapability(reachable.map((entry) => entry.probe));
   params.runtime.log(colorize(params.rich, theme.heading, "Gateway Status"));
   params.runtime.log(
     ok
       ? `${colorize(params.rich, theme.success, "Reachable")}: yes`
       : `${colorize(params.rich, theme.error, "Reachable")}: no`,
+  );
+  params.runtime.log(
+    `${colorize(params.rich, theme.info, "Capability")}: ${capability.replaceAll("_", "-")}`,
   );
   params.runtime.log(
     colorize(params.rich, theme.muted, `Probe budget: ${params.overallTimeoutMs}ms`),
@@ -156,6 +230,9 @@ export function writeGatewayStatusText(params: {
     params.runtime.log(colorize(params.rich, theme.warn, "Warning:"));
     for (const warning of params.warnings) {
       params.runtime.log(`- ${warning.message}`);
+      for (const detail of warning.details ?? []) {
+        params.runtime.log(`  ${detail}`);
+      }
     }
   }
 
@@ -163,9 +240,7 @@ export function writeGatewayStatusText(params: {
   params.runtime.log(colorize(params.rich, theme.heading, "Discovery (this machine)"));
   const discoveryDomains = params.wideAreaDomain ? `local. + ${params.wideAreaDomain}` : "local.";
   params.runtime.log(
-    params.discovery.length > 0
-      ? `Found ${params.discovery.length} gateway(s) via Bonjour (${discoveryDomains})`
-      : `Found 0 gateways via Bonjour (${discoveryDomains})`,
+    `Found ${params.discovery.length} ${params.discovery.length > 0 ? "gateway(s)" : "gateways"} via Bonjour (${discoveryDomains})`,
   );
   if (params.discovery.length === 0) {
     params.runtime.log(

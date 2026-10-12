@@ -1,5 +1,6 @@
 import { Command } from "commander";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { ExpectedCliError } from "../failure-output.js";
 import { registerStatusHealthSessionsCommands } from "./register.status-health-sessions.js";
 
 const mocks = vi.hoisted(() => ({
@@ -7,357 +8,277 @@ const mocks = vi.hoisted(() => ({
   healthCommand: vi.fn(),
   sessionsCommand: vi.fn(),
   sessionsCleanupCommand: vi.fn(),
-  tasksListCommand: vi.fn(),
-  tasksAuditCommand: vi.fn(),
-  tasksMaintenanceCommand: vi.fn(),
-  tasksShowCommand: vi.fn(),
-  tasksNotifyCommand: vi.fn(),
-  tasksCancelCommand: vi.fn(),
-  flowsListCommand: vi.fn(),
-  flowsShowCommand: vi.fn(),
-  flowsCancelCommand: vi.fn(),
+  sessionsTailCommand: vi.fn(),
+  sessionsCompactCommand: vi.fn(),
+  sessionsArchiveCommand: vi.fn(),
+  sessionsDeleteCommand: vi.fn(),
+  exportTrajectoryCommand: vi.fn(),
+  ownerLoaded: vi.fn(),
   setVerbose: vi.fn(),
-  runtime: {
-    log: vi.fn(),
-    error: vi.fn(),
-    exit: vi.fn(),
-  },
+  runtime: { log: vi.fn(), error: vi.fn(), exit: vi.fn() },
 }));
-
-const statusCommand = mocks.statusCommand;
-const healthCommand = mocks.healthCommand;
-const sessionsCommand = mocks.sessionsCommand;
-const sessionsCleanupCommand = mocks.sessionsCleanupCommand;
-const tasksListCommand = mocks.tasksListCommand;
-const tasksAuditCommand = mocks.tasksAuditCommand;
-const tasksMaintenanceCommand = mocks.tasksMaintenanceCommand;
-const tasksShowCommand = mocks.tasksShowCommand;
-const tasksNotifyCommand = mocks.tasksNotifyCommand;
-const tasksCancelCommand = mocks.tasksCancelCommand;
-const flowsListCommand = mocks.flowsListCommand;
-const flowsShowCommand = mocks.flowsShowCommand;
-const flowsCancelCommand = mocks.flowsCancelCommand;
-const setVerbose = mocks.setVerbose;
-const runtime = mocks.runtime;
-
-vi.mock("../../commands/status.js", () => ({
-  statusCommand: mocks.statusCommand,
-}));
-
-vi.mock("../../commands/health.js", () => ({
-  healthCommand: mocks.healthCommand,
-}));
-
-vi.mock("../../commands/sessions.js", () => ({
-  sessionsCommand: mocks.sessionsCommand,
-}));
-
-vi.mock("../../commands/sessions-cleanup.js", () => ({
-  sessionsCleanupCommand: mocks.sessionsCleanupCommand,
-}));
-
-vi.mock("../../commands/tasks.js", () => ({
-  tasksListCommand: mocks.tasksListCommand,
-  tasksAuditCommand: mocks.tasksAuditCommand,
-  tasksMaintenanceCommand: mocks.tasksMaintenanceCommand,
-  tasksShowCommand: mocks.tasksShowCommand,
-  tasksNotifyCommand: mocks.tasksNotifyCommand,
-  tasksCancelCommand: mocks.tasksCancelCommand,
-}));
-
-vi.mock("../../commands/flows.js", () => ({
-  flowsListCommand: mocks.flowsListCommand,
-  flowsShowCommand: mocks.flowsShowCommand,
-  flowsCancelCommand: mocks.flowsCancelCommand,
-}));
-
-vi.mock("../../globals.js", () => ({
-  setVerbose: mocks.setVerbose,
-}));
-
-vi.mock("../../runtime.js", () => ({
+vi.mock("../../commands/status.js", () => ({ statusCommand: mocks.statusCommand }));
+vi.mock("../../commands/health.js", () => ({ healthCommand: mocks.healthCommand }));
+vi.mock("../../commands/sessions.js", () => ({ sessionsCommand: mocks.sessionsCommand }));
+vi.mock("../../commands/sessions-cleanup.js", () => {
+  mocks.ownerLoaded();
+  return { sessionsCleanupCommand: mocks.sessionsCleanupCommand };
+});
+vi.mock("../../commands/sessions-tail.js", () => {
+  mocks.ownerLoaded();
+  return { sessionsTailCommand: mocks.sessionsTailCommand };
+});
+vi.mock("../../commands/sessions-compact.js", () => {
+  mocks.ownerLoaded();
+  return { sessionsCompactCommand: mocks.sessionsCompactCommand };
+});
+vi.mock("../../commands/sessions-lifecycle.js", () => {
+  mocks.ownerLoaded();
+  return {
+    sessionsArchiveCommand: mocks.sessionsArchiveCommand,
+    sessionsDeleteCommand: mocks.sessionsDeleteCommand,
+  };
+});
+vi.mock("../../commands/export-trajectory.js", () => {
+  mocks.ownerLoaded();
+  return { exportTrajectoryCommand: mocks.exportTrajectoryCommand };
+});
+vi.mock("../../globals.js", () => ({ setVerbose: mocks.setVerbose }));
+vi.mock("../../runtime.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../runtime.js")>()),
   defaultRuntime: mocks.runtime,
 }));
 
+function program() {
+  const cli = new Command();
+  registerStatusHealthSessionsCommands(cli);
+  return cli;
+}
+async function run(args: string | string[]) {
+  await program().parseAsync(typeof args === "string" ? args.split(" ") : args, { from: "user" });
+}
+function expectOptions(owner: typeof mocks.sessionsCommand, options: Record<string, unknown>) {
+  expect(owner).toHaveBeenCalledExactlyOnceWith(expect.objectContaining(options), mocks.runtime);
+}
+async function runSession(placement: string, command: string, options: string[], extra = "") {
+  await run([
+    "sessions",
+    ...(placement === "parent" ? [...options, command] : [command, ...options]),
+    ...extra.split(" ").filter(Boolean),
+  ]);
+}
+async function expectRejection(
+  args: string[],
+  owner: typeof mocks.sessionsCommand,
+  message: string,
+) {
+  const execution = run(args);
+  await expect(execution).rejects.toBeInstanceOf(ExpectedCliError);
+  await expect(execution).rejects.toMatchObject({ message });
+  expect(owner).not.toHaveBeenCalled();
+  expect(mocks.ownerLoaded).not.toHaveBeenCalled();
+  expect(mocks.runtime.error).not.toHaveBeenCalled();
+  expect(mocks.runtime.exit).not.toHaveBeenCalled();
+}
+const key = "agent:work:main";
+const blankStore = ["--store", ""];
+const selection = ["--agent", "work", "--all-agents", "--active", "120", "--limit", "25"];
+const listOptions = {
+  json: true,
+  store: "",
+  agent: "work",
+  allAgents: true,
+  active: "120",
+  limit: "25",
+};
+
 describe("registerStatusHealthSessionsCommands", () => {
-  async function runCli(args: string[]) {
-    const program = new Command();
-    registerStatusHealthSessionsCommands(program);
-    await program.parseAsync(args, { from: "user" });
-  }
+  beforeEach(() => vi.clearAllMocks());
 
-  beforeEach(() => {
-    vi.clearAllMocks();
-    runtime.exit.mockImplementation(() => {});
-    statusCommand.mockResolvedValue(undefined);
-    healthCommand.mockResolvedValue(undefined);
-    sessionsCommand.mockResolvedValue(undefined);
-    sessionsCleanupCommand.mockResolvedValue(undefined);
-    tasksListCommand.mockResolvedValue(undefined);
-    tasksAuditCommand.mockResolvedValue(undefined);
-    tasksMaintenanceCommand.mockResolvedValue(undefined);
-    tasksShowCommand.mockResolvedValue(undefined);
-    tasksNotifyCommand.mockResolvedValue(undefined);
-    tasksCancelCommand.mockResolvedValue(undefined);
-    flowsListCommand.mockResolvedValue(undefined);
-    flowsShowCommand.mockResolvedValue(undefined);
-    flowsCancelCommand.mockResolvedValue(undefined);
+  it.each([
+    [
+      "sessions --active 5 cleanup",
+      mocks.sessionsCleanupCommand,
+      "`sessions cleanup` does not support the parent `sessions` option --active; session-list filters cannot scope session maintenance.",
+    ],
+    [
+      "sessions --json tail",
+      mocks.sessionsTailCommand,
+      "`sessions tail` does not support the parent `sessions` option --json; trajectory tail emits human-readable progress and selects sessions separately.",
+    ],
+    [
+      "sessions --all-agents export-trajectory",
+      mocks.exportTrajectoryCommand,
+      "`sessions export-trajectory` does not support the parent `sessions` option --all-agents; trajectory export targets one session and cannot apply session-list filters.",
+    ],
+    [
+      `sessions --store /tmp/other.sqlite archive ${key}`,
+      mocks.sessionsArchiveCommand,
+      "`sessions archive` does not support the parent `sessions` option --store; the gateway resolves target stores from each key and --agent.",
+    ],
+    [
+      `sessions --store /tmp/other.sqlite --all-agents --limit 25 --verbose compact ${key}`,
+      mocks.sessionsCompactCommand,
+      "`sessions compact` does not support the parent `sessions` options --store, --all-agents, --limit, --verbose; the gateway resolves the target store from <key> and --agent.",
+    ],
+    [
+      `sessions delete ${key} --timeout 0 --json`,
+      mocks.sessionsDeleteCommand,
+      "--timeout must be a positive integer (milliseconds).",
+    ],
+    [
+      `sessions compact ${key} --max-lines 0 --json`,
+      mocks.sessionsCompactCommand,
+      "--max-lines must be a positive integer.",
+    ],
+    [
+      `sessions compact ${key} --timeout 0 --json`,
+      mocks.sessionsCompactCommand,
+      "--timeout must be a positive integer (milliseconds).",
+    ],
+  ] as const)("rejects %s before loading the session owner", async (args, owner, message) => {
+    await expectRejection(args.split(" "), owner, message);
   });
 
-  it("runs status command with timeout and debug-derived verbose", async () => {
-    await runCli([
-      "status",
-      "--json",
-      "--all",
-      "--deep",
-      "--usage",
-      "--debug",
-      "--timeout",
-      "5000",
-    ]);
-
-    expect(setVerbose).toHaveBeenCalledWith(true);
-    expect(statusCommand).toHaveBeenCalledWith(
-      expect.objectContaining({
-        json: true,
-        all: true,
-        deep: true,
-        usage: true,
-        timeoutMs: 5000,
-        verbose: true,
-      }),
-      runtime,
-    );
+  it("dispatches status with debug, scope and parsed timeout", async () => {
+    await run("status --json --all --deep --usage --agent beta --debug --timeout 5000");
+    expect(mocks.setVerbose).toHaveBeenCalledWith(true);
+    expectOptions(mocks.statusCommand, {
+      json: true,
+      all: true,
+      deep: true,
+      usage: true,
+      agent: "beta",
+      timeoutMs: 5000,
+      verbose: true,
+    });
   });
-
-  it("rejects invalid status timeout without calling status command", async () => {
-    await runCli(["status", "--timeout", "nope"]);
-
-    expect(runtime.error).toHaveBeenCalledWith(
+  it("dispatches health with a parsed timeout", async () => {
+    await run("health --json --timeout 2500 --verbose");
+    expect(mocks.setVerbose).toHaveBeenCalledWith(true);
+    expectOptions(mocks.healthCommand, { json: true, timeoutMs: 2500, verbose: true });
+  });
+  it("rejects an invalid probe timeout without dispatch", async () => {
+    await run("status --timeout nope");
+    expect(mocks.runtime.error).toHaveBeenCalledWith(
       "--timeout must be a positive integer (milliseconds)",
     );
-    expect(runtime.exit).toHaveBeenCalledWith(1);
-    expect(statusCommand).not.toHaveBeenCalled();
+    expect(mocks.runtime.exit).toHaveBeenCalledWith(1);
+    expect(mocks.statusCommand).not.toHaveBeenCalled();
   });
 
-  it("runs health command with parsed timeout", async () => {
-    await runCli(["health", "--json", "--timeout", "2500", "--verbose"]);
-
-    expect(setVerbose).toHaveBeenCalledWith(true);
-    expect(healthCommand).toHaveBeenCalledWith(
-      expect.objectContaining({
-        json: true,
-        timeoutMs: 2500,
-        verbose: true,
-      }),
-      runtime,
-    );
+  it("forwards bare sessions options including an explicitly blank store", async () => {
+    await run(["sessions", ...blankStore, "--json", "--verbose", ...selection]);
+    expect(mocks.setVerbose).toHaveBeenCalledWith(true);
+    expectOptions(mocks.sessionsCommand, listOptions);
   });
-
-  it("rejects invalid health timeout without calling health command", async () => {
-    await runCli(["health", "--timeout", "0"]);
-
-    expect(runtime.error).toHaveBeenCalledWith(
-      "--timeout must be a positive integer (milliseconds)",
-    );
-    expect(runtime.exit).toHaveBeenCalledWith(1);
-    expect(healthCommand).not.toHaveBeenCalled();
+  it("dispatches the list alias with omitted selectors (#81139)", async () => {
+    await run("sessions list");
+    expectOptions(mocks.sessionsCommand, {
+      json: false,
+      allAgents: false,
+      agent: undefined,
+      store: undefined,
+    });
   });
-
-  it("runs sessions command with forwarded options", async () => {
-    await runCli([
-      "sessions",
-      "--json",
-      "--verbose",
-      "--store",
-      "/tmp/sessions.json",
-      "--active",
-      "120",
-    ]);
-
-    expect(setVerbose).toHaveBeenCalledWith(true);
-    expect(sessionsCommand).toHaveBeenCalledWith(
-      expect.objectContaining({
-        json: true,
-        store: "/tmp/sessions.json",
-        active: "120",
-      }),
-      runtime,
-    );
+  it.each(["parent", "leaf"])("list preserves %s options and blank store", async (placement) => {
+    const options = [...blankStore, "--json", "--verbose", ...selection];
+    await runSession(placement, "list", options);
+    expect(mocks.setVerbose).toHaveBeenCalledWith(true);
+    expectOptions(mocks.sessionsCommand, listOptions);
   });
-
-  it("runs sessions command with --agent forwarding", async () => {
-    await runCli(["sessions", "--agent", "work"]);
-
-    expect(sessionsCommand).toHaveBeenCalledWith(
-      expect.objectContaining({
-        agent: "work",
-        allAgents: false,
-      }),
-      runtime,
-    );
-  });
-
-  it("runs sessions command with --all-agents forwarding", async () => {
-    await runCli(["sessions", "--all-agents"]);
-
-    expect(sessionsCommand).toHaveBeenCalledWith(
-      expect.objectContaining({
-        allAgents: true,
-      }),
-      runtime,
-    );
-  });
-
-  it("runs sessions cleanup subcommand with forwarded options", async () => {
-    await runCli([
-      "sessions",
+  it.each(["parent", "leaf"])("cleanup preserves %s options and blank store", async (placement) => {
+    const options = [...blankStore, "--all-agents", "--json"];
+    await runSession(
+      placement,
       "cleanup",
-      "--store",
-      "/tmp/sessions.json",
-      "--dry-run",
-      "--enforce",
-      "--fix-missing",
-      "--active-key",
-      "agent:main:main",
-      "--json",
-    ]);
-
-    expect(sessionsCleanupCommand).toHaveBeenCalledWith(
-      expect.objectContaining({
-        store: "/tmp/sessions.json",
-        agent: undefined,
-        allAgents: false,
-        dryRun: true,
-        enforce: true,
-        fixMissing: true,
-        activeKey: "agent:main:main",
-        json: true,
-      }),
-      runtime,
+      options,
+      `--dry-run --enforce --fix-missing --fix-dm-scope --active-key ${key}`,
     );
+    expectOptions(mocks.sessionsCleanupCommand, {
+      store: "",
+      agent: undefined,
+      allAgents: true,
+      dryRun: true,
+      enforce: true,
+      fixMissing: true,
+      fixDmScope: true,
+      activeKey: key,
+      json: true,
+    });
+  });
+  it.each(["parent", "leaf"])("tail preserves %s options and blank store", async (placement) => {
+    const options = [...blankStore, "--agent", "work"];
+    await runSession(placement, "tail", options, `--session-key ${key} --tail 5 --follow`);
+    expectOptions(mocks.sessionsTailCommand, {
+      sessionKey: key,
+      store: "",
+      agent: "work",
+      allAgents: false,
+      follow: true,
+      tail: "5",
+    });
+  });
+  it.each(["parent", "leaf"])("export preserves %s options and blank store", async (placement) => {
+    const options = [...blankStore, "--json"];
+    const request = "eyJzZXNzaW9uS2V5IjoiYWdlbnQ6bWFpbjp0ZWxlZ3JhbTpkaXJlY3Q6b3duZXIifQ";
+    await runSession(
+      placement,
+      "export-trajectory",
+      options,
+      `--session-key ${key} --workspace /workspace --output bug-123 --request-json-base64 ${request}`,
+    );
+    expectOptions(mocks.exportTrajectoryCommand, {
+      sessionKey: key,
+      output: "bug-123",
+      workspace: "/workspace",
+      store: "",
+      json: true,
+      requestJsonBase64: request,
+    });
   });
 
-  it("forwards parent-level all-agents to cleanup subcommand", async () => {
-    await runCli(["sessions", "--all-agents", "cleanup", "--dry-run"]);
-
-    expect(sessionsCleanupCommand).toHaveBeenCalledWith(
-      expect.objectContaining({
-        allAgents: true,
-      }),
-      runtime,
+  it.each([false, true])("compact leaf override=%s (#91378)", async (override) => {
+    await run(
+      `sessions --agent ${override ? "main" : "work"} --json compact ${key}${override ? " --agent work" : ""}`,
     );
+    expectOptions(mocks.sessionsCompactCommand, { key, agent: "work", json: true });
   });
-
-  it("runs tasks list from the parent command", async () => {
-    await runCli(["tasks", "--json", "--runtime", "acp", "--status", "running"]);
-
-    expect(tasksListCommand).toHaveBeenCalledWith(
-      expect.objectContaining({
-        json: true,
-        runtime: "acp",
-        status: "running",
-      }),
-      runtime,
+  it("forwards archive keys, inherited scope and RPC options", async () => {
+    await run(
+      `sessions --agent work --json archive ${key} agent:work:scratch --dry-run --url ws://gateway.test --token test-token --password test-password --timeout 45000`,
     );
+    expectOptions(mocks.sessionsArchiveCommand, {
+      keys: [key, "agent:work:scratch"],
+      agent: "work",
+      dryRun: true,
+      url: "ws://gateway.test",
+      token: "test-token",
+      password: "test-password",
+      timeout: "45000",
+      json: true,
+    });
   });
-
-  it("runs tasks show subcommand with lookup forwarding", async () => {
-    await runCli(["tasks", "show", "run-123", "--json"]);
-
-    expect(tasksShowCommand).toHaveBeenCalledWith(
-      expect.objectContaining({
-        lookup: "run-123",
-        json: true,
-      }),
-      runtime,
-    );
+  it("forwards delete keys with leaf scope and confirmation", async () => {
+    await run(`sessions --agent main delete ${key} agent:work:scratch --agent work --yes --json`);
+    expectOptions(mocks.sessionsDeleteCommand, {
+      keys: [key, "agent:work:scratch"],
+      agent: "work",
+      dryRun: false,
+      yes: true,
+      json: true,
+    });
   });
-
-  it("runs tasks maintenance subcommand with apply forwarding", async () => {
-    await runCli(["tasks", "--json", "maintenance", "--apply"]);
-
-    expect(tasksMaintenanceCommand).toHaveBeenCalledWith(
-      expect.objectContaining({
-        json: true,
-        apply: true,
-      }),
-      runtime,
+  it("documents retained delete archives and local memory cleanup", () => {
+    const sessions = program().commands.find((command) => command.name() === "sessions");
+    const command = sessions?.commands.find((child) => child.name() === "delete");
+    let help = "";
+    command?.configureOutput({ writeOut: (text) => (help += text) }).outputHelp();
+    expect(help).toContain(
+      "Retained deleted-session archives can remain eligible for memory search",
     );
-  });
-
-  it("runs tasks audit subcommand with filters", async () => {
-    await runCli([
-      "tasks",
-      "--json",
-      "audit",
-      "--severity",
-      "error",
-      "--code",
-      "stale_running",
-      "--limit",
-      "5",
-    ]);
-
-    expect(tasksAuditCommand).toHaveBeenCalledWith(
-      expect.objectContaining({
-        json: true,
-        severity: "error",
-        code: "stale_running",
-        limit: 5,
-      }),
-      runtime,
-    );
-  });
-
-  it("routes tasks flow commands through the TaskFlow handlers", async () => {
-    await runCli(["tasks", "flow", "list", "--json", "--status", "blocked"]);
-    expect(flowsListCommand).toHaveBeenCalledWith(expect.any(Object), runtime);
-
-    await runCli(["tasks", "flow", "show", "flow-123", "--json"]);
-    expect(flowsShowCommand).toHaveBeenCalledWith(
-      expect.objectContaining({
-        lookup: "flow-123",
-      }),
-      runtime,
-    );
-
-    await runCli(["tasks", "flow", "cancel", "flow-123"]);
-    expect(flowsCancelCommand).toHaveBeenCalledWith(
-      expect.objectContaining({
-        lookup: "flow-123",
-      }),
-      runtime,
-    );
-  });
-
-  it("runs tasks notify subcommand with lookup and policy forwarding", async () => {
-    await runCli(["tasks", "notify", "run-123", "state_changes"]);
-
-    expect(tasksNotifyCommand).toHaveBeenCalledWith(
-      expect.objectContaining({
-        lookup: "run-123",
-        notify: "state_changes",
-      }),
-      runtime,
-    );
-  });
-
-  it("runs tasks cancel subcommand with lookup forwarding", async () => {
-    await runCli(["tasks", "cancel", "run-123"]);
-
-    expect(tasksCancelCommand).toHaveBeenCalledWith(
-      expect.objectContaining({
-        lookup: "run-123",
-      }),
-      runtime,
-    );
-  });
-
-  it("does not register the legacy top-level flows command", () => {
-    const program = new Command();
-    registerStatusHealthSessionsCommands(program);
-
-    expect(program.commands.find((command) => command.name() === "flows")).toBeUndefined();
+    expect(help).toContain("openclaw memory forget --agent <agent-id> --session <id-or-key>");
+    expect(help).toContain("on the Gateway host or container using its state and configuration");
+    expect(help).toContain("including for global keys");
   });
 });

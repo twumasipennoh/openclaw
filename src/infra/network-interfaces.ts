@@ -1,8 +1,8 @@
 import os from "node:os";
 
 export type NetworkInterfacesSnapshot = ReturnType<typeof os.networkInterfaces>;
-export type NetworkInterfaceFamily = "IPv4" | "IPv6";
-export type ExternalNetworkInterfaceAddress = {
+type NetworkInterfaceFamily = "IPv4" | "IPv6";
+type ExternalNetworkInterfaceAddress = {
   name: string;
   address: string;
   family: NetworkInterfaceFamily;
@@ -11,6 +11,7 @@ export type ExternalNetworkInterfaceAddress = {
 function normalizeNetworkInterfaceFamily(
   family: string | number | undefined,
 ): NetworkInterfaceFamily | undefined {
+  // Node versions and test fixtures can expose family as either string or number.
   if (family === "IPv4" || family === 4) {
     return "IPv4";
   }
@@ -20,17 +21,12 @@ function normalizeNetworkInterfaceFamily(
   return undefined;
 }
 
-export function readNetworkInterfaces(
-  networkInterfaces: () => NetworkInterfacesSnapshot = os.networkInterfaces,
-): NetworkInterfacesSnapshot {
-  return networkInterfaces();
-}
-
+/** Best-effort interface read that returns undefined when OS inspection fails. */
 export function safeNetworkInterfaces(
   networkInterfaces: () => NetworkInterfacesSnapshot = os.networkInterfaces,
 ): NetworkInterfacesSnapshot | undefined {
   try {
-    return readNetworkInterfaces(networkInterfaces);
+    return networkInterfaces();
   } catch {
     return undefined;
   }
@@ -68,6 +64,7 @@ export function listExternalInterfaceAddresses(
   return addresses;
 }
 
+/** Picks a matching external address, honoring preferred interface names first. */
 export function pickMatchingExternalInterfaceAddress(
   snapshot: NetworkInterfacesSnapshot | undefined,
   params: {

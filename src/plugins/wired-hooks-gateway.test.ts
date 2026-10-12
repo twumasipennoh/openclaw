@@ -1,17 +1,15 @@
-/**
- * Test: gateway_start & gateway_stop hook wiring (server.impl.ts)
- *
- * Since startGatewayServer is heavily integrated, we test the hook runner
- * calls at the unit level by verifying the hook runner functions exist
- * and validating the integration pattern.
- */
 import { describe, expect, it, vi } from "vitest";
-import { createHookRunnerWithRegistry } from "./hooks.test-helpers.js";
 import type {
+  PluginHookCronChangedEvent,
+  PluginHookCronReconciledContext,
+  PluginHookCronReconciledEvent,
   PluginHookGatewayContext,
-  PluginHookGatewayStartEvent,
   PluginHookGatewayStopEvent,
-} from "./types.js";
+} from "./hook-gateway.types.js";
+import type { PluginHookHandlerMap } from "./hook-types.js";
+import { createHookRunnerWithRegistry } from "./hooks.test-fixtures.js";
+
+type PluginHookGatewayStartEvent = Parameters<PluginHookHandlerMap["gateway_start"]>[0];
 
 async function expectGatewayHookCall(params: {
   hookName: "gateway_start" | "gateway_stop";
@@ -31,7 +29,16 @@ async function expectGatewayHookCall(params: {
 }
 
 describe("gateway hook runner methods", () => {
-  const gatewayCtx = { port: 18789 };
+  const gatewayCtx = {
+    port: 18789,
+    config: {} as never,
+    workspaceDir: "/tmp/openclaw-workspace",
+    getCron: () => undefined,
+  };
+  const cronReconciledCtx: PluginHookCronReconciledContext = {
+    ...gatewayCtx,
+    abortSignal: new AbortController().signal,
+  };
 
   it.each([
     {
@@ -48,12 +55,45 @@ describe("gateway hook runner methods", () => {
     await expectGatewayHookCall({ hookName, event, gatewayCtx });
   });
 
-  it("hasHooks returns true for registered gateway hooks", () => {
-    const { runner } = createHookRunnerWithRegistry([
-      { hookName: "gateway_start", handler: vi.fn() },
-    ]);
+  it("runCronReconciled forwards state", async () => {
+    const handler = vi.fn();
+    const { runner } = createHookRunnerWithRegistry([{ hookName: "cron_reconciled", handler }]);
+    const event: PluginHookCronReconciledEvent = { reason: "reload", enabled: false };
 
-    expect(runner.hasHooks("gateway_start")).toBe(true);
-    expect(runner.hasHooks("gateway_stop")).toBe(false);
+    await runner.runCronReconciled(event, cronReconciledCtx);
+
+    expect(handler).toHaveBeenCalledWith(event, cronReconciledCtx);
+  });
+
+  it("runCronChanged passes finished events with delivery and error fields", async () => {
+    const handler = vi.fn();
+    const { runner } = createHookRunnerWithRegistry([{ hookName: "cron_changed", handler }]);
+    const event: PluginHookCronChangedEvent = {
+      action: "finished",
+      jobId: "job-2",
+      sessionTarget: "session:ops",
+      agentId: "reporter",
+      status: "error",
+      error: "timeout",
+      summary: "Job timed out",
+      delivered: false,
+      deliveryStatus: "not-delivered",
+      deliveryError: "channel unavailable",
+      durationMs: 5000,
+      runAtMs: 100,
+      nextRunAtMs: 200,
+      model: "gpt-5.4",
+      provider: "openai",
+      job: {
+        id: "job-2",
+        agentId: "reporter",
+        sessionTarget: "session:ops",
+        state: { lastRunStatus: "error", lastError: "timeout" },
+      },
+    };
+
+    await runner.runCronChanged(event, gatewayCtx);
+
+    expect(handler).toHaveBeenCalledWith(event, gatewayCtx);
   });
 });

@@ -1,19 +1,23 @@
-import { fetchWithSsrFGuard, type LookupFn, type SsrFPolicy } from "../../runtime-api.js";
+import {
+  fetchWithSsrFGuard,
+  type LookupFn,
+  type SsrFPolicy,
+} from "openclaw/plugin-sdk/ssrf-runtime";
 import { validateUrbitBaseUrl } from "./base-url.js";
 import { UrbitUrlError } from "./errors.js";
 
-export type UrbitFetchOptions = {
+type UrbitFetchOptions = {
   baseUrl: string;
   path: string;
   init?: RequestInit;
   ssrfPolicy?: SsrFPolicy;
   lookupFn?: LookupFn;
   fetchImpl?: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
+  beforeRequest?: () => void;
   timeoutMs?: number;
   maxRedirects?: number;
   signal?: AbortSignal;
   auditContext?: string;
-  pinDns?: boolean;
 };
 
 export async function urbitFetch(params: UrbitFetchOptions) {
@@ -23,9 +27,10 @@ export async function urbitFetch(params: UrbitFetchOptions) {
   }
 
   const url = new URL(params.path, validated.baseUrl).toString();
-  return await fetchWithSsrFGuard({
+  const guarded = await fetchWithSsrFGuard({
     url,
     fetchImpl: params.fetchImpl,
+    beforeRequest: params.beforeRequest,
     init: params.init,
     timeoutMs: params.timeoutMs,
     maxRedirects: params.maxRedirects,
@@ -33,6 +38,17 @@ export async function urbitFetch(params: UrbitFetchOptions) {
     policy: params.ssrfPolicy,
     lookupFn: params.lookupFn,
     auditContext: params.auditContext,
-    pinDns: params.pinDns,
   });
+
+  return {
+    ...guarded,
+    release: async () => {
+      // Guard cleanup only closes the dispatcher; captured response clones can
+      // keep cancellation pending, so start it without delaying the release.
+      if (!guarded.response.bodyUsed) {
+        void guarded.response.body?.cancel().catch(() => undefined);
+      }
+      await guarded.release();
+    },
+  };
 }

@@ -1,66 +1,61 @@
 import {
   coerceSecretRef,
-  ensureAuthProfileStore,
   resolveNonEnvSecretRefApiKeyMarker,
-} from "openclaw/plugin-sdk/provider-auth";
-import type { ModelProviderConfig } from "openclaw/plugin-sdk/provider-model-shared";
+} from "openclaw/plugin-sdk/secret-input";
+import { normalizeOptionalString } from "openclaw/plugin-sdk/string-coerce-runtime";
 import {
   buildCloudflareAiGatewayModelDefinition,
   resolveCloudflareAiGatewayBaseUrl,
 } from "./models.js";
 
-export type CloudflareAiGatewayCredential =
-  | ReturnType<typeof ensureAuthProfileStore>["profiles"][string]
+type CloudflareAiGatewayCredential =
+  | {
+      type?: string;
+      keyRef?: unknown;
+      key?: unknown;
+      metadata?: {
+        accountId?: unknown;
+        gatewayId?: unknown;
+      };
+    }
   | undefined;
 
-export function resolveCloudflareAiGatewayApiKey(
-  cred: CloudflareAiGatewayCredential,
-): string | undefined {
+function resolveCloudflareAiGatewayApiKey(cred: CloudflareAiGatewayCredential): string | undefined {
   if (!cred || cred.type !== "api_key") {
     return undefined;
   }
 
   const keyRef = coerceSecretRef(cred.keyRef);
-  if (keyRef && keyRef.id.trim()) {
-    return keyRef.source === "env"
-      ? keyRef.id.trim()
-      : resolveNonEnvSecretRefApiKeyMarker(keyRef.source);
+  const keyRefId = normalizeOptionalString(keyRef?.id);
+  if (keyRef && keyRefId) {
+    return keyRef.source === "env" ? keyRefId : resolveNonEnvSecretRefApiKeyMarker(keyRef.source);
   }
-  return cred.key?.trim() || undefined;
+  return normalizeOptionalString(cred.key);
 }
 
-export function resolveCloudflareAiGatewayMetadata(cred: CloudflareAiGatewayCredential): {
-  accountId?: string;
-  gatewayId?: string;
-} {
-  if (!cred || cred.type !== "api_key") {
-    return {};
-  }
-  return {
-    accountId: cred.metadata?.accountId?.trim() || undefined,
-    gatewayId: cred.metadata?.gatewayId?.trim() || undefined,
-  };
-}
-
+/**
+ * Returns a provider catalog entry when credentials and Gateway metadata are
+ * complete enough to construct an Anthropic-compatible base URL.
+ */
 export function buildCloudflareAiGatewayCatalogProvider(params: {
   credential: CloudflareAiGatewayCredential;
   envApiKey?: string;
-}): ModelProviderConfig | null {
-  const apiKey = params.envApiKey?.trim() || resolveCloudflareAiGatewayApiKey(params.credential);
+}) {
+  const apiKey =
+    normalizeOptionalString(params.envApiKey) ??
+    resolveCloudflareAiGatewayApiKey(params.credential);
   if (!apiKey) {
     return null;
   }
-  const { accountId, gatewayId } = resolveCloudflareAiGatewayMetadata(params.credential);
+  const metadata = params.credential?.type === "api_key" ? params.credential.metadata : undefined;
+  const accountId = normalizeOptionalString(metadata?.accountId);
+  const gatewayId = normalizeOptionalString(metadata?.gatewayId);
   if (!accountId || !gatewayId) {
     return null;
   }
-  const baseUrl = resolveCloudflareAiGatewayBaseUrl({ accountId, gatewayId });
-  if (!baseUrl) {
-    return null;
-  }
   return {
-    baseUrl,
-    api: "anthropic-messages",
+    baseUrl: resolveCloudflareAiGatewayBaseUrl({ accountId, gatewayId }),
+    api: "anthropic-messages" as const,
     apiKey,
     models: [buildCloudflareAiGatewayModelDefinition()],
   };

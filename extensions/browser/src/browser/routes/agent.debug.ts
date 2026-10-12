@@ -1,147 +1,149 @@
 import crypto from "node:crypto";
-import path from "node:path";
+import { formatErrorMessage } from "openclaw/plugin-sdk/security-runtime";
+import { normalizeOptionalString } from "openclaw/plugin-sdk/string-coerce-runtime";
+import { DEFAULT_TRACE_DIR } from "../paths.js";
+import { getBrowserProfileCapabilities } from "../profile-capabilities.js";
+import type { PwAiModule } from "../pw-ai-module.js";
 import type { BrowserRouteContext } from "../server-context.js";
-import {
-  readBody,
-  resolveTargetIdFromBody,
-  resolveTargetIdFromQuery,
-  withPlaywrightRouteContext,
-} from "./agent.shared.js";
+import { readBody, resolveProfileContext, withPlaywrightRouteContext } from "./agent.shared.js";
+import { EXISTING_SESSION_LIMITS } from "./existing-session-limits.js";
 import { resolveWritableOutputPathOrRespond } from "./output-paths.js";
-import { DEFAULT_TRACE_DIR } from "./path-output.js";
-import type { BrowserRouteRegistrar } from "./types.js";
-import { toBoolean, toStringOrEmpty } from "./utils.js";
+import { readRoutePositiveInteger } from "./route-numeric.js";
+import type { BrowserResponse, BrowserRouteRegistrar } from "./types.js";
+import { jsonError, toBoolean, toStringOrEmpty } from "./utils.js";
+
+type DebugCollector = (
+  pw: PwAiModule,
+  target: { cdpUrl: string; targetId: string; signal: AbortSignal },
+) => Promise<object | null>;
 
 export function registerBrowserAgentDebugRoutes(
   app: BrowserRouteRegistrar,
   ctx: BrowserRouteContext,
 ) {
-  app.get("/console", async (req, res) => {
-    const targetId = resolveTargetIdFromQuery(req.query);
-    const level = typeof req.query.level === "string" ? req.query.level : "";
+  const register = (
+    method: "get" | "post",
+    path: string,
+    feature: string,
+    prepare: (input: Record<string, unknown>, res: BrowserResponse) => DebugCollector,
+    existingSessionUnsupported?: string,
+  ) => {
+    app[method](path, async (req, res) => {
+      const input = method === "get" ? req.query : readBody(req);
+      const targetId = normalizeOptionalString(input.targetId);
+      let collect: DebugCollector;
+      try {
+        collect = prepare(input, res);
+      } catch (error) {
+        return jsonError(res, 400, formatErrorMessage(error));
+      }
+      const profileCtx = resolveProfileContext(req, res, ctx);
+      if (!profileCtx) {
+        return;
+      }
+      if (
+        existingSessionUnsupported &&
+        getBrowserProfileCapabilities(profileCtx.profile).usesChromeMcp
+      ) {
+        return jsonError(res, 501, existingSessionUnsupported);
+      }
+      await withPlaywrightRouteContext({
+        req,
+        res,
+        ctx,
+        profileCtx,
+        targetId,
+        feature,
+        enforceCurrentUrlAllowed: true,
+        run: async ({ cdpUrl, tab, pw, resolveTabUrl, signal }) => {
+          const result = await collect(pw, { cdpUrl, targetId: tab.targetId, signal });
+          if (result === null) {
+            return;
+          }
+          const url = await resolveTabUrl(tab.url);
+          res.json({ ok: true, targetId: tab.targetId, ...(url ? { url } : {}), ...result });
+        },
+      });
+    });
+  };
 
-    await withPlaywrightRouteContext({
-      req,
-      res,
-      ctx,
-      targetId,
-      feature: "console messages",
-      run: async ({ cdpUrl, tab, pw }) => {
-        const messages = await pw.getConsoleMessagesViaPlaywright({
-          cdpUrl,
-          targetId: tab.targetId,
-          level: level.trim() || undefined,
-        });
-        res.json({ ok: true, messages, targetId: tab.targetId });
-      },
+  register("get", "/console", "console messages", (input) => {
+    const level = normalizeOptionalString(typeof input.level === "string" ? input.level : "");
+    return async (pw, { cdpUrl, targetId }) => ({
+      messages: await pw.getConsoleMessagesViaPlaywright({ cdpUrl, targetId, level }),
     });
   });
 
-  app.get("/errors", async (req, res) => {
-    const targetId = resolveTargetIdFromQuery(req.query);
-    const clear = toBoolean(req.query.clear) ?? false;
+  register(
+    "get",
+    "/errors",
+    "page errors",
+    (input) => {
+      const clear = toBoolean(input.clear) ?? false;
+      return (pw, { cdpUrl, targetId }) =>
+        pw.getPageErrorsViaPlaywright({ cdpUrl, targetId, clear });
+    },
+    EXISTING_SESSION_LIMITS.errors,
+  );
 
-    await withPlaywrightRouteContext({
-      req,
-      res,
-      ctx,
+  register(
+    "get",
+    "/requests",
+    "network requests",
+    (input) => {
+      const filter = normalizeOptionalString(typeof input.filter === "string" ? input.filter : "");
+      const clear = toBoolean(input.clear) ?? false;
+      return (pw, { cdpUrl, targetId }) =>
+        pw.getNetworkRequestsViaPlaywright({ cdpUrl, targetId, filter, clear });
+    },
+    EXISTING_SESSION_LIMITS.requests,
+  );
+
+  register(
+    "get",
+    "/text",
+    "page text",
+    (input) => {
+      const selector = normalizeOptionalString(input.selector);
+      const maxChars = readRoutePositiveInteger(input.maxChars, "maxChars");
+      return (pw, target) => pw.getPageTextViaPlaywright({ ...target, selector, maxChars });
+    },
+    EXISTING_SESSION_LIMITS.text,
+  );
+
+  register("get", "/dialogs", "dialog state", () => async (pw, { cdpUrl, targetId }) => ({
+    browserState: await pw.getObservedBrowserStateViaPlaywright({
+      cdpUrl,
       targetId,
-      feature: "page errors",
-      run: async ({ cdpUrl, tab, pw }) => {
-        const result = await pw.getPageErrorsViaPlaywright({
-          cdpUrl,
-          targetId: tab.targetId,
-          clear,
-        });
-        res.json({ ok: true, targetId: tab.targetId, ...result });
-      },
-    });
+      ssrfPolicy: ctx.state().resolved.ssrfPolicy,
+    }),
+  }));
+
+  register("post", "/trace/start", "trace start", (input) => {
+    const screenshots = toBoolean(input.screenshots) ?? undefined;
+    const snapshots = toBoolean(input.snapshots) ?? undefined;
+    const sources = toBoolean(input.sources) ?? undefined;
+    return async (pw, { cdpUrl, targetId }) => {
+      await pw.traceStartViaPlaywright({ cdpUrl, targetId, screenshots, snapshots, sources });
+      return {};
+    };
   });
 
-  app.get("/requests", async (req, res) => {
-    const targetId = resolveTargetIdFromQuery(req.query);
-    const filter = typeof req.query.filter === "string" ? req.query.filter : "";
-    const clear = toBoolean(req.query.clear) ?? false;
-
-    await withPlaywrightRouteContext({
-      req,
-      res,
-      ctx,
-      targetId,
-      feature: "network requests",
-      run: async ({ cdpUrl, tab, pw }) => {
-        const result = await pw.getNetworkRequestsViaPlaywright({
-          cdpUrl,
-          targetId: tab.targetId,
-          filter: filter.trim() || undefined,
-          clear,
-        });
-        res.json({ ok: true, targetId: tab.targetId, ...result });
-      },
-    });
-  });
-
-  app.post("/trace/start", async (req, res) => {
-    const body = readBody(req);
-    const targetId = resolveTargetIdFromBody(body);
-    const screenshots = toBoolean(body.screenshots) ?? undefined;
-    const snapshots = toBoolean(body.snapshots) ?? undefined;
-    const sources = toBoolean(body.sources) ?? undefined;
-
-    await withPlaywrightRouteContext({
-      req,
-      res,
-      ctx,
-      targetId,
-      feature: "trace start",
-      run: async ({ cdpUrl, tab, pw }) => {
-        await pw.traceStartViaPlaywright({
-          cdpUrl,
-          targetId: tab.targetId,
-          screenshots,
-          snapshots,
-          sources,
-        });
-        res.json({ ok: true, targetId: tab.targetId });
-      },
-    });
-  });
-
-  app.post("/trace/stop", async (req, res) => {
-    const body = readBody(req);
-    const targetId = resolveTargetIdFromBody(body);
-    const out = toStringOrEmpty(body.path) || "";
-
-    await withPlaywrightRouteContext({
-      req,
-      res,
-      ctx,
-      targetId,
-      feature: "trace stop",
-      run: async ({ cdpUrl, tab, pw }) => {
-        const id = crypto.randomUUID();
-        const tracePath = await resolveWritableOutputPathOrRespond({
-          res,
-          rootDir: DEFAULT_TRACE_DIR,
-          requestedPath: out,
-          scopeLabel: "trace directory",
-          defaultFileName: `browser-trace-${id}.zip`,
-          ensureRootDir: true,
-        });
-        if (!tracePath) {
-          return;
-        }
-        await pw.traceStopViaPlaywright({
-          cdpUrl,
-          targetId: tab.targetId,
-          path: tracePath,
-        });
-        res.json({
-          ok: true,
-          targetId: tab.targetId,
-          path: path.resolve(tracePath),
-        });
-      },
-    });
+  register("post", "/trace/stop", "trace stop", (input, res) => {
+    const requestedPath = toStringOrEmpty(input.path);
+    return async (pw, { cdpUrl, targetId }) => {
+      const tracePath = await resolveWritableOutputPathOrRespond({
+        res,
+        rootDir: DEFAULT_TRACE_DIR,
+        requestedPath,
+        scopeLabel: "trace directory",
+        defaultFileName: `browser-trace-${crypto.randomUUID()}.zip`,
+        ensureRootDir: true,
+      });
+      if (!tracePath) {
+        return null;
+      }
+      return { path: await pw.traceStopViaPlaywright({ cdpUrl, targetId, path: tracePath }) };
+    };
   });
 }

@@ -1,15 +1,16 @@
+// Whatsapp tests cover index plugin behavior.
 import { describe, expect, it } from "vitest";
-import entry from "./index.js";
-import setupEntry from "./setup-entry.js";
+import { whatsappPlugin } from "./channel-plugin-api.js";
 
 describe("whatsapp bundled entries", () => {
-  it("loads the channel plugin without importing the broad api barrel", () => {
-    const plugin = entry.loadChannelPlugin();
-    expect(plugin.id).toBe("whatsapp");
-  });
-
-  it("loads the setup plugin without importing the broad api barrel", () => {
-    const plugin = setupEntry.loadSetupPlugin();
-    expect(plugin.id).toBe("whatsapp");
+  it("declares account config as channel-restart reload metadata", () => {
+    expect(whatsappPlugin.reload).toEqual({
+      configPrefixes: [
+        "channels.whatsapp.enabled",
+        "channels.whatsapp.accounts",
+        "channels.whatsapp.selfChatMode",
+      ],
+      noopPrefixes: ["channels.whatsapp", "messages.inbound", "messages.ackReactionScope"],
+    });
   });
 });

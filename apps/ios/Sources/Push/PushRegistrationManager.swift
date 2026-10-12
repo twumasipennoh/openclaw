@@ -17,6 +17,7 @@ private struct RelayGatewayPushRegistrationPayload: Encodable {
     var topic: String
     var environment: String
     var distribution: String
+    var relayOrigin: String
     var tokenDebugSuffix: String?
 }
 
@@ -68,12 +69,16 @@ actor PushRegistrationManager {
     async throws -> String {
         guard self.buildConfig.distribution == .official else {
             throw PushRelayError.relayMisconfigured(
-                "Relay transport requires OpenClawPushDistribution=official")
+                "Relay transport requires an official push build mode")
         }
-        guard self.buildConfig.apnsEnvironment == .production else {
-            throw PushRelayError.relayMisconfigured(
-                "Relay transport requires OpenClawPushAPNsEnvironment=production")
-        }
+        try Self.validateRelayContract(
+            relayProfile: self.buildConfig.relayProfile,
+            apnsEnvironment: self.buildConfig.apnsEnvironment,
+            proofPolicy: self.buildConfig.proofPolicy)
+        GatewayDiagnostics.pushRelay.stage(
+            "contract validated apns=\(self.buildConfig.apnsEnvironment.rawValue) "
+                + "profile=\(self.buildConfig.relayProfile.rawValue) "
+                + "proof=\(self.buildConfig.proofPolicy.rawValue)")
         guard let relayClient = self.relayClient else {
             throw PushRelayError.relayBaseURLMissing
         }
@@ -84,60 +89,64 @@ actor PushRegistrationManager {
         }
         guard let installationId = GatewaySettingsStore.loadStableInstanceID()?
             .trimmingCharacters(in: .whitespacesAndNewlines),
-              !installationId.isEmpty
+            !installationId.isEmpty
         else {
             throw PushRelayError.relayMisconfigured("Missing stable installation ID for relay registration")
         }
 
         let tokenHashHex = Self.sha256Hex(apnsTokenHex)
         let relayOrigin = relayClient.normalizedBaseURLString
+        let registrationState: PushRelayRegistrationStore.RegistrationState
         if let stored = PushRelayRegistrationStore.loadRegistrationState(),
            stored.installationId == installationId,
            stored.gatewayDeviceId == gatewayIdentity.deviceId,
            stored.relayOrigin == relayOrigin,
+           stored.apnsEnvironment == self.buildConfig.apnsEnvironment.rawValue,
+           stored.relayProfile == self.buildConfig.relayProfile.rawValue,
+           stored.proofPolicy == self.buildConfig.proofPolicy.rawValue,
            stored.lastAPNsTokenHashHex == tokenHashHex,
            !Self.isExpired(stored.relayHandleExpiresAtMs)
         {
-            return try Self.encodePayload(
-                RelayGatewayPushRegistrationPayload(
-                    relayHandle: stored.relayHandle,
-                    sendGrant: stored.sendGrant,
-                    gatewayDeviceId: gatewayIdentity.deviceId,
-                    installationId: installationId,
-                    topic: topic,
-                    environment: self.buildConfig.apnsEnvironment.rawValue,
-                    distribution: self.buildConfig.distribution.rawValue,
-                    tokenDebugSuffix: stored.tokenDebugSuffix))
-        }
-
-        let response = try await relayClient.register(
-            installationId: installationId,
-            bundleId: bundleId,
-            appVersion: DeviceInfoHelper.appVersion(),
-            environment: self.buildConfig.apnsEnvironment,
-            distribution: self.buildConfig.distribution,
-            apnsTokenHex: apnsTokenHex,
-            gatewayIdentity: gatewayIdentity)
-        let registrationState = PushRelayRegistrationStore.RegistrationState(
-            relayHandle: response.relayHandle,
-            sendGrant: response.sendGrant,
-            relayOrigin: relayOrigin,
-            gatewayDeviceId: gatewayIdentity.deviceId,
-            relayHandleExpiresAtMs: response.expiresAtMs,
-            tokenDebugSuffix: Self.normalizeTokenSuffix(response.tokenSuffix),
-            lastAPNsTokenHashHex: tokenHashHex,
-            installationId: installationId,
-            lastTransport: self.buildConfig.transport.rawValue)
-        _ = PushRelayRegistrationStore.saveRegistrationState(registrationState)
-        return try Self.encodePayload(
-            RelayGatewayPushRegistrationPayload(
+            GatewayDiagnostics.pushRelay.stage("using cached relay registration")
+            registrationState = stored
+        } else {
+            GatewayDiagnostics.pushRelay.stage("relay registration cache miss")
+            let response = try await relayClient.register(PushRelayRegistrationInput(
+                installationId: installationId,
+                bundleId: bundleId,
+                appVersion: DeviceInfoHelper.appVersion(),
+                environment: self.buildConfig.apnsEnvironment,
+                relayProfile: self.buildConfig.relayProfile,
+                proofPolicy: self.buildConfig.proofPolicy,
+                distribution: self.buildConfig.distribution,
+                apnsTokenHex: apnsTokenHex,
+                gatewayIdentity: gatewayIdentity))
+            registrationState = PushRelayRegistrationStore.RegistrationState(
                 relayHandle: response.relayHandle,
                 sendGrant: response.sendGrant,
+                relayOrigin: relayOrigin,
+                gatewayDeviceId: gatewayIdentity.deviceId,
+                relayHandleExpiresAtMs: response.expiresAtMs,
+                tokenDebugSuffix: Self.normalizeTokenSuffix(response.tokenSuffix),
+                lastAPNsTokenHashHex: tokenHashHex,
+                installationId: installationId,
+                lastTransport: self.buildConfig.transport.rawValue,
+                apnsEnvironment: self.buildConfig.apnsEnvironment.rawValue,
+                relayProfile: self.buildConfig.relayProfile.rawValue,
+                proofPolicy: self.buildConfig.proofPolicy.rawValue)
+            _ = PushRelayRegistrationStore.saveRegistrationState(registrationState)
+            GatewayDiagnostics.pushRelay.stage("stored relay registration hasExpiry=\(response.expiresAtMs != nil)")
+        }
+        return try Self.encodePayload(
+            RelayGatewayPushRegistrationPayload(
+                relayHandle: registrationState.relayHandle,
+                sendGrant: registrationState.sendGrant,
                 gatewayDeviceId: gatewayIdentity.deviceId,
                 installationId: installationId,
                 topic: topic,
                 environment: self.buildConfig.apnsEnvironment.rawValue,
                 distribution: self.buildConfig.distribution.rawValue,
+                relayOrigin: relayOrigin,
                 tokenDebugSuffix: registrationState.tokenDebugSuffix))
     }
 
@@ -145,7 +154,31 @@ actor PushRegistrationManager {
         guard let expiresAtMs else { return true }
         let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
         // Refresh shortly before expiry so reconnect-path republishes a live handle.
-        return expiresAtMs <= nowMs + 60_000
+        return expiresAtMs <= nowMs + 60000
+    }
+
+    private static func validateRelayContract(
+        relayProfile: PushRelayProfile,
+        apnsEnvironment: PushAPNsEnvironment,
+        proofPolicy: PushProofPolicy)
+    throws {
+        switch relayProfile {
+        case .production:
+            guard apnsEnvironment == .production, proofPolicy == .appleStrict else {
+                throw PushRelayError.relayMisconfigured(
+                    "production relay profile requires production APNs and appleStrict proof")
+            }
+        case .deviceSandbox:
+            guard apnsEnvironment == .sandbox, proofPolicy == .appleDevelopment else {
+                throw PushRelayError.relayMisconfigured(
+                    "deviceSandbox relay profile requires sandbox APNs and appleDevelopment proof")
+            }
+        case .simulatorSandbox:
+            guard apnsEnvironment == .sandbox, proofPolicy == .internalSimulator else {
+                throw PushRelayError.relayMisconfigured(
+                    "simulatorSandbox relay profile requires sandbox APNs and internalSimulator proof")
+            }
+        }
     }
 
     private static func sha256Hex(_ value: String) -> String {

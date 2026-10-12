@@ -1,33 +1,114 @@
+import { createChannelConfigUiHints } from "openclaw/plugin-sdk/channel-core";
 import type { ChannelConfigUiHint } from "openclaw/plugin-sdk/channel-core";
 
+const observedGroupHistoryHint = {
+  help: "Automatic observed-message context uses a default of 50 and a maximum of 200 messages; 0 disables automatic injection. The JSON integer maximum selects the 50-message default. Session transcript trimming separately counts user turns, where 0 means no trimming. The observed-message cap does not rewrite saved values.",
+};
+const observedDmHistoryHint = {
+  help: "Automatic observed-DM context uses a default of 0 and a maximum of 200 messages; 0 disables that extra context. The JSON integer maximum selects the 0-message default. Session transcript trimming separately counts user turns, where 0 means no trimming. The observed-message cap does not rewrite saved values.",
+};
+const botThreadMentionHint = {
+  label: "Require Mention in Bot Threads",
+  help: "Override mention gating in threads whose root message was sent by this bot. False allows unmentioned replies; true requires a mention even when implicit reply or participation signals are enabled. Omit to preserve the existing mention policy. Channel settings override account settings; access restrictions still apply.",
+};
+
 export const slackChannelConfigUiHints = {
+  historyLimit: observedGroupHistoryHint,
+  "accounts.*.historyLimit": observedGroupHistoryHint,
+  dmHistoryLimit: observedDmHistoryHint,
+  "accounts.*.dmHistoryLimit": observedDmHistoryHint,
+  "dms.*.historyLimit": observedDmHistoryHint,
+  "accounts.*.dms.*.historyLimit": observedDmHistoryHint,
+  requireMentionInBotThreads: botThreadMentionHint,
+  "accounts.*.requireMentionInBotThreads": botThreadMentionHint,
+  "channels.*.requireMentionInBotThreads": botThreadMentionHint,
+  "accounts.*.channels.*.requireMentionInBotThreads": botThreadMentionHint,
   "": {
     label: "Slack",
     help: "Slack channel provider configuration for bot/app tokens, streaming behavior, and DM policy controls. Keep token handling and thread behavior explicit to avoid noisy workspace interactions.",
   },
-  "dm.policy": {
-    label: "Slack DM Policy",
-    help: 'Direct message access control ("pairing" recommended). "open" requires channels.slack.allowFrom=["*"] (legacy: channels.slack.dm.allowFrom).',
+  postAs: {
+    label: "Slack Identity",
+    help: 'Select "bot" (default) for the classic Slack app/bot identity or "user" to post as the authorizing human through a user token while the app carries event transport.',
   },
-  dmPolicy: {
-    label: "Slack DM Policy",
-    help: 'Direct message access control ("pairing" recommended). "open" requires channels.slack.allowFrom=["*"].',
+  ...createChannelConfigUiHints({
+    channelLabel: "Slack",
+    dmPolicy: { channelKey: "slack" },
+    configWrites: true,
+    mentionPatterns: {
+      targetDescription: "Slack channel IDs",
+      policyNote: "Native Slack @mentions still trigger even when regex patterns are denied.",
+      denyNote: "Native @mentions still trigger.",
+    },
+    nativeCommands: true,
+    implicitMentions: true,
+    streaming: {
+      "": 'Unified Slack stream preview mode: "off" | "partial" | "block" | "progress" (default). Legacy boolean/streamMode keys are auto-mapped.',
+      mode: 'Canonical Slack preview mode: "off" | "partial" | "block" | "progress" (default). Default progress outside reply threads uses only a temporary typing reaction. Any explicit streaming.progress setting opts top-level turns into a preview, except nativeTaskCards: true, which only affects threads.',
+      chunkMode: 'Chunking mode for outbound Slack text delivery: "length" (default) or "newline".',
+      "block.enabled":
+        'Enable chunked block-style Slack preview delivery when channels.slack.streaming.mode="block".',
+      "block.coalesce": "Merge streamed Slack block replies before final delivery.",
+      nativeTransport:
+        "Enable native Slack text streaming (chat.startStream/chat.appendStream/chat.stopStream) when channels.slack.streaming.mode is partial (default: true). Native streaming and Slack session status require a reply thread target; top-level DMs can still use draft post-and-edit preview streaming.",
+      "preview.toolProgress":
+        "Show tool/progress activity in the live draft preview message (default: true). Set false to hide interim tool updates while the draft preview stays active.",
+      "preview.commandText":
+        'Command/exec detail in preview tool-progress lines: "status" is the safe default; "raw" opts into command text.',
+      "progress.style":
+        'Slack progress presentation: "card" uses structured task/session cards; "compact" keeps a temporary editable text draft. The final response is posted as a new message, then the draft is deleted after confirmed delivery. Outside reply threads, unset progress presentation is quiet. Any explicit streaming.progress setting in the merged root and account config opts top-level turns into a preview, except nativeTaskCards: true, which only affects threads. This includes commentary or label alone. The style defaults to "compact" when toolProgress is explicitly false, otherwise "card".',
+      "progress.nativeTaskCards":
+        'Slack native task-card progress updates when channels.slack.streaming.mode="progress", progress.style="card", and streaming.nativeTransport is enabled. Set false to fall back to the Block Kit progress card. Default: true.',
+    },
+    progress: { labels: "openclaw" },
+  }),
+  "streaming.progress.toolProgress": {
+    label: "Slack Progress Tool Lines",
+    help: "Show individual tool activity, including intermediate failures, in progress drafts (default: false). Native cards add a task row per tool call. Block Kit cards add tool activity, the plan checklist, and tool/file/time totals while working; finished cards retain only file diff totals. Default Block Kit cards show commentary and text, approval requests, and available session links. Failed turns show a plain Failed line on the Block Kit card, even without an error reply.",
   },
-  configWrites: {
-    label: "Slack Config Writes",
-    help: "Allow Slack to write config in response to channel events/commands (default: true).",
-  },
-  "commands.native": {
-    label: "Slack Native Commands",
-    help: 'Override native commands for Slack (bool or "auto").',
-  },
-  "commands.nativeSkills": {
-    label: "Slack Native Skill Commands",
-    help: 'Override native skill commands for Slack (bool or "auto").',
+  joinIntro: {
+    label: "Slack Channel Join Introduction",
+    help: "Post one brief, room-specific introduction when the bot joins an allowed Slack channel (default: true). Account settings override the channel-wide setting.",
   },
   allowBots: {
     label: "Slack Allow Bot Messages",
-    help: "Allow bot-authored messages to trigger Slack replies (default: false).",
+    help: 'Allow bot-authored messages to trigger Slack replies (default: true). Set false to disable bot-triggered turns, or "mentions" to require a mention. Channel access, mention, owner-presence, and loop-protection rules still apply; accessible bot-authored context remains available independently.',
+  },
+  botLoopProtection: {
+    label: "Slack Bot Loop Protection",
+    help: "Sliding-window guard for Slack bot-to-bot loops. Default is enabled whenever allowBots lets bot-authored messages reach dispatch.",
+  },
+  "botLoopProtection.enabled": {
+    label: "Slack Bot Loop Protection Enabled",
+    help: 'Enable the bot-pair loop guard. Defaults to true when allowBots is true or "mentions", and false when bot messages are ignored.',
+  },
+  "botLoopProtection.maxEventsPerWindow": {
+    label: "Slack Bot Loop Events per Window",
+    help: "Maximum accepted bot-pair messages within the sliding window before suppression starts. Default: 20.",
+  },
+  "botLoopProtection.windowSeconds": {
+    label: "Slack Bot Loop Window Seconds",
+    help: "Sliding window length for counting bot-pair messages. Default: 60.",
+  },
+  "botLoopProtection.cooldownSeconds": {
+    label: "Slack Bot Loop Cooldown Seconds",
+    help: "How long to suppress the bot pair after it exceeds the budget. Default: 60.",
+  },
+  relay: {
+    label: "Slack Relay Mode",
+    help: 'Relay-delivered Slack events. Use with mode="relay" when openclaw-slack-router owns the Slack Socket Mode connection.',
+  },
+  "relay.url": {
+    label: "Slack Relay URL",
+    help: "Full websocket URL for openclaw-slack-router. Include the route path, for example ws://127.0.0.1:8081/gateway/ws.",
+  },
+  "relay.authToken": {
+    label: "Slack Relay Auth Token",
+    help: "Bearer token used by this gateway to authenticate its reverse websocket connection to openclaw-slack-router.",
+  },
+  "relay.gatewayId": {
+    label: "Slack Relay Gateway ID",
+    help: "Destination id that openclaw-slack-router uses when routing user-group mentions to this gateway.",
   },
   botToken: {
     label: "Slack Bot Token",
@@ -45,17 +126,33 @@ export const slackChannelConfigUiHints = {
     label: "Slack User Token Read Only",
     help: "When true, treat configured Slack user token usage as read-only helper behavior where possible. Keep enabled if you only need supplemental reads without user-context writes.",
   },
-  "capabilities.interactiveReplies": {
-    label: "Slack Interactive Replies",
-    help: "Enable agent-authored Slack interactive reply directives (`[[slack_buttons: ...]]`, `[[slack_select: ...]]`). Default: false.",
-  },
   execApprovals: {
     label: "Slack Exec Approvals",
-    help: "Slack-native exec approval routing and approver authorization. When unset, OpenClaw auto-enables DM-first native approvals if approvers can be resolved for this workspace account.",
+    help: 'Slack-native exec approval routing and approver authorization. Set enabled to "auto" or true to enable DM-first native approvals when approvers can be resolved for this Slack account; unset or false disables them.',
+  },
+  presenceEvents: {
+    label: "Slack Presence Events",
+    help: 'Poll observed human participants and wake the routed agent on away-to-active transitions. Default: "off".',
+  },
+  "presenceEvents.mode": {
+    label: "Slack Presence Event Mode",
+    help: '"off" disables polling; "auto" covers DMs, MPIMs, and recent threads with up to 8 observed people; "on" also covers larger threads and top-level channels.',
+  },
+  "presenceEvents.prompt": {
+    label: "Slack Presence Event Prompt",
+    help: "Replace the default greeting guidance appended after presence facts. Use an empty string to omit event-specific guidance and let workspace instructions such as AGENTS.md govern behavior. Maximum: 20,000 characters.",
+  },
+  "channels.*.presenceEvents.mode": {
+    label: "Slack Channel Presence Event Mode",
+    help: 'Override presence events for one Slack channel. Use "on" to include large threads or top-level channel sessions.',
+  },
+  "channels.*.presenceEvents.prompt": {
+    label: "Slack Channel Presence Event Prompt",
+    help: "Override the account-level presence-event prompt for one Slack channel. Maximum: 20,000 characters.",
   },
   "execApprovals.enabled": {
     label: "Slack Exec Approvals Enabled",
-    help: 'Controls Slack native exec approvals for this account: unset or "auto" enables DM-first native approvals when approvers can be resolved, true forces native approvals on, and false disables them.',
+    help: 'Controls Slack native exec approvals for this account: "auto" or true enables DM-first native approvals when approvers can be resolved; unset or false disables them.',
   },
   "execApprovals.approvers": {
     label: "Slack Exec Approval Approvers",
@@ -72,14 +169,6 @@ export const slackChannelConfigUiHints = {
   "execApprovals.target": {
     label: "Slack Exec Approval Target",
     help: 'Controls where Slack approval prompts are sent: "dm" sends to approver DMs (default), "channel" sends to the originating Slack chat/thread, and "both" sends to both. Channel delivery exposes the command text to the chat, so only use it in trusted channels.',
-  },
-  streaming: {
-    label: "Slack Streaming Mode",
-    help: 'Unified Slack stream preview mode: "off" | "partial" | "block" | "progress". Legacy boolean/streamMode keys are auto-mapped.',
-  },
-  nativeStreaming: {
-    label: "Slack Native Streaming",
-    help: "Enable native Slack text streaming (chat.startStream/chat.appendStream/chat.stopStream) when channels.slack.streaming is partial (default: true).",
   },
   "thread.historyScope": {
     label: "Slack Thread History Scope",

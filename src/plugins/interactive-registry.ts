@@ -1,81 +1,77 @@
+import { normalizeOptionalLowercaseString } from "@openclaw/normalization-core/string-coerce";
 import {
-  clearPluginInteractiveHandlersState,
-  getPluginInteractiveHandlersState,
-  type RegisteredInteractiveHandler,
-} from "./interactive-state.js";
+  resolvePluginInteractiveMatch,
+  toPluginInteractiveRegistryKey,
+  validatePluginInteractiveNamespace,
+} from "./interactive-shared.js";
+import { clearPluginInteractiveHandlersState } from "./interactive-state.js";
+import { wrapCurrentPluginInstance } from "./plugin-instance-scope.js";
+import type { PluginRegistry } from "./registry-types.js";
+import {
+  getPluginRegistrationContext,
+  requireActivePluginChannelRegistry,
+  resolveDirectPluginRegistrationOwner,
+} from "./runtime.js";
 import type { PluginInteractiveHandlerRegistration } from "./types.js";
 
-export type InteractiveRegistrationResult = {
+/** Registered interactive handler with owning plugin metadata. */
+export type RegisteredInteractiveHandler = PluginInteractiveHandlerRegistration & {
+  pluginId: string;
+  pluginName?: string;
+  pluginRoot?: string;
+};
+
+/** Registration result for plugin interactive namespace handlers. */
+type InteractiveRegistrationResult = {
   ok: boolean;
   error?: string;
 };
 
-function toRegistryKey(channel: string, namespace: string): string {
-  return `${channel.trim().toLowerCase()}:${namespace.trim()}`;
-}
-
-function normalizeNamespace(namespace: string): string {
-  return namespace.trim();
-}
-
-function validateNamespace(namespace: string): string | null {
-  if (!namespace.trim()) {
-    return "Interactive handler namespace cannot be empty";
-  }
-  if (!/^[A-Za-z0-9._-]+$/.test(namespace.trim())) {
-    return "Interactive handler namespace must contain only letters, numbers, dots, underscores, and hyphens";
-  }
-  return null;
-}
-
-export function resolvePluginInteractiveNamespaceMatch(
+/** Resolves a handler from registry-owned registrations without changing global state. */
+export function resolvePluginInteractiveRegistrationsMatch(
+  registrations: readonly RegisteredInteractiveHandler[],
   channel: string,
   data: string,
 ): { registration: RegisteredInteractiveHandler; namespace: string; payload: string } | null {
-  const interactiveHandlers = getPluginInteractiveHandlersState();
-  const trimmedData = data.trim();
-  if (!trimmedData) {
-    return null;
-  }
-
-  const separatorIndex = trimmedData.indexOf(":");
-  const namespace =
-    separatorIndex >= 0 ? trimmedData.slice(0, separatorIndex) : normalizeNamespace(trimmedData);
-  const registration = interactiveHandlers.get(toRegistryKey(channel, namespace));
-  if (!registration) {
-    return null;
-  }
-
-  return {
-    registration,
-    namespace,
-    payload: separatorIndex >= 0 ? trimmedData.slice(separatorIndex + 1) : "",
-  };
+  return resolvePluginInteractiveMatch({
+    interactiveHandlers: {
+      get: (key) =>
+        registrations.find(
+          (entry) => toPluginInteractiveRegistryKey(entry.channel, entry.namespace) === key,
+        ),
+    },
+    channel,
+    data,
+  });
 }
 
-export function registerPluginInteractiveHandler(
+/** Registers one handler whose lifetime follows its owning plugin registry. */
+export function registerPluginInteractiveHandlerInRegistry(
+  registry: PluginRegistry,
   pluginId: string,
   registration: PluginInteractiveHandlerRegistration,
   opts?: { pluginName?: string; pluginRoot?: string },
 ): InteractiveRegistrationResult {
-  const interactiveHandlers = getPluginInteractiveHandlersState();
-  const namespace = normalizeNamespace(registration.namespace);
-  const validationError = validateNamespace(namespace);
+  const registrations = registry.interactiveHandlers;
+  const namespace = registration.namespace.trim();
+  const validationError = validatePluginInteractiveNamespace(namespace);
   if (validationError) {
     return { ok: false, error: validationError };
   }
-  const key = toRegistryKey(registration.channel, namespace);
-  const existing = interactiveHandlers.get(key);
+  const key = toPluginInteractiveRegistryKey(registration.channel, namespace);
+  const existing = registrations.find(
+    (entry) => toPluginInteractiveRegistryKey(entry.channel, entry.namespace) === key,
+  );
   if (existing) {
     return {
       ok: false,
       error: `Interactive handler namespace "${namespace}" already registered by plugin "${existing.pluginId}"`,
     };
   }
-  interactiveHandlers.set(key, {
-    ...registration,
+  registrations.push({
+    ...wrapCurrentPluginInstance(registration),
     namespace,
-    channel: registration.channel.trim().toLowerCase(),
+    channel: normalizeOptionalLowercaseString(registration.channel) ?? "",
     pluginId,
     pluginName: opts?.pluginName,
     pluginRoot: opts?.pluginRoot,
@@ -83,15 +79,22 @@ export function registerPluginInteractiveHandler(
   return { ok: true };
 }
 
-export function clearPluginInteractiveHandlers(): void {
-  clearPluginInteractiveHandlersState();
+/** Registers one process-global interactive handler. */
+export function registerPluginInteractiveHandler(
+  pluginId: string,
+  registration: PluginInteractiveHandlerRegistration,
+  opts?: { pluginName?: string; pluginRoot?: string },
+): InteractiveRegistrationResult {
+  return registerPluginInteractiveHandlerInRegistry(
+    getPluginRegistrationContext()?.registry ?? requireActivePluginChannelRegistry(),
+    resolveDirectPluginRegistrationOwner(pluginId) ?? pluginId,
+    registration,
+    opts,
+  );
 }
 
-export function clearPluginInteractiveHandlersForPlugin(pluginId: string): void {
-  const interactiveHandlers = getPluginInteractiveHandlersState();
-  for (const [key, value] of interactiveHandlers.entries()) {
-    if (value.pluginId === pluginId) {
-      interactiveHandlers.delete(key);
-    }
-  }
+/** Clears all active plugin interactive handlers. */
+export function clearPluginInteractiveHandlers(): void {
+  requireActivePluginChannelRegistry().interactiveHandlers.length = 0;
+  clearPluginInteractiveHandlersState();
 }

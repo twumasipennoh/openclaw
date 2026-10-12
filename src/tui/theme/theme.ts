@@ -3,15 +3,17 @@ import type {
   MarkdownTheme,
   SelectListTheme,
   SettingsListTheme,
-} from "@mariozechner/pi-tui";
+} from "@earendil-works/pi-tui";
+import { normalizeOptionalLowercaseString } from "@openclaw/normalization-core/string-coerce";
 import chalk from "chalk";
-import { highlight, supportsLanguage } from "cli-highlight";
 import type { SearchableSelectListTheme } from "../components/searchable-select-list.js";
-import { createSyntaxTheme } from "./syntax-theme.js";
 
 const DARK_TEXT = "#E8E3D5";
 const LIGHT_TEXT = "#1E1E1E";
-const XTERM_LEVELS = [0, 95, 135, 175, 215, 255] as const;
+
+function xtermCubeLevel(index: number): number {
+  return index === 0 ? 0 : 55 + index * 40;
+}
 
 function channelToSrgb(value: number): number {
   const normalized = value / 255;
@@ -46,7 +48,7 @@ function pickHigherContrastText(r: number, g: number, b: number): boolean {
 }
 
 function isLightBackground(): boolean {
-  const explicit = process.env.OPENCLAW_THEME?.toLowerCase();
+  const explicit = normalizeOptionalLowercaseString(process.env.OPENCLAW_THEME);
   if (explicit === "light") {
     return true;
   }
@@ -66,19 +68,19 @@ function isLightBackground(): boolean {
         return bg >= 244;
       }
       const cubeIndex = bg - 16;
-      const bVal = XTERM_LEVELS[cubeIndex % 6];
-      const gVal = XTERM_LEVELS[Math.floor(cubeIndex / 6) % 6];
-      const rVal = XTERM_LEVELS[Math.floor(cubeIndex / 36)];
-      return pickHigherContrastText(rVal, gVal, bVal);
+      return pickHigherContrastText(
+        xtermCubeLevel(Math.floor(cubeIndex / 36)),
+        xtermCubeLevel(Math.floor(cubeIndex / 6) % 6),
+        xtermCubeLevel(cubeIndex % 6),
+      );
     }
   }
   return false;
 }
 
-/** Whether the terminal has a light background. Exported for testing only. */
-export const lightMode = isLightBackground();
+const lightMode = isLightBackground();
 
-export const darkPalette = {
+const darkPalette = {
   text: "#E8E3D5",
   dim: "#7B7F87",
   accent: "#F6C453",
@@ -95,14 +97,13 @@ export const darkPalette = {
   quote: "#8CC8FF",
   quoteBorder: "#3B4D6B",
   code: "#F0C987",
-  codeBlock: "#1E232A",
   codeBorder: "#343A45",
   link: "#7DD3A5",
   error: "#F97066",
   success: "#7DD3A5",
 } as const;
 
-export const lightPalette = {
+const lightPalette = {
   text: "#1E1E1E",
   dim: "#5B6472",
   accent: "#B45309",
@@ -119,42 +120,23 @@ export const lightPalette = {
   quote: "#1D4ED8",
   quoteBorder: "#2563EB",
   code: "#92400E",
-  codeBlock: "#F9FAFB",
   codeBorder: "#92400E",
   link: "#047857",
   error: "#DC2626",
   success: "#047857",
 } as const;
 
-export const palette = lightMode ? lightPalette : darkPalette;
+const palette = lightMode ? lightPalette : darkPalette;
 
 const fg = (hex: string) => (text: string) => chalk.hex(hex)(text);
 const bg = (hex: string) => (text: string) => chalk.bgHex(hex)(text);
 
-const syntaxTheme = createSyntaxTheme(fg(palette.code), lightMode);
-
-/**
- * Highlight code with syntax coloring.
- * Returns an array of lines with ANSI escape codes.
- */
-function highlightCode(code: string, lang?: string): string[] {
-  try {
-    // Auto-detect can be slow for very large blocks; prefer explicit language when available.
-    // Check if language is supported, fall back to auto-detect
-    const language = lang && supportsLanguage(lang) ? lang : undefined;
-    const highlighted = highlight(code, {
-      language,
-      theme: syntaxTheme,
-      ignoreIllegals: true,
-    });
-    return highlighted.split("\n");
-  } catch {
-    // If highlighting fails, return plain code
-    return code.split("\n").map((line) => fg(palette.code)(line));
-  }
+// Keep code blocks parser-free on the base TUI path.
+function highlightCode(code: string): string[] {
+  return code.split("\n").map((line) => fg(palette.code)(line));
 }
 
-export const theme = {
+export const tuiTheme = {
   fg: fg(palette.text),
   assistantText: (text: string) => text,
   dim: fg(palette.dim),
@@ -177,55 +159,53 @@ export const theme = {
 };
 
 export const markdownTheme: MarkdownTheme = {
-  heading: (text) => chalk.bold(fg(palette.accent)(text)),
-  link: (text) => fg(palette.link)(text),
+  heading: tuiTheme.header,
+  link: fg(palette.link),
   linkUrl: (text) => chalk.dim(text),
-  code: (text) => fg(palette.code)(text),
-  codeBlock: (text) => fg(palette.code)(text),
-  codeBlockBorder: (text) => fg(palette.codeBorder)(text),
-  quote: (text) => fg(palette.quote)(text),
-  quoteBorder: (text) => fg(palette.quoteBorder)(text),
-  hr: (text) => fg(palette.border)(text),
-  listBullet: (text) => fg(palette.accentSoft)(text),
-  bold: (text) => chalk.bold(text),
-  italic: (text) => chalk.italic(text),
+  code: fg(palette.code),
+  codeBlock: fg(palette.code),
+  codeBlockBorder: fg(palette.codeBorder),
+  quote: fg(palette.quote),
+  quoteBorder: fg(palette.quoteBorder),
+  hr: tuiTheme.border,
+  listBullet: tuiTheme.accentSoft,
+  bold: tuiTheme.bold,
+  italic: tuiTheme.italic,
   strikethrough: (text) => chalk.strikethrough(text),
   underline: (text) => chalk.underline(text),
   highlightCode,
 };
 
-const baseSelectListTheme: SelectListTheme = {
-  selectedPrefix: (text) => fg(palette.accent)(text),
-  selectedText: (text) => chalk.bold(fg(palette.accent)(text)),
-  description: (text) => fg(palette.dim)(text),
-  scrollInfo: (text) => fg(palette.dim)(text),
-  noMatch: (text) => fg(palette.dim)(text),
+export const selectListTheme: SelectListTheme = {
+  selectedPrefix: tuiTheme.accent,
+  selectedText: tuiTheme.header,
+  description: tuiTheme.dim,
+  scrollInfo: tuiTheme.dim,
+  noMatch: tuiTheme.dim,
 };
 
-export const selectListTheme: SelectListTheme = baseSelectListTheme;
-
 export const filterableSelectListTheme = {
-  ...baseSelectListTheme,
-  filterLabel: (text: string) => fg(palette.dim)(text),
+  ...selectListTheme,
+  filterLabel: tuiTheme.dim,
 };
 
 export const settingsListTheme: SettingsListTheme = {
   label: (text, selected) =>
     selected ? chalk.bold(fg(palette.accent)(text)) : fg(palette.text)(text),
   value: (text, selected) => (selected ? fg(palette.accentSoft)(text) : fg(palette.dim)(text)),
-  description: (text) => fg(palette.systemText)(text),
+  description: tuiTheme.system,
   cursor: fg(palette.accent)("→ "),
-  hint: (text) => fg(palette.dim)(text),
+  hint: tuiTheme.dim,
 };
 
 export const editorTheme: EditorTheme = {
-  borderColor: (text) => fg(palette.border)(text),
+  borderColor: tuiTheme.border,
   selectList: selectListTheme,
 };
 
 export const searchableSelectListTheme: SearchableSelectListTheme = {
-  ...baseSelectListTheme,
-  searchPrompt: (text) => fg(palette.accentSoft)(text),
-  searchInput: (text) => fg(palette.text)(text),
-  matchHighlight: (text) => chalk.bold(fg(palette.accent)(text)),
+  ...selectListTheme,
+  searchPrompt: tuiTheme.accentSoft,
+  searchInput: tuiTheme.fg,
+  matchHighlight: tuiTheme.header,
 };

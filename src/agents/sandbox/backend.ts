@@ -1,134 +1,157 @@
-import type { OpenClawConfig } from "../../config/config.js";
-import type { SandboxFsBridge } from "./fs-bridge.js";
-import type { SandboxRegistryEntry } from "./registry.js";
-import type { SandboxConfig, SandboxContext } from "./types.js";
+import { normalizeOptionalLowercaseString } from "@openclaw/normalization-core/string-coerce";
+import { resolveGlobalMap } from "../../shared/global-singleton.js";
+import type { AdmittedRunOperatorAuthority } from "../admitted-run-context.js";
+import type { PreparedGitHubToolEnvironment } from "../github-tool-identity.types.js";
+import type { WorkspaceStateGuard } from "../workspace-state-store.worker-contract.js";
+import type { SandboxBackendHandle } from "./backend-handle.types.js";
+import type {
+  CreateSandboxBackendParams,
+  RegisteredSandboxBackend,
+  SandboxBackendFactory,
+  SandboxBackendId,
+  SandboxBackendManager,
+  SandboxBackendRegistration,
+  SandboxBackendWorkdirResolver,
+} from "./backend.types.js";
+import {
+  createDockerSandboxBackend,
+  createPodmanSandboxBackend,
+  dockerSandboxBackendManager,
+  podmanSandboxBackendManager,
+} from "./docker-backend.js";
+import { SandboxRuntimeRetiredError } from "./provisioning-error.js";
+import {
+  assertSandboxRegistryEntryCurrent,
+  completeSandboxRegistryReservation,
+  reserveSandboxRegistryEntry,
+  updateRegistry,
+  withSandboxRegistryEntryLock,
+  type SandboxRegistryEntry,
+} from "./registry.js";
+import {
+  createSshSandboxBackend,
+  resolveSshRuntimePaths,
+  sshSandboxBackendManager,
+} from "./ssh-backend.js";
 
-export type SandboxBackendId = string;
+export type {
+  CreateSandboxBackendParams,
+  CreateReservedSandboxBackendParamsV1,
+  ReservedSandboxBackendFactoryV1,
+  SandboxBackendFactory,
+  SandboxBackendId,
+  SandboxBackendManager,
+  SandboxBackendRegistration,
+  SandboxBackendRuntimeInfo,
+  SandboxBackendWorkdirValidation,
+  SandboxBackendWorkdirResolver,
+} from "./backend.types.js";
+export type {
+  SandboxBackendCommandParams,
+  SandboxBackendCommandResult,
+  SandboxBackendExecSpec,
+  SandboxBackendHandle,
+  SandboxBackendPreparedWorkdirDiscarder,
+  SandboxBackendWorkdirValidator,
+} from "./backend-handle.types.js";
 
-export type SandboxBackendExecSpec = {
-  argv: string[];
-  env: NodeJS.ProcessEnv;
-  stdinMode: "pipe-open" | "pipe-closed";
-  finalizeToken?: unknown;
+const SANDBOX_BACKEND_FACTORIES_STATE_KEY = Symbol.for("openclaw.sandboxBackendFactories");
+
+type SandboxBackendRegistrationGeneration = {
+  registration: RegisteredSandboxBackend;
+  previous: SandboxBackendRegistrationGeneration | undefined;
+  retired: boolean;
 };
 
-export type SandboxBackendCommandParams = {
-  script: string;
-  args?: string[];
-  stdin?: Buffer | string;
-  allowFailure?: boolean;
-  signal?: AbortSignal;
-};
-
-export type SandboxBackendCommandResult = {
-  stdout: Buffer;
-  stderr: Buffer;
-  code: number;
-};
-
-export type SandboxBackendHandle = {
-  id: SandboxBackendId;
-  runtimeId: string;
-  runtimeLabel: string;
-  workdir: string;
-  env?: Record<string, string>;
-  configLabel?: string;
-  configLabelKind?: string;
-  capabilities?: {
-    browser?: boolean;
-  };
-  buildExecSpec(params: {
-    command: string;
-    workdir?: string;
-    env: Record<string, string>;
-    usePty: boolean;
-  }): Promise<SandboxBackendExecSpec>;
-  finalizeExec?: (params: {
-    status: "completed" | "failed";
-    exitCode: number | null;
-    timedOut: boolean;
-    token?: unknown;
-  }) => Promise<void>;
-  runShellCommand(params: SandboxBackendCommandParams): Promise<SandboxBackendCommandResult>;
-  createFsBridge?: (params: { sandbox: SandboxContext }) => SandboxFsBridge;
-};
-
-export type SandboxBackendRuntimeInfo = {
-  running: boolean;
-  actualConfigLabel?: string;
-  configLabelMatch: boolean;
-};
-
-export type SandboxBackendManager = {
-  describeRuntime(params: {
-    entry: SandboxRegistryEntry;
-    config: OpenClawConfig;
-    agentId?: string;
-  }): Promise<SandboxBackendRuntimeInfo>;
-  removeRuntime(params: {
-    entry: SandboxRegistryEntry;
-    config: OpenClawConfig;
-    agentId?: string;
-  }): Promise<void>;
-};
-
-export type CreateSandboxBackendParams = {
-  sessionKey: string;
-  scopeKey: string;
-  workspaceDir: string;
-  agentWorkspaceDir: string;
-  cfg: SandboxConfig;
-};
-
-export type SandboxBackendFactory = (
-  params: CreateSandboxBackendParams,
-) => Promise<SandboxBackendHandle>;
-
-export type SandboxBackendRegistration =
-  | SandboxBackendFactory
-  | {
-      factory: SandboxBackendFactory;
-      manager?: SandboxBackendManager;
-    };
-
-type RegisteredSandboxBackend = {
-  factory: SandboxBackendFactory;
-  manager?: SandboxBackendManager;
-};
-
-const SANDBOX_BACKEND_FACTORIES = new Map<SandboxBackendId, RegisteredSandboxBackend>();
+// Only explicit overrides need process-wide generations. Built-in defaults stay
+// module-local so repeated imports neither retain old graphs nor replace overrides.
+function getSandboxBackendFactories(): Map<SandboxBackendId, SandboxBackendRegistrationGeneration> {
+  return resolveGlobalMap(SANDBOX_BACKEND_FACTORIES_STATE_KEY);
+}
 
 function normalizeSandboxBackendId(id: string): SandboxBackendId {
-  const normalized = id.trim().toLowerCase();
+  const normalized = normalizeOptionalLowercaseString(id);
   if (!normalized) {
     throw new Error("Sandbox backend id must not be empty.");
   }
   return normalized;
 }
 
+/** Register or replace a sandbox backend and return a restore callback. */
 export function registerSandboxBackend(
   id: string,
   registration: SandboxBackendRegistration,
 ): () => void {
   const normalizedId = normalizeSandboxBackendId(id);
   const resolved = typeof registration === "function" ? { factory: registration } : registration;
-  const previous = SANDBOX_BACKEND_FACTORIES.get(normalizedId);
-  SANDBOX_BACKEND_FACTORIES.set(normalizedId, resolved);
+  const factories = getSandboxBackendFactories();
+  const generation: SandboxBackendRegistrationGeneration = {
+    registration: resolved,
+    previous: factories.get(normalizedId),
+    retired: false,
+  };
+  factories.set(normalizedId, generation);
   return () => {
-    if (previous) {
-      SANDBOX_BACKEND_FACTORIES.set(normalizedId, previous);
+    if (generation.retired) {
       return;
     }
-    SANDBOX_BACKEND_FACTORIES.delete(normalizedId);
+    generation.retired = true;
+    if (factories.get(normalizedId) !== generation) {
+      return;
+    }
+    // Older disposers can run before newer plugin generations retire. Skip
+    // every retired predecessor so stale sandbox authority never returns.
+    let previous = generation.previous;
+    while (previous?.retired) {
+      previous = previous.previous;
+    }
+    if (previous) {
+      factories.set(normalizedId, previous);
+      return;
+    }
+    factories.delete(normalizedId);
   };
 }
 
 export function getSandboxBackendFactory(id: string): SandboxBackendFactory | null {
-  return SANDBOX_BACKEND_FACTORIES.get(normalizeSandboxBackendId(id))?.factory ?? null;
+  const registration = resolveSandboxBackendRegistration(id);
+  if (!registration) {
+    return null;
+  }
+  if (!registration.reserveRuntimeId) {
+    return registration.factory;
+  }
+  const factory = registration.factory;
+  return async (params) => {
+    const { runtimeId, assertRuntimeCurrent } = params;
+    if (!runtimeId || !assertRuntimeCurrent) {
+      throw new Error(
+        `Sandbox backend "${id}" requires a registry-reserved runtime and its current owner.`,
+      );
+    }
+    assertRuntimeCurrent();
+    return factory({ ...params, runtimeId, assertRuntimeCurrent });
+  };
 }
 
 export function getSandboxBackendManager(id: string): SandboxBackendManager | null {
-  return SANDBOX_BACKEND_FACTORIES.get(normalizeSandboxBackendId(id))?.manager ?? null;
+  return resolveSandboxBackendRegistration(id)?.manager ?? null;
+}
+
+/** Include legacy rows in the lifecycle selected by the currently registered backend. */
+export function usesSandboxRuntimeReservations(id: string): boolean {
+  return resolveSandboxBackendRegistration(id)?.reserveRuntimeId !== undefined;
+}
+
+export function getSandboxBackendWorkdirResolver(id: string): SandboxBackendWorkdirResolver | null {
+  return resolveSandboxBackendRegistration(id)?.resolveWorkdir ?? null;
+}
+
+/** Read static backend capabilities without provisioning a sandbox runtime. */
+export function getSandboxBackendCapabilities(
+  id: string,
+): RegisteredSandboxBackend["capabilities"] | undefined {
+  return resolveSandboxBackendRegistration(id)?.capabilities;
 }
 
 export function requireSandboxBackendFactory(id: string): SandboxBackendFactory {
@@ -144,15 +167,133 @@ export function requireSandboxBackendFactory(id: string): SandboxBackendFactory 
   );
 }
 
-import { createDockerSandboxBackend, dockerSandboxBackendManager } from "./docker-backend.js";
-import { createSshSandboxBackend, sshSandboxBackendManager } from "./ssh-backend.js";
+/** Create and publish a backend, reserving provider IDs only for opted-in factories. */
+export async function createSandboxBackend(
+  params: CreateSandboxBackendParams,
+  operatorAuthority?: AdmittedRunOperatorAuthority,
+  githubIdentity?: PreparedGitHubToolEnvironment,
+  guard?: WorkspaceStateGuard,
+): Promise<SandboxBackendHandle> {
+  params.assertRuntimeCurrent?.();
+  const factory = requireSandboxBackendFactory(params.cfg.backend);
+  if (
+    githubIdentity &&
+    factory !== createDockerSandboxBackend &&
+    factory !== createPodmanSandboxBackend
+  ) {
+    throw new Error("Sandbox GitHub identity requires the built-in Docker or Podman backend.");
+  }
+  const reserveRuntimeId = resolveSandboxBackendRegistration(params.cfg.backend)?.reserveRuntimeId;
+  const toEntry = (backend: SandboxBackendHandle): SandboxRegistryEntry => ({
+    containerName: backend.runtimeId,
+    backendId: backend.id,
+    runtimeLabel: backend.runtimeLabel,
+    sessionKey: params.scopeKey,
+    createdAtMs: Date.now(),
+    lastUsedAtMs: Date.now(),
+    image: backend.configLabel ?? params.cfg.docker.image,
+    configLabelKind: backend.configLabelKind ?? "Image",
+  });
+  if (!reserveRuntimeId) {
+    // Only the built-in container owner can establish custody of its allocation.
+    // A plugin overriding the same backend ID retains its own lifecycle contract.
+    const backend =
+      factory === createDockerSandboxBackend
+        ? await createDockerSandboxBackend(params, operatorAuthority, githubIdentity)
+        : factory === createPodmanSandboxBackend
+          ? await createPodmanSandboxBackend(params, operatorAuthority, githubIdentity)
+          : await factory(params);
+    await updateRegistry(toEntry(backend), {
+      ...guard,
+      beforeLegacyApply: params.assertRuntimeCurrent,
+    });
+    return backend;
+  }
+  for (let attempt = 0; ; attempt++) {
+    params.assertRuntimeCurrent?.();
+    const reservation = reserveSandboxRegistryEntry({
+      containerName: reserveRuntimeId(params),
+      backendId: params.cfg.backend,
+      sessionKey: params.scopeKey,
+      createdAtMs: Date.now(),
+      lastUsedAtMs: Date.now(),
+      image: params.cfg.docker.image,
+      workspaceDir: params.workspaceDir,
+    });
+    try {
+      return await withSandboxRegistryEntryLock(reservation, async () => {
+        const assertCurrent = () => {
+          params.assertRuntimeCurrent?.();
+          assertSandboxRegistryEntryCurrent(reservation);
+        };
+        assertCurrent();
+        try {
+          const backend = await factory({
+            ...params,
+            workspaceDir: reservation.workspaceDir ?? params.workspaceDir,
+            runtimeId: reservation.containerName,
+            assertRuntimeCurrent: assertCurrent,
+          });
+          if (
+            backend.runtimeId !== reservation.containerName ||
+            backend.id !== reservation.backendId
+          ) {
+            throw new Error("Sandbox backend returned a runtime outside its reserved generation.");
+          }
+          await completeSandboxRegistryReservation(toEntry(backend), false, {
+            ...guard,
+            beforeLegacyApply: assertCurrent,
+          });
+          return backend;
+        } catch (error) {
+          if (
+            error instanceof SandboxRuntimeRetiredError &&
+            error.runtimeId === reservation.containerName
+          ) {
+            await completeSandboxRegistryReservation(reservation, true, {
+              ...guard,
+              beforeLegacyApply: assertCurrent,
+            });
+          }
+          throw error;
+        }
+      });
+    } catch (error) {
+      if (
+        !(error instanceof SandboxRuntimeRetiredError) ||
+        error.runtimeId !== reservation.containerName ||
+        attempt > 0
+      ) {
+        throw error;
+      }
+    }
+  }
+}
 
-registerSandboxBackend("docker", {
+const builtinSandboxBackends = new Map<SandboxBackendId, RegisteredSandboxBackend>();
+builtinSandboxBackends.set("docker", {
   factory: createDockerSandboxBackend,
   manager: dockerSandboxBackendManager,
+  resolveWorkdir: ({ cfg }) => cfg.docker.workdir,
+  capabilities: { readOnlyResourceMounts: true },
 });
-
-registerSandboxBackend("ssh", {
+builtinSandboxBackends.set("podman", {
+  factory: createPodmanSandboxBackend,
+  manager: podmanSandboxBackendManager,
+  resolveWorkdir: ({ cfg }) => cfg.docker.workdir,
+  capabilities: { readOnlyResourceMounts: true },
+});
+builtinSandboxBackends.set("ssh", {
   factory: createSshSandboxBackend,
   manager: sshSandboxBackendManager,
+  resolveWorkdir: ({ cfg, scopeKey }) =>
+    resolveSshRuntimePaths(cfg.ssh.workspaceRoot, scopeKey).remoteWorkspaceDir,
 });
+
+function resolveSandboxBackendRegistration(id: string): RegisteredSandboxBackend | undefined {
+  const normalizedId = normalizeSandboxBackendId(id);
+  return (
+    getSandboxBackendFactories().get(normalizedId)?.registration ??
+    builtinSandboxBackends.get(normalizedId)
+  );
+}

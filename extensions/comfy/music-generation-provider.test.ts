@@ -1,48 +1,45 @@
-import { describe, expect, it, vi } from "vitest";
+import { expectExplicitMusicGenerationCapabilities } from "openclaw/plugin-sdk/provider-test-contracts";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { buildComfyMusicGenerationProvider } from "./music-generation-provider.js";
-import { _setComfyFetchGuardForTesting } from "./workflow-runtime.js";
+import { buildComfyConfig, fetchGuardJson } from "./test-helpers.js";
 
 const { fetchWithSsrFGuardMock } = vi.hoisted(() => ({
   fetchWithSsrFGuardMock: vi.fn(),
 }));
 
+vi.mock("openclaw/plugin-sdk/ssrf-runtime", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("openclaw/plugin-sdk/ssrf-runtime")>()),
+  fetchWithSsrFGuard: fetchWithSsrFGuardMock,
+}));
+
 describe("comfy music-generation provider", () => {
+  afterEach(() => {
+    fetchWithSsrFGuardMock.mockReset();
+    vi.clearAllMocks();
+  });
+
   it("registers the workflow model", () => {
     const provider = buildComfyMusicGenerationProvider();
 
     expect(provider.defaultModel).toBe("workflow");
     expect(provider.models).toEqual(["workflow"]);
-    expect(provider.capabilities.maxInputImages).toBe(1);
+    expectExplicitMusicGenerationCapabilities(provider);
   });
 
   it("runs a music workflow and returns audio outputs", async () => {
-    _setComfyFetchGuardForTesting(fetchWithSsrFGuardMock);
     fetchWithSsrFGuardMock
-      .mockResolvedValueOnce({
-        response: new Response(JSON.stringify({ prompt_id: "music-job-1" }), {
-          status: 200,
-          headers: { "content-type": "application/json" },
-        }),
-        release: vi.fn(async () => {}),
-      })
-      .mockResolvedValueOnce({
-        response: new Response(
-          JSON.stringify({
-            "music-job-1": {
-              outputs: {
-                "9": {
-                  audio: [{ filename: "song.mp3", subfolder: "", type: "output" }],
-                },
+      .mockResolvedValueOnce(fetchGuardJson({ prompt_id: "music-job-1" }))
+      .mockResolvedValueOnce(
+        fetchGuardJson({
+          "music-job-1": {
+            outputs: {
+              "9": {
+                audio: [{ filename: "song.mp3", subfolder: "", type: "output" }],
               },
             },
-          }),
-          {
-            status: 200,
-            headers: { "content-type": "application/json" },
           },
-        ),
-        release: vi.fn(async () => {}),
-      })
+        }),
+      )
       .mockResolvedValueOnce({
         response: new Response(Buffer.from("music-bytes"), {
           status: 200,
@@ -56,28 +53,23 @@ describe("comfy music-generation provider", () => {
       provider: "comfy",
       model: "workflow",
       prompt: "gentle ambient synth loop",
-      cfg: {
-        models: {
-          providers: {
-            comfy: {
-              music: {
-                workflow: {
-                  "6": { inputs: { text: "" } },
-                  "9": { inputs: {} },
-                },
-                promptNodeId: "6",
-                outputNodeId: "9",
-              },
-            },
+      cfg: buildComfyConfig({
+        music: {
+          workflow: {
+            "6": { inputs: { text: "" } },
+            "9": { inputs: {} },
           },
+          promptNodeId: "6",
+          outputNodeId: "9",
         },
-      } as never,
+      }),
     });
 
-    expect(result).toMatchObject({
+    expect(result).toEqual({
       model: "workflow",
       tracks: [
         {
+          buffer: Buffer.from("music-bytes"),
           mimeType: "audio/mpeg",
           fileName: "song.mp3",
         },
@@ -88,6 +80,45 @@ describe("comfy music-generation provider", () => {
         inputImageCount: 0,
       },
     });
-    expect(result.tracks[0]?.buffer).toEqual(Buffer.from("music-bytes"));
+  });
+
+  it("honors req.timeoutMs for the music workflow poll deadline", async () => {
+    // Submit succeeds, but the workflow never produces outputs: every history
+    // poll returns an empty object. The request-level timeoutMs must bound the
+    // wait — before the fix, music ignored req.timeoutMs and always waited the
+    // 5-minute default.
+    fetchWithSsrFGuardMock.mockImplementation(async (params: { url?: string }) => {
+      const url = params.url ?? "";
+      const body = url.includes("/prompt")
+        ? JSON.stringify({ prompt_id: "music-job-slow" })
+        : JSON.stringify({});
+      return {
+        response: new Response(body, {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+        release: vi.fn(async () => {}),
+      };
+    });
+
+    const provider = buildComfyMusicGenerationProvider();
+    await expect(
+      provider.generateMusic({
+        provider: "comfy",
+        model: "workflow",
+        prompt: "gentle ambient synth loop",
+        timeoutMs: 1000,
+        cfg: buildComfyConfig({
+          music: {
+            workflow: {
+              "6": { inputs: { text: "" } },
+              "9": { inputs: {} },
+            },
+            promptNodeId: "6",
+            outputNodeId: "9",
+          },
+        }),
+      }),
+    ).rejects.toThrow("Comfy workflow did not finish within 1s");
   });
 });

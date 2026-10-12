@@ -1,4 +1,5 @@
 import type {
+  AnswerCallInput,
   GetCallStatusInput,
   GetCallStatusResult,
   HangupCallInput,
@@ -6,6 +7,7 @@ import type {
   InitiateCallResult,
   PlayTtsInput,
   ProviderName,
+  SendDtmfInput,
   WebhookParseOptions,
   ProviderWebhookParseResult,
   StartListeningInput,
@@ -14,20 +16,13 @@ import type {
   WebhookVerificationResult,
 } from "../types.js";
 
-/**
- * Abstract base interface for voice call providers.
- *
- * Each provider (Telnyx, Twilio, etc.) implements this interface to provide
- * a consistent API for the call manager.
- *
- * Responsibilities:
- * - Webhook verification and event parsing
- * - Outbound call initiation and hangup
- * - Media control (TTS playback, STT listening)
- */
 export interface VoiceCallProvider {
-  /** Provider identifier */
   readonly name: ProviderName;
+
+  setPublicUrl?(url: string): void;
+
+  /** Defer conversation greeting/listening until the configured stream connects. */
+  isConversationStreamConnectEnabled?(): boolean;
 
   /**
    * Verify webhook signature/HMAC before processing.
@@ -42,14 +37,19 @@ export interface VoiceCallProvider {
   parseWebhookEvent(ctx: WebhookContext, options?: WebhookParseOptions): ProviderWebhookParseResult;
 
   /**
-   * Initiate an outbound call.
-   * @returns Provider call ID and status
+   * Consume one-time TwiML that must be served before shortcut handlers such as
+   * realtime media streams take over the webhook response.
    */
+  consumeInitialTwiML?: (ctx: WebhookContext) => string | null;
+
   initiateCall(input: InitiateCallInput): Promise<InitiateCallResult>;
 
   /**
-   * Hang up an active call.
+   * Answer an accepted inbound call when the provider requires an explicit
+   * answer command after the initial webhook.
    */
+  answerCall?: (input: AnswerCallInput) => Promise<void>;
+
   hangupCall(input: HangupCallInput): Promise<void>;
 
   /**
@@ -58,14 +58,10 @@ export interface VoiceCallProvider {
    */
   playTts(input: PlayTtsInput): Promise<void>;
 
-  /**
-   * Start listening for user speech (activate STT).
-   */
+  sendDtmf?: (input: SendDtmfInput) => Promise<void>;
+
   startListening(input: StartListeningInput): Promise<void>;
 
-  /**
-   * Stop listening for user speech (deactivate STT).
-   */
   stopListening(input: StopListeningInput): Promise<void>;
 
   /**

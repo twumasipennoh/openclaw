@@ -1,8 +1,9 @@
-import { resolveChannelContextVisibilityMode } from "openclaw/plugin-sdk/config-runtime";
 import {
-  evaluateSupplementalContextVisibility,
-  type ContextVisibilityDecision,
-} from "openclaw/plugin-sdk/security-runtime";
+  filterChannelInboundQuoteContext,
+  resolveInboundSupplementalSenderAllowed,
+} from "openclaw/plugin-sdk/channel-inbound";
+import { resolveChannelContextVisibilityMode } from "openclaw/plugin-sdk/context-visibility-runtime";
+import { normalizeOptionalString } from "openclaw/plugin-sdk/string-coerce-runtime";
 import {
   formatSignalSenderDisplay,
   isSignalSenderAllowed,
@@ -10,9 +11,8 @@ import {
 } from "../identity.js";
 import type { SignalDataMessage } from "./event-handler.types.js";
 
-export type SignalQuoteContext = {
+type SignalQuoteContext = {
   contextVisibilityMode: ReturnType<typeof resolveChannelContextVisibilityMode>;
-  decision: ContextVisibilityDecision;
   quoteSenderAllowed: boolean;
   visibleQuoteText: string;
   visibleQuoteSender?: string;
@@ -30,29 +30,29 @@ export function resolveSignalQuoteContext(params: {
     channel: "signal",
     accountId: params.accountId,
   });
-  const quoteText = params.dataMessage?.quote?.text?.trim() ?? "";
+  const quoteText = normalizeOptionalString(params.dataMessage?.quote?.text) ?? "";
   const quoteSender = resolveSignalSender({
     sourceNumber: params.dataMessage?.quote?.author ?? null,
     sourceUuid: params.dataMessage?.quote?.authorUuid ?? null,
   });
-  const quoteSenderAllowed =
-    !params.isGroup || params.effectiveGroupAllow.length === 0
-      ? true
-      : quoteSender
-        ? isSignalSenderAllowed(quoteSender, params.effectiveGroupAllow)
-        : false;
-  const decision = evaluateSupplementalContextVisibility({
-    mode: contextVisibilityMode,
-    kind: "quote",
+  const quoteSenderAllowed = resolveInboundSupplementalSenderAllowed({
+    isGroup: params.isGroup,
+    groupPolicy: params.effectiveGroupAllow.length === 0 ? "open" : "allowlist",
+    allowFrom: params.effectiveGroupAllow,
+    isSenderAllowed: (allowFrom) =>
+      quoteSender ? isSignalSenderAllowed(quoteSender, allowFrom) : false,
+  });
+  const visibleQuote = filterChannelInboundQuoteContext(contextVisibilityMode, {
+    body: quoteText,
+    sender: quoteSender ? formatSignalSenderDisplay(quoteSender) : undefined,
     senderAllowed: quoteSenderAllowed,
+    isQuote: true,
   });
 
   return {
     contextVisibilityMode,
-    decision,
     quoteSenderAllowed,
-    visibleQuoteText: decision.include ? quoteText : "",
-    visibleQuoteSender:
-      decision.include && quoteSender ? formatSignalSenderDisplay(quoteSender) : undefined,
+    visibleQuoteText: visibleQuote?.body ?? "",
+    visibleQuoteSender: visibleQuote?.sender,
   };
 }

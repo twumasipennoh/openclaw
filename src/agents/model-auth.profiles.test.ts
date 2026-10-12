@@ -1,797 +1,989 @@
 import fs from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
-import type { Api, Model } from "@mariozechner/pi-ai";
+import type { Model } from "openclaw/plugin-sdk/llm";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
+import type { ModelProviderConfig, OpenClawConfig } from "../config/types.js";
+import type { SecretRef } from "../config/types.secrets.js";
+import { writeConfigMachineState } from "../state/config-machine-state-write.js";
+import { resolveOpenClawStateSqlitePath } from "../state/openclaw-state-db.paths.js";
 import { withEnvAsync } from "../test-utils/env.js";
-import { clearRuntimeAuthProfileStoreSnapshots, ensureAuthProfileStore } from "./auth-profiles.js";
+import { withOpenClawTestState } from "../test-utils/openclaw-test-state.js";
 import {
-  getApiKeyForModel,
-  hasAvailableAuthForProvider,
-  resolveApiKeyForProvider,
+  createApiKeyCredential as keyCredential,
+  createAuthProfileStoreFixture as authStore,
+} from "./auth-profiles/credential-fixtures.test-support.js";
+import { clearAuthProfileMigrationDiagnostics } from "./auth-profiles/legacy-source-diagnostic.js";
+import {
+  clearRuntimeAuthProfileStoreSnapshots,
+  replaceRuntimeAuthProfileStoreSnapshots,
+} from "./auth-profiles/runtime-snapshots.js";
+import {
+  inspectPersistedAuthProfileStoreRaw,
+  writePersistedAuthProfileStoreRaw,
+} from "./auth-profiles/sqlite.js";
+import { ensureAuthProfileStore } from "./auth-profiles/store-runtime.js";
+import type { AuthProfileCredential, OAuthCredential } from "./auth-profiles/types.js";
+import { upsertAuthProfileWithLockOrThrow } from "./auth-profiles/upsert-with-lock.js";
+import { resolveInlineProviderApiKeyUsageId } from "./auth-profiles/usage.js";
+import { resolveLegacyInheritedAuthDir } from "./legacy-inherited-auth-dir.js";
+import {
+  createRuntimeProviderAuthLookup,
+  getApiKeyForModelCore as resolveModelAuth,
+  hasAvailableAuthForProvider as hasAuth,
+  hasRuntimeAvailableProviderAuth,
+  prepareRuntimeAvailableProviderAuth,
+  resolveApiKeyForProviderCore as resolveAuth,
   resolveEnvApiKey,
 } from "./model-auth.js";
 
-vi.mock("../plugins/provider-runtime.js", () => ({
-  buildProviderMissingAuthMessageWithPlugin: (params: {
-    provider: string;
-    context: { listProfileIds: (providerId: string) => string[] };
-  }) => {
-    if (params.provider === "openai" && params.context.listProfileIds("openai-codex").length > 0) {
-      return 'No API key found for provider "openai". Use openai-codex/gpt-5.4.';
-    }
-    return undefined;
-  },
-  formatProviderAuthProfileApiKeyWithPlugin: async () => undefined,
-  refreshProviderOAuthCredentialWithPlugin: async () => null,
-  resolveProviderSyntheticAuthWithPlugin: (params: {
-    provider: string;
-    context: { providerConfig?: { api?: string; baseUrl?: string; models?: unknown[] } };
-  }) => {
-    if (params.provider !== "ollama" && params.provider !== "demo-local") {
-      return undefined;
-    }
-    const providerConfig = params.context.providerConfig;
-    const hasApiConfig =
-      Boolean(providerConfig?.api?.trim()) ||
-      Boolean(providerConfig?.baseUrl?.trim()) ||
-      (Array.isArray(providerConfig?.models) && providerConfig.models.length > 0);
-    if (!hasApiConfig) {
+function secretRef(source: SecretRef["source"], id: string, provider: string): SecretRef {
+  return { source, id, provider };
+}
+
+function providerEntry(
+  baseUrl: string,
+  options: Omit<ModelProviderConfig, "baseUrl" | "models"> = {},
+): ModelProviderConfig {
+  return { baseUrl, models: [], ...options };
+}
+
+function configForProviders(providers: Record<string, ModelProviderConfig>): OpenClawConfig {
+  return { models: { providers } };
+}
+
+function testModelDefinition(id: string): ModelProviderConfig["models"][number] {
+  return {
+    id,
+    name: id,
+    reasoning: false,
+    input: ["text"],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: 128_000,
+    maxTokens: 8192,
+  };
+}
+
+vi.mock("../plugins/setup-registry.js", () => ({
+  resolvePluginSetupProviderCore: ({ provider }: { provider: string; env: NodeJS.ProcessEnv }) => {
+    if (provider !== "anthropic-vertex") {
       return undefined;
     }
     return {
-      apiKey: params.provider === "ollama" ? "ollama-local" : "demo-local",
-      source: `models.providers.${params.provider} (synthetic local key)`,
-      mode: "api-key" as const,
+      resolveConfigApiKey: ({ env }: { env: NodeJS.ProcessEnv }) =>
+        ["1", "true"].includes(env.ANTHROPIC_VERTEX_USE_GCP_METADATA?.trim().toLowerCase() ?? "")
+          ? "gcp-vertex-credentials"
+          : undefined,
     };
   },
+}));
+
+vi.mock("./model-auth-env-vars.js", () => {
+  const candidates = {
+    anthropic: ["ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY"],
+    "google-vertex": ["GOOGLE_CLOUD_API_KEY"],
+    "demo-local": ["DEMO_LOCAL_API_KEY"],
+    openai: ["OPENAI_API_KEY"],
+    zai: ["ZAI_API_KEY", "Z_AI_API_KEY"],
+  } as const;
+
+  const authEvidenceMap = {
+    "google-vertex": [
+      {
+        type: "local-file-with-env",
+        fileEnvVar: "GOOGLE_APPLICATION_CREDENTIALS",
+        fallbackPaths: ["${HOME}/.config/gcloud/application_default_credentials.json"],
+        requiresAnyEnv: ["GOOGLE_CLOUD_PROJECT", "GCLOUD_PROJECT"],
+        requiresAllEnv: ["GOOGLE_CLOUD_LOCATION"],
+        credentialMarker: "gcp-vertex-credentials",
+        source: "gcloud adc",
+      },
+    ],
+  } satisfies Record<string, readonly unknown[]>;
+  return {
+    listKnownProviderEnvApiKeyNames: () => [...new Set(Object.values(candidates).flat())],
+    resolveProviderEnvAuthLookupMaps: () => ({
+      aliasMap: {},
+      envCandidateMap: candidates,
+      authEvidenceMap,
+      setupProviderFallbackRefs: ["anthropic-vertex"],
+    }),
+  };
+});
+
+vi.mock("../plugins/provider-external-auth-core.js", () => ({
+  createProviderExternalAuthResolver: () => ({
+    resolveExternalAuthProfilesWithPlugins: () => [],
+  }),
+}));
+
+vi.mock("../plugins/provider-runtime.js", () => ({
+  buildProviderMissingAuthMessageWithPlugin: () => undefined,
+  formatProviderAuthProfileApiKeyWithPlugin: async () => undefined,
+  refreshProviderOAuthCredentialWithPlugin: async () => null,
+  resolveProviderDeprecatedAuthProfileIds: ({ provider }: { provider: string }) =>
+    provider === "anthropic" || provider === "claude-cli" ? ["anthropic:claude-cli"] : [],
+  prepareProviderExternalAuthWithPlugin: async () => undefined,
+  prepareProviderSyntheticAuthWithPlugin: async () => undefined,
+  resolveProviderSyntheticAuthWithPlugin: () => undefined,
   shouldDeferProviderSyntheticProfileAuthWithPlugin: (params: {
     provider: string;
     context: { resolvedApiKey?: string };
   }) => {
-    const expectedMarker =
-      params.provider === "ollama"
-        ? "ollama-local"
-        : params.provider === "demo-local"
-          ? "demo-local"
-          : undefined;
+    const expectedMarker = params.provider === "demo-local" ? "demo-local" : undefined;
     return Boolean(expectedMarker && params.context.resolvedApiKey?.trim() === expectedMarker);
   },
 }));
 
-vi.mock("./cli-credentials.js", () => ({
-  readCodexCliCredentialsCached: () => null,
-  readMiniMaxCliCredentialsCached: () => null,
+vi.mock("../plugins/providers.js", () => ({
+  resolveOwningPluginIdsForProvider: ({ provider }: { provider: string }) =>
+    provider === "openai" ? ["openai"] : [],
+  resolveOwningPluginIdsForProviderRef: ({ provider }: { provider: string }) =>
+    provider === "openai" ? ["openai"] : [],
 }));
+
+const cliCredentialMocks = vi.hoisted(() => ({
+  readCodexCliCredentialsCached: vi.fn<(options?: unknown) => OAuthCredential | null>(() => null),
+  readMiniMaxCliCredentialsCached: vi.fn<(options?: unknown) => OAuthCredential | null>(() => null),
+}));
+
+vi.mock("./cli-credentials.js", () => cliCredentialMocks);
 
 beforeEach(() => {
   clearRuntimeAuthProfileStoreSnapshots();
+  cliCredentialMocks.readCodexCliCredentialsCached.mockReset().mockReturnValue(null);
+  cliCredentialMocks.readMiniMaxCliCredentialsCached.mockReset().mockReturnValue(null);
 });
 
-afterEach(() => {
-  clearRuntimeAuthProfileStoreSnapshots();
-});
+afterEach(clearRuntimeAuthProfileStoreSnapshots);
 
-const envVar = (...parts: string[]) => parts.join("_");
+const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 
 const oauthFixture = {
   access: "access-token",
   refresh: "refresh-token",
-  expires: Date.now() + 60_000,
+  expires: Date.now() + 30 * 60 * 1000,
   accountId: "acct_123",
 };
 
 const BEDROCK_PROVIDER_CFG = {
   models: {
     providers: {
-      "amazon-bedrock": {
-        baseUrl: "https://bedrock-runtime.us-east-1.amazonaws.com",
+      "amazon-bedrock": providerEntry("https://bedrock-runtime.us-east-1.amazonaws.com", {
         api: "bedrock-converse-stream",
         auth: "aws-sdk",
-        models: [],
+      }),
+    },
+  },
+} satisfies OpenClawConfig;
+
+const BEDROCK_PROVIDER_CFG_WITH_PROFILE = {
+  ...BEDROCK_PROVIDER_CFG,
+  auth: {
+    order: {
+      "amazon-bedrock": ["amazon-bedrock:default"],
+    },
+    profiles: {
+      "amazon-bedrock:default": {
+        provider: "amazon-bedrock",
+        mode: "aws-sdk",
       },
     },
   },
-} as const;
+} satisfies OpenClawConfig;
 
-async function resolveBedrockProvider() {
-  return resolveApiKeyForProvider({
-    provider: "amazon-bedrock",
-    store: { version: 1, profiles: {} },
-    cfg: BEDROCK_PROVIDER_CFG as never,
-  });
-}
-
-async function expectBedrockAuthSource(params: {
-  env: Record<string, string | undefined>;
-  expectedSource: string;
-}) {
-  await withEnvAsync(params.env, async () => {
-    const resolved = await resolveBedrockProvider();
+it.each(["amazon-bedrock:default", undefined])(
+  "resolves config-only AWS SDK auth with explicit profile %s",
+  async (profileId) => {
+    const resolved = await resolveAuth({
+      provider: "amazon-bedrock",
+      profileId,
+      store: authStore({}),
+      cfg: BEDROCK_PROVIDER_CFG_WITH_PROFILE,
+    });
     expect(resolved.mode).toBe("aws-sdk");
+    expect(resolved.profileId).toBe("amazon-bedrock:default");
+    expect(resolved.source).toBe("profile:amazon-bedrock:default");
     expect(resolved.apiKey).toBeUndefined();
-    expect(resolved.source).toContain(params.expectedSource);
+  },
+);
+
+function cooldownStore(
+  provider: string,
+  profiles: import("./auth-profiles.js").AuthProfileStore["profiles"] = {},
+) {
+  return {
+    ...authStore(profiles),
+    usageStats: {
+      [resolveInlineProviderApiKeyUsageId(provider)]: {
+        disabledUntil: Date.now() + 60_000,
+        disabledReason: "billing" as const,
+      },
+    },
+  };
+}
+
+function configuredAgent(agentDir: string) {
+  return { entries: { configured: { agentDir } } };
+}
+
+function buildDemoLocalStore(keys: string[]) {
+  return authStore(
+    Object.fromEntries(
+      keys.map((key, index) => [
+        index === 0 ? "demo-local:default" : `demo-local:${index + 1}`,
+        keyCredential("demo-local" as const, key),
+      ]),
+    ),
+  );
+}
+
+function buildDemoLocalProviderCfg(apiKey: string): OpenClawConfig {
+  return configForProviders({
+    "demo-local": providerEntry("https://local-provider.example", {
+      api: "openai-completions",
+      apiKey,
+    }),
   });
 }
 
-describe("getApiKeyForModel", () => {
-  it("reads oauth auth-profiles entries from auth-profiles.json via explicit profile", async () => {
-    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-oauth-"));
-
-    try {
-      const agentDir = path.join(tempDir, "agent");
-      await withEnvAsync(
-        {
-          OPENCLAW_STATE_DIR: tempDir,
-          OPENCLAW_AGENT_DIR: agentDir,
-          PI_CODING_AGENT_DIR: agentDir,
-        },
-        async () => {
-          const authProfilesPath = path.join(agentDir, "auth-profiles.json");
-          await fs.mkdir(agentDir, { recursive: true, mode: 0o700 });
-          await fs.writeFile(
-            authProfilesPath,
-            `${JSON.stringify(
-              {
-                version: 1,
-                profiles: {
-                  "openai-codex:default": {
-                    type: "oauth",
-                    provider: "openai-codex",
-                    ...oauthFixture,
-                  },
-                },
-              },
-              null,
-              2,
-            )}\n`,
-            "utf8",
-          );
-
-          const model = {
-            id: "codex-mini-latest",
-            provider: "openai-codex",
-            api: "openai-codex-responses",
-          } as Model<Api>;
-
-          const store = ensureAuthProfileStore(process.env.OPENCLAW_AGENT_DIR, {
-            allowKeychainPrompt: false,
-          });
-          const apiKey = await getApiKeyForModel({
-            model,
-            profileId: "openai-codex:default",
-            store,
-            agentDir: process.env.OPENCLAW_AGENT_DIR,
-          });
-          expect(apiKey.apiKey).toBe(oauthFixture.access);
-        },
-      );
-    } finally {
-      await fs.rm(tempDir, { recursive: true, force: true });
-    }
+async function resolveDemoLocalApiKey(params: {
+  envApiKey: string | undefined;
+  storedKeys: string[];
+  configuredApiKey: string;
+}) {
+  return await withEnvAsync({ DEMO_LOCAL_API_KEY: params.envApiKey }, async () => {
+    return await resolveAuth({
+      provider: "demo-local",
+      store: buildDemoLocalStore(params.storedKeys),
+      cfg: buildDemoLocalProviderCfg(params.configuredApiKey),
+    });
   });
+}
 
-  it("suggests openai-codex when only Codex OAuth is configured", async () => {
-    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-auth-"));
-
-    try {
-      const agentDir = path.join(tempDir, "agent");
-      await withEnvAsync(
-        {
-          OPENAI_API_KEY: undefined,
-          OPENCLAW_STATE_DIR: tempDir,
-          OPENCLAW_AGENT_DIR: agentDir,
-          PI_CODING_AGENT_DIR: agentDir,
-        },
-        async () => {
-          const authProfilesPath = path.join(tempDir, "agent", "auth-profiles.json");
-          await fs.mkdir(path.dirname(authProfilesPath), {
-            recursive: true,
-            mode: 0o700,
-          });
-          await fs.writeFile(
-            authProfilesPath,
-            `${JSON.stringify(
-              {
-                version: 1,
-                profiles: {
-                  "openai-codex:default": {
-                    type: "oauth",
-                    provider: "openai-codex",
-                    ...oauthFixture,
-                  },
-                },
-              },
-              null,
-              2,
-            )}\n`,
-            "utf8",
-          );
-
-          let error: unknown = null;
-          try {
-            await resolveApiKeyForProvider({ provider: "openai" });
-          } catch (err) {
-            error = err;
-          }
-          expect(String(error)).toContain("openai-codex/gpt-5.4");
-        },
-      );
-    } finally {
-      await fs.rm(tempDir, { recursive: true, force: true });
-    }
-  });
-
-  it("throws when ZAI API key is missing", async () => {
-    await withEnvAsync(
+describe("shared auth profile read-through", () => {
+  it.each([
+    {
+      name: "reads a shared API key without a local profile",
+      baseKey: "shared-state-key",
+      legacy: false,
+      localKey: undefined,
+    },
+    {
+      name: "keeps the populated legacy main store authoritative before relocation",
+      baseKey: "legacy-main-key",
+      legacy: true,
+      localKey: undefined,
+    },
+    {
+      name: "lets an agent-local profile override its shared read-through base",
+      baseKey: "shared-state-key",
+      legacy: false,
+      localKey: "agent-local-key",
+    },
+  ])("$name", async ({ baseKey, legacy, localKey }) => {
+    await withOpenClawTestState(
       {
-        ZAI_API_KEY: undefined,
-        Z_AI_API_KEY: undefined,
+        layout: "state-only",
+        prefix: "openclaw-auth-read-through-",
+        agentEnv: "main",
+        env: { OPENAI_API_KEY: undefined },
       },
-      async () => {
-        let error: unknown = null;
-        try {
-          await resolveApiKeyForProvider({
-            provider: "zai",
-            store: { version: 1, profiles: {} },
-          });
-        } catch (err) {
-          error = err;
+      async (state) => {
+        const profileId = "openai:manual";
+        const mainAgentDir = state.agentDir();
+        const agentDir = state.agentDir("worker");
+        const credential = keyCredential("openai", baseKey);
+
+        if (legacy) {
+          writePersistedAuthProfileStoreRaw(authStore({ [profileId]: credential }), mainAgentDir);
+        }
+        await upsertAuthProfileWithLockOrThrow({
+          profileId,
+          credential,
+          agentDir: mainAgentDir,
+        });
+        if (localKey) {
+          writePersistedAuthProfileStoreRaw(
+            authStore({ [profileId]: { ...credential, key: localKey } }),
+            agentDir,
+          );
         }
 
-        expect(String(error)).toContain('No API key found for provider "zai".');
-      },
-    );
-  });
+        expect(inspectPersistedAuthProfileStoreRaw(mainAgentDir).status).toBe(
+          legacy ? "readable" : "missing",
+        );
+        expect(inspectPersistedAuthProfileStoreRaw(agentDir).status).toBe(
+          localKey ? "readable" : "missing",
+        );
 
-  it("accepts legacy Z_AI_API_KEY for zai", async () => {
-    await withEnvAsync(
-      {
-        ZAI_API_KEY: undefined,
-        Z_AI_API_KEY: "zai-test-key", // pragma: allowlist secret
-      },
-      async () => {
-        const resolved = await resolveApiKeyForProvider({
-          provider: "zai",
-          store: { version: 1, profiles: {} },
+        const inheritedAuthDir = resolveLegacyInheritedAuthDir({}, state.env);
+        const store = ensureAuthProfileStore(agentDir, {
+          allowKeychainPrompt: false,
+          syncExternalCli: false,
+          ...(inheritedAuthDir ? { inheritedAuthDir } : {}),
         });
-        expect(resolved.apiKey).toBe("zai-test-key");
-        expect(resolved.source).toContain("Z_AI_API_KEY");
+        const resolved = await resolveAuth({
+          provider: "openai",
+          cfg: {},
+          agentDir,
+          store,
+        });
+
+        expect(resolved.apiKey).toBe(localKey ?? baseKey);
+        expect(resolved.source).toBe(`profile:${profileId}`);
       },
     );
   });
+});
 
-  it("hasAvailableAuthForProvider('google') accepts GOOGLE_API_KEY fallback", async () => {
-    await withEnvAsync(
-      {
-        GEMINI_API_KEY: undefined,
-        GOOGLE_API_KEY: "google-test-key", // pragma: allowlist secret
-      },
-      async () => {
-        await expect(
-          hasAvailableAuthForProvider({
-            provider: "google",
-            store: { version: 1, profiles: {} },
+describe("getApiKeyForModelCore", () => {
+  it("keeps OpenAI OAuth profiles on the Codex transport and API keys on direct OpenAI", async () => {
+    await withOpenClawTestState(
+      { layout: "state-only", prefix: "openclaw-oauth-", agentEnv: "main" },
+      async (state) => {
+        await state.writeAuthProfiles(
+          authStore({
+            "openai:chatgpt": {
+              type: "oauth" as const,
+              provider: "openai",
+              ...oauthFixture,
+            },
+            "openai:api-key": keyCredential("openai", "direct-openai-key"),
           }),
-        ).resolves.toBe(true);
+        );
+        const agentDir = state.agentDir();
+        const store = ensureAuthProfileStore(agentDir, { allowKeychainPrompt: false });
+
+        const directAuth = await resolveModelAuth({
+          model: {
+            id: "chat-latest",
+            provider: "openai",
+            api: "openai-responses",
+          } as Model,
+          store,
+          agentDir,
+        });
+        const codexAuth = await resolveModelAuth({
+          model: {
+            id: "gpt-5.5",
+            provider: "openai",
+            api: "openai-chatgpt-responses",
+          } as Model,
+          store,
+          agentDir,
+        });
+
+        expect(directAuth).toMatchObject({
+          apiKey: "direct-openai-key",
+          mode: "api-key",
+          profileId: "openai:api-key",
+        });
+        expect(codexAuth).toMatchObject({
+          apiKey: oauthFixture.access,
+          mode: "oauth",
+          profileId: "openai:chatgpt",
+        });
       },
     );
   });
 
-  it("hasAvailableAuthForProvider returns false when no provider auth is available", async () => {
+  it("resolves ChatGPT token-sharing as renewable OAuth for public Responses", async () => {
+    await expect(
+      resolveModelAuth({
+        model: {
+          id: "gpt-5.5",
+          provider: "openai",
+          api: "openai-responses",
+          baseUrl: "https://api.openai.com/v1",
+        } as Model,
+        profileId: "openai:shared",
+        lockedProfile: true,
+        store: authStore({
+          "openai:shared": {
+            type: "oauth",
+            provider: "openai",
+            ...oauthFixture,
+            authFlow: "chatgpt-token-sharing",
+          },
+        }),
+      }),
+    ).resolves.toMatchObject({
+      apiKey: oauthFixture.access,
+      mode: "oauth",
+      authFlow: "chatgpt-token-sharing",
+      profileId: "openai:shared",
+    });
+  });
+
+  it.each([["chatgpt-token-sharing", "openai-responses", "https://proxy.example/v1"]])(
+    "rejects %s for %s at %s before returning a bearer",
+    async (authFlow, api, baseUrl) => {
+      await expect(
+        resolveModelAuth({
+          model: { id: "gpt-5.5", provider: "openai", api, baseUrl } as Model,
+          profileId: "openai:shared",
+          lockedProfile: true,
+          store: authStore({
+            "openai:shared": { type: "oauth", provider: "openai", ...oauthFixture, authFlow },
+          }),
+        }),
+      ).rejects.toThrow(/requires (the public OpenAI Responses endpoint|token-sharing consent)/);
+    },
+  );
+
+  it("rejects an explicit OpenAI API-key profile for the Codex transport", async () => {
+    const store = authStore({
+      "openai:api-key": keyCredential("openai", "direct-openai-key"),
+    });
+
+    await expect(
+      resolveModelAuth({
+        model: {
+          id: "gpt-5.5",
+          provider: "openai",
+          api: "openai-chatgpt-responses",
+        } as Model,
+        profileId: "openai:api-key",
+        lockedProfile: true,
+        store,
+      }),
+    ).rejects.toThrow(/requires a ChatGPT subscription \(OAuth or token\) profile/);
+  });
+
+  it("uses the config default agent dir for inline provider cooldown checks", async () => {
+    await withOpenClawTestState(
+      {
+        layout: "state-only",
+        prefix: "openclaw-inline-cooldown-agent-dir-",
+        agentEnv: "clear",
+      },
+      async (state) => {
+        await state.writeAuthProfiles(cooldownStore("demo-local"), "configured");
+
+        const cfg: OpenClawConfig = {
+          ...buildDemoLocalProviderCfg("DEMO_LOCAL_API_KEY"),
+          agents: configuredAgent(state.agentDir("configured")),
+        };
+
+        await withEnvAsync({ DEMO_LOCAL_API_KEY: "env-demo-key" }, async () => {
+          await expect(resolveAuth({ provider: "demo-local", cfg })).rejects.toThrow(
+            /Inline API key for provider "demo-local" is temporarily disabled/,
+          );
+        });
+      },
+    );
+  });
+
+  it("does not read unrelated external CLI credentials when resolving provider auth", async () => {
+    await withOpenClawTestState(
+      {
+        layout: "state-only",
+        prefix: "openclaw-auth-scope-",
+        agentEnv: "main",
+        env: {
+          OPENAI_API_KEY: undefined,
+        },
+      },
+      async (state) => {
+        writeConfigMachineState("auth.sharedStore", { location: "state-db" }, { env: state.env });
+        const error = await resolveAuth({
+          provider: "openai",
+          agentDir: state.agentDir(),
+        }).catch((caught: unknown) => caught);
+        expect(error).toMatchObject({
+          code: "missing-provider-auth",
+          provider: "openai",
+        });
+        expect(error).toBeInstanceOf(Error);
+        expect((error as Error).message).toContain(
+          `Auth store: ${resolveOpenClawStateSqlitePath(state.env)} (agentDir: ${state.agentDir()}).`,
+        );
+        expect((error as Error).message).toContain(
+          "openclaw models auth paste-api-key --provider openai",
+        );
+        expect((error as Error).message).not.toContain("openclaw agents add");
+      },
+    );
+
+    expect(cliCredentialMocks.readCodexCliCredentialsCached).not.toHaveBeenCalled();
+    expect(cliCredentialMocks.readMiniMaxCliCredentialsCached).not.toHaveBeenCalled();
+  });
+
+  it("skips malformed stored ZAI command profiles and uses current env auth", async () => {
     await withEnvAsync(
       {
-        ZAI_API_KEY: undefined,
+        ZAI_API_KEY: "zai-current-key", // pragma: allowlist secret
         Z_AI_API_KEY: undefined,
       },
       async () => {
-        await expect(
-          hasAvailableAuthForProvider({
-            provider: "zai",
-            store: { version: 1, profiles: {} },
+        const resolved = await resolveAuth({
+          provider: "zai",
+          store: authStore({
+            "zai:default": keyCredential("zai", "openclaw onboard --auth-choice zai-coding-global"),
           }),
-        ).resolves.toBe(false);
-      },
-    );
-  });
-
-  it("resolves Synthetic API key from env", async () => {
-    await withEnvAsync({ [envVar("SYNTHETIC", "API", "KEY")]: "synthetic-test-key" }, async () => {
-      // pragma: allowlist secret
-      const resolved = await resolveApiKeyForProvider({
-        provider: "synthetic",
-        store: { version: 1, profiles: {} },
-      });
-      expect(resolved.apiKey).toBe("synthetic-test-key");
-      expect(resolved.source).toContain("SYNTHETIC_API_KEY");
-    });
-  });
-
-  it("resolves Qianfan API key from env", async () => {
-    await withEnvAsync({ [envVar("QIANFAN", "API", "KEY")]: "qianfan-test-key" }, async () => {
-      // pragma: allowlist secret
-      const resolved = await resolveApiKeyForProvider({
-        provider: "qianfan",
-        store: { version: 1, profiles: {} },
-      });
-      expect(resolved.apiKey).toBe("qianfan-test-key");
-      expect(resolved.source).toContain("QIANFAN_API_KEY");
-    });
-  });
-
-  it("resolves Qwen API key from env", async () => {
-    await withEnvAsync(
-      { [envVar("MODELSTUDIO", "API", "KEY")]: "modelstudio-test-key" },
-      async () => {
-        // pragma: allowlist secret
-        const resolved = await resolveApiKeyForProvider({
-          provider: "qwen",
-          store: { version: 1, profiles: {} },
         });
-        expect(resolved.apiKey).toBe("modelstudio-test-key");
-        expect(resolved.source).toContain("MODELSTUDIO_API_KEY");
+        expect(resolved.apiKey).toBe("zai-current-key");
+        expect(resolved.source).toContain("ZAI_API_KEY");
+        expect(resolved.profileId).toBeUndefined();
       },
     );
   });
 
-  it("resolves synthetic local auth key for configured ollama provider without apiKey", async () => {
-    await withEnvAsync({ OLLAMA_API_KEY: undefined }, async () => {
-      const resolved = await resolveApiKeyForProvider({
-        provider: "ollama",
-        store: { version: 1, profiles: {} },
-        cfg: {
-          models: {
-            providers: {
-              ollama: {
-                baseUrl: "http://gpu-node-server:11434",
-                api: "openai-completions",
-                models: [],
-              },
-            },
+  it.each([
+    ["vllm", "http://127.0.0.1:8000/v1", true],
+    ["remote", "https://remote.example.com/v1", false],
+  ] as const)("reports prepared auth availability for %s", async (provider, baseUrl, available) => {
+    await expect(
+      prepareRuntimeAvailableProviderAuth({
+        provider,
+        cfg: configForProviders({
+          [provider]: {
+            api: "openai-completions",
+            baseUrl,
+            models: [testModelDefinition("fixture-model")],
           },
-        },
-      });
-      expect(resolved.apiKey).toBe("ollama-local");
-      expect(resolved.mode).toBe("api-key");
-      expect(resolved.source).toContain("synthetic local key");
-    });
+        }),
+        env: {},
+        store: authStore({}),
+      }),
+    ).resolves.toBe(available);
   });
 
-  it("prefers explicit OLLAMA_API_KEY over synthetic local key", async () => {
-    await withEnvAsync({ [envVar("OLLAMA", "API", "KEY")]: "env-ollama-key" }, async () => {
-      // pragma: allowlist secret
-      const resolved = await resolveApiKeyForProvider({
-        provider: "ollama",
-        store: { version: 1, profiles: {} },
-        cfg: {
-          models: {
-            providers: {
-              ollama: {
-                baseUrl: "http://gpu-node-server:11434",
-                api: "openai-completions",
-                models: [],
-              },
-            },
-          },
-        },
+  it.each([false, true])(
+    "honors inline cooldown with healthy profile available = %s",
+    async (healthy) => {
+      await withEnvAsync({ INLINE_CLOUD_API_KEY: "env-cloud-key" }, async () => {
+        const store = cooldownStore(
+          "inline-cloud",
+          healthy
+            ? {
+                "inline-cloud:default": keyCredential("inline-cloud", "stored-cloud-key"),
+              }
+            : {},
+        );
+        const cfg = configForProviders({
+          "inline-cloud": providerEntry("https://inline-cloud.example", {
+            api: "openai-completions",
+            apiKey: "INLINE_CLOUD_API_KEY",
+          }),
+        });
+        await expect(hasAuth({ provider: "inline-cloud", store, cfg })).resolves.toBe(healthy);
+        if (healthy) {
+          const resolved = await resolveAuth({
+            provider: "inline-cloud",
+            store,
+            cfg,
+          });
+          expect(resolved.apiKey).toBe("stored-cloud-key");
+          expect(resolved.source).toBe("profile:inline-cloud:default");
+        } else {
+          await expect(resolveAuth({ provider: "inline-cloud", store, cfg })).rejects.toThrow(
+            /Inline API key for provider "inline-cloud" is temporarily disabled/,
+          );
+        }
       });
-      expect(resolved.apiKey).toBe("env-ollama-key");
-      expect(resolved.source).toContain("OLLAMA_API_KEY");
+    },
+  );
+
+  it("falls back to the stored synthetic local profile when no real auth exists", async () => {
+    const resolved = await resolveDemoLocalApiKey({
+      envApiKey: undefined,
+      storedKeys: ["demo-local"],
+      configuredApiKey: "DEMO_LOCAL_API_KEY",
     });
+    expect(resolved.apiKey).toBe("demo-local");
+    expect(resolved.source).toBe("profile:demo-local:default");
+    expect(resolved.profileId).toBe("demo-local:default");
   });
 
-  it("prefers explicit OLLAMA_API_KEY over the stored ollama-local profile", async () => {
-    await withEnvAsync({ OLLAMA_API_KEY: "env-ollama-key" }, async () => {
-      const resolved = await resolveApiKeyForProvider({
-        provider: "ollama",
-        store: {
-          version: 1,
-          profiles: {
-            "ollama:default": {
-              type: "api_key",
-              provider: "ollama",
-              key: "ollama-local",
-            },
-          },
-        },
-        cfg: {
-          models: {
-            providers: {
-              ollama: {
-                baseUrl: "https://ollama.com",
-                api: "ollama",
-                apiKey: "OLLAMA_API_KEY",
-                models: [],
-              },
-            },
-          },
-        },
-      });
-      expect(resolved.apiKey).toBe("env-ollama-key");
-      expect(resolved.source).toContain("OLLAMA_API_KEY");
-      expect(resolved.profileId).toBeUndefined();
+  it("defers every stored synthetic local profile until real auth sources are checked", async () => {
+    const resolved = await resolveDemoLocalApiKey({
+      envApiKey: "env-demo-key",
+      storedKeys: ["demo-local", "demo-local"],
+      configuredApiKey: "DEMO_LOCAL_API_KEY",
     });
-  });
-
-  it("prefers explicit configured ollama apiKey over the stored ollama-local profile", async () => {
-    await withEnvAsync({ OLLAMA_API_KEY: undefined }, async () => {
-      const resolved = await resolveApiKeyForProvider({
-        provider: "ollama",
-        store: {
-          version: 1,
-          profiles: {
-            "ollama:default": {
-              type: "api_key",
-              provider: "ollama",
-              key: "ollama-local",
-            },
-          },
-        },
-        cfg: {
-          models: {
-            providers: {
-              ollama: {
-                baseUrl: "https://ollama.com",
-                api: "ollama",
-                apiKey: "config-ollama-key",
-                models: [],
-              },
-            },
-          },
-        },
-      });
-      expect(resolved.apiKey).toBe("config-ollama-key");
-      expect(resolved.source).toBe("models.json");
-      expect(resolved.profileId).toBeUndefined();
-    });
-  });
-
-  it("falls back to the stored ollama-local profile when no real ollama auth exists", async () => {
-    await withEnvAsync({ OLLAMA_API_KEY: undefined }, async () => {
-      const resolved = await resolveApiKeyForProvider({
-        provider: "ollama",
-        store: {
-          version: 1,
-          profiles: {
-            "ollama:default": {
-              type: "api_key",
-              provider: "ollama",
-              key: "ollama-local",
-            },
-          },
-        },
-        cfg: {
-          models: {
-            providers: {
-              ollama: {
-                baseUrl: "https://ollama.com",
-                api: "ollama",
-                apiKey: "OLLAMA_API_KEY",
-                models: [],
-              },
-            },
-          },
-        },
-      });
-      expect(resolved.apiKey).toBe("ollama-local");
-      expect(resolved.source).toBe("profile:ollama:default");
-      expect(resolved.profileId).toBe("ollama:default");
-    });
-  });
-
-  it("keeps a real stored ollama profile ahead of env auth", async () => {
-    await withEnvAsync({ OLLAMA_API_KEY: "env-ollama-key" }, async () => {
-      const resolved = await resolveApiKeyForProvider({
-        provider: "ollama",
-        store: {
-          version: 1,
-          profiles: {
-            "ollama:default": {
-              type: "api_key",
-              provider: "ollama",
-              key: "stored-ollama-key",
-            },
-          },
-        },
-        cfg: {
-          models: {
-            providers: {
-              ollama: {
-                baseUrl: "https://ollama.com",
-                api: "ollama",
-                apiKey: "OLLAMA_API_KEY",
-                models: [],
-              },
-            },
-          },
-        },
-      });
-      expect(resolved.apiKey).toBe("stored-ollama-key");
-      expect(resolved.source).toBe("profile:ollama:default");
-      expect(resolved.profileId).toBe("ollama:default");
-    });
-  });
-
-  it("defers every stored ollama-local profile until real auth sources are checked", async () => {
-    await withEnvAsync({ OLLAMA_API_KEY: "env-ollama-key" }, async () => {
-      const resolved = await resolveApiKeyForProvider({
-        provider: "ollama",
-        store: {
-          version: 1,
-          profiles: {
-            "ollama:default": {
-              type: "api_key",
-              provider: "ollama",
-              key: "ollama-local",
-            },
-            "ollama:secondary": {
-              type: "api_key",
-              provider: "ollama",
-              key: "ollama-local",
-            },
-          },
-        },
-        cfg: {
-          models: {
-            providers: {
-              ollama: {
-                baseUrl: "https://ollama.com",
-                api: "ollama",
-                apiKey: "OLLAMA_API_KEY",
-                models: [],
-              },
-            },
-          },
-        },
-      });
-      expect(resolved.apiKey).toBe("env-ollama-key");
-      expect(resolved.source).toContain("OLLAMA_API_KEY");
-      expect(resolved.profileId).toBeUndefined();
-    });
-  });
-
-  it("defers plugin-owned synthetic profile markers without core provider branching", async () => {
-    const resolved = await resolveApiKeyForProvider({
-      provider: "demo-local",
-      store: {
-        version: 1,
-        profiles: {
-          "demo-local:default": {
-            type: "api_key",
-            provider: "demo-local",
-            key: "demo-local",
-          },
-        },
-      },
-      cfg: {
-        models: {
-          providers: {
-            "demo-local": {
-              baseUrl: "http://localhost:11434",
-              api: "openai-completions",
-              apiKey: "config-demo-key",
-              models: [],
-            },
-          },
-        },
-      },
-    });
-    expect(resolved.apiKey).toBe("config-demo-key");
-    expect(resolved.source).toBe("models.json");
+    expect(resolved.apiKey).toBe("env-demo-key");
+    expect(resolved.source).toContain("DEMO_LOCAL_API_KEY");
     expect(resolved.profileId).toBeUndefined();
   });
 
-  it("still throws for ollama when no env/profile/config provider is available", async () => {
-    await withEnvAsync({ OLLAMA_API_KEY: undefined }, async () => {
-      await expect(
-        resolveApiKeyForProvider({
-          provider: "ollama",
-          store: { version: 1, profiles: {} },
-        }),
-      ).rejects.toThrow('No API key found for provider "ollama".');
-    });
-  });
-
-  it("resolves Vercel AI Gateway API key from env", async () => {
-    await withEnvAsync({ [envVar("AI_GATEWAY", "API", "KEY")]: "gateway-test-key" }, async () => {
-      // pragma: allowlist secret
-      const resolved = await resolveApiKeyForProvider({
-        provider: "vercel-ai-gateway",
-        store: { version: 1, profiles: {} },
-      });
-      expect(resolved.apiKey).toBe("gateway-test-key");
-      expect(resolved.source).toContain("AI_GATEWAY_API_KEY");
-    });
-  });
-
-  it("prefers Bedrock bearer token over access keys and profile", async () => {
-    await expectBedrockAuthSource({
-      env: {
-        AWS_BEARER_TOKEN_BEDROCK: "bedrock-token", // pragma: allowlist secret
-        AWS_ACCESS_KEY_ID: "access-key",
-        [envVar("AWS", "SECRET", "ACCESS", "KEY")]: "secret-key", // pragma: allowlist secret
+  it.each([
+    ["bearer", "AWS_BEARER_TOKEN_BEDROCK"],
+    ["access", "AWS_ACCESS_KEY_ID"],
+    ["profile", "AWS_PROFILE"],
+  ])("prefers Bedrock %s credentials over lower-priority sources", async (kind, source) => {
+    await withEnvAsync(
+      {
+        AWS_BEARER_TOKEN_BEDROCK: kind === "bearer" ? "bedrock-token" : undefined,
+        AWS_ACCESS_KEY_ID: kind === "profile" ? undefined : "access-key",
+        AWS_SECRET_ACCESS_KEY: kind === "profile" ? undefined : "secret-key",
         AWS_PROFILE: "profile",
       },
-      expectedSource: "AWS_BEARER_TOKEN_BEDROCK",
-    });
-  });
-
-  it("prefers Bedrock access keys over profile", async () => {
-    await expectBedrockAuthSource({
-      env: {
-        AWS_BEARER_TOKEN_BEDROCK: undefined,
-        AWS_ACCESS_KEY_ID: "access-key",
-        [envVar("AWS", "SECRET", "ACCESS", "KEY")]: "secret-key", // pragma: allowlist secret
-        AWS_PROFILE: "profile",
-      },
-      expectedSource: "AWS_ACCESS_KEY_ID",
-    });
-  });
-
-  it("uses Bedrock profile when access keys are missing", async () => {
-    await expectBedrockAuthSource({
-      env: {
-        AWS_BEARER_TOKEN_BEDROCK: undefined,
-        AWS_ACCESS_KEY_ID: undefined,
-        AWS_SECRET_ACCESS_KEY: undefined,
-        AWS_PROFILE: "profile",
-      },
-      expectedSource: "AWS_PROFILE",
-    });
-  });
-
-  it("accepts VOYAGE_API_KEY for voyage", async () => {
-    await withEnvAsync({ [envVar("VOYAGE", "API", "KEY")]: "voyage-test-key" }, async () => {
-      // pragma: allowlist secret
-      const voyage = await resolveApiKeyForProvider({
-        provider: "voyage",
-        store: { version: 1, profiles: {} },
-      });
-      expect(voyage.apiKey).toBe("voyage-test-key");
-      expect(voyage.source).toContain("VOYAGE_API_KEY");
-    });
-  });
-
-  it("strips embedded CR/LF from ANTHROPIC_API_KEY", async () => {
-    await withEnvAsync({ [envVar("ANTHROPIC", "API", "KEY")]: "sk-ant-test-\r\nkey" }, async () => {
-      // pragma: allowlist secret
-      const resolved = resolveEnvApiKey("anthropic");
-      expect(resolved?.apiKey).toBe("sk-ant-test-key");
-      expect(resolved?.source).toContain("ANTHROPIC_API_KEY");
-    });
-  });
-
-  it("resolveEnvApiKey('huggingface') returns HUGGINGFACE_HUB_TOKEN when set", async () => {
-    await withEnvAsync(
-      {
-        HUGGINGFACE_HUB_TOKEN: "hf_hub_xyz",
-        HF_TOKEN: undefined,
-      },
       async () => {
-        const resolved = resolveEnvApiKey("huggingface");
-        expect(resolved?.apiKey).toBe("hf_hub_xyz");
-        expect(resolved?.source).toContain("HUGGINGFACE_HUB_TOKEN");
+        const resolved = await resolveAuth({
+          provider: "amazon-bedrock",
+          cfg: BEDROCK_PROVIDER_CFG,
+          store: authStore({}),
+        });
+        expect(resolved.mode).toBe("aws-sdk");
+        expect(resolved.apiKey).toBeUndefined();
+        expect(resolved.source).toContain(source);
       },
     );
   });
 
-  it("resolveEnvApiKey('huggingface') prefers HUGGINGFACE_HUB_TOKEN over HF_TOKEN when both set", async () => {
-    await withEnvAsync(
+  it("resolveEnvApiKey('google-vertex') keeps ADC fallback when manifest env candidates are empty", async () => {
+    const tempDir = tempDirs.make("openclaw-google-adc-candidates-");
+    const credentialsPath = path.join(tempDir, "認証情報-adc.json");
+    await fs.writeFile(credentialsPath, "{}", "utf8");
+
+    const resolved = resolveEnvApiKey(
+      "google-vertex",
       {
-        HUGGINGFACE_HUB_TOKEN: "hf_hub_first",
-        HF_TOKEN: "hf_second",
-      },
-      async () => {
-        const resolved = resolveEnvApiKey("huggingface");
-        expect(resolved?.apiKey).toBe("hf_hub_first");
-        expect(resolved?.source).toContain("HUGGINGFACE_HUB_TOKEN");
-      },
+        GOOGLE_APPLICATION_CREDENTIALS: credentialsPath,
+        GOOGLE_CLOUD_LOCATION: "us-central1",
+        GOOGLE_CLOUD_PROJECT: "vertex-project",
+      } as NodeJS.ProcessEnv,
+      { candidateMap: { "google-vertex": ["GOOGLE_CLOUD_API_KEY"] } },
     );
+
+    expect(resolved?.apiKey).toBe("gcp-vertex-credentials");
+    expect(resolved?.source).toBe("gcloud adc");
   });
 
-  it("resolveEnvApiKey('huggingface') returns HF_TOKEN when only HF_TOKEN set", async () => {
-    await withEnvAsync(
-      {
-        HUGGINGFACE_HUB_TOKEN: undefined,
-        HF_TOKEN: "hf_abc123",
-      },
-      async () => {
-        const resolved = resolveEnvApiKey("huggingface");
-        expect(resolved?.apiKey).toBe("hf_abc123");
-        expect(resolved?.source).toContain("HF_TOKEN");
-      },
+  it("resolveEnvApiKey('google-vertex') rejects missing explicit ADC path before fallback paths", async () => {
+    const homeDir = tempDirs.make("openclaw-google-adc-home-");
+    const fallbackDir = path.join(homeDir, ".config", "gcloud");
+    const missingCredentialsPath = path.join(homeDir, "missing-adc.json");
+    await fs.mkdir(fallbackDir, { recursive: true });
+    await fs.writeFile(
+      path.join(fallbackDir, "application_default_credentials.json"),
+      "{}",
+      "utf8",
     );
-  });
 
-  it("resolveEnvApiKey('opencode-go') falls back to OPENCODE_ZEN_API_KEY", async () => {
-    await withEnvAsync(
-      {
-        OPENCODE_API_KEY: undefined,
-        OPENCODE_ZEN_API_KEY: "sk-opencode-zen-fallback", // pragma: allowlist secret
-      },
-      async () => {
-        const resolved = resolveEnvApiKey("opencode-go");
-        expect(resolved?.apiKey).toBe("sk-opencode-zen-fallback");
-        expect(resolved?.source).toContain("OPENCODE_ZEN_API_KEY");
-      },
-    );
-  });
-
-  it("resolveEnvApiKey('minimax-portal') accepts MINIMAX_OAUTH_TOKEN", async () => {
-    await withEnvAsync(
-      {
-        MINIMAX_OAUTH_TOKEN: "minimax-oauth-token",
-        MINIMAX_API_KEY: undefined,
-      },
-      async () => {
-        const resolved = resolveEnvApiKey("minimax-portal");
-        expect(resolved?.apiKey).toBe("minimax-oauth-token");
-        expect(resolved?.source).toContain("MINIMAX_OAUTH_TOKEN");
-      },
-    );
-  });
-
-  it("resolveEnvApiKey('volcengine-plan') uses volcengine auth candidates", async () => {
-    await withEnvAsync(
-      {
-        VOLCANO_ENGINE_API_KEY: "volcengine-plan-key",
-      },
-      async () => {
-        const resolved = resolveEnvApiKey("volcengine-plan");
-        expect(resolved?.apiKey).toBe("volcengine-plan-key");
-        expect(resolved?.source).toContain("VOLCANO_ENGINE_API_KEY");
-      },
-    );
-  });
-
-  it("resolveEnvApiKey('anthropic-vertex') uses the provided env snapshot", async () => {
-    const resolved = resolveEnvApiKey("anthropic-vertex", {
-      GOOGLE_CLOUD_PROJECT_ID: "vertex-project",
+    const resolved = resolveEnvApiKey("google-vertex", {
+      GOOGLE_APPLICATION_CREDENTIALS: missingCredentialsPath,
+      GOOGLE_CLOUD_LOCATION: "us-central1",
+      GOOGLE_CLOUD_PROJECT: "vertex-project",
+      HOME: homeDir,
     } as NodeJS.ProcessEnv);
 
     expect(resolved).toBeNull();
   });
 
-  it("resolveEnvApiKey('anthropic-vertex') accepts GOOGLE_APPLICATION_CREDENTIALS with project_id", async () => {
-    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-adc-"));
-    const credentialsPath = path.join(tempDir, "adc.json");
-    await fs.writeFile(credentialsPath, JSON.stringify({ project_id: "vertex-project" }), "utf8");
+  it.each([
+    ["anthropic-vertex", true],
+    ["other-vertex", false],
+  ] as const)("limits prepared setup auth to declared provider %s", (provider, available) => {
+    expect(
+      hasRuntimeAvailableProviderAuth({
+        provider,
+        env: { ANTHROPIC_VERTEX_USE_GCP_METADATA: "true" },
+        runtimeLookup: createRuntimeProviderAuthLookup({ env: {} }),
+      }),
+    ).toBe(available);
+  });
+});
 
-    try {
-      const resolved = resolveEnvApiKey("anthropic-vertex", {
-        GOOGLE_APPLICATION_CREDENTIALS: credentialsPath,
-      } as NodeJS.ProcessEnv);
+describe("resolveApiKeyForProviderCore — per-entry apiKey as profile ID reference", () => {
+  it.each(["both", "invalid persisted"])(
+    "isolates legacy migration to its providers with %s snapshots",
+    async (snapshot) => {
+      await withOpenClawTestState(
+        { layout: "state-only", prefix: "openclaw-provider-migration-" },
+        async (state) => {
+          const agentDir = state.agentDir("worker");
+          await fs.mkdir(agentDir, { recursive: true });
+          const legacyPath = path.join(agentDir, "auth-profiles.json");
+          const legacyBytes = JSON.stringify(
+            authStore({
+              "anthropic:default": keyCredential("anthropic", "legacy-key"),
+            }),
+          );
+          await fs.writeFile(legacyPath, legacyBytes);
+          const persistedProfiles =
+            snapshot === "invalid persisted"
+              ? { "invalid:default": { type: "invalid", provider: "invalid" } }
+              : {};
+          writePersistedAuthProfileStoreRaw(authStore(persistedProfiles), agentDir);
+          replaceRuntimeAuthProfileStoreSnapshots([
+            ...(snapshot === "both" ? [{ store: authStore({}) }] : []),
+            ...(snapshot === "both" ? [{ agentDir, store: authStore({}) }] : []),
+          ]);
+          const cfg: OpenClawConfig = configForProviders({
+            litellm: providerEntry("https://litellm.example.test/v1", {
+              apiKey: "litellm-key",
+            }),
+            anthropic: providerEntry("https://anthropic.example.test/v1", {
+              apiKey: "fallback-key",
+            }),
+          });
+          try {
+            for (const store of [undefined, authStore({})]) {
+              await expect(
+                resolveAuth({ provider: "litellm", agentDir, cfg, store }),
+              ).resolves.toMatchObject({ apiKey: "litellm-key" });
+              await expect(
+                resolveAuth({ provider: "anthropic", agentDir, cfg, store }),
+              ).rejects.toMatchObject({
+                code: "AUTH_PROFILE_MIGRATION_REQUIRED",
+                affectedProviders: ["anthropic"],
+                message: expect.stringContaining(
+                  "affected providers: anthropic; run openclaw doctor --fix",
+                ),
+              });
+            }
+            expect(await fs.readFile(legacyPath, "utf8")).toBe(legacyBytes);
+            expect(inspectPersistedAuthProfileStoreRaw(agentDir)).toMatchObject({
+              status: "readable",
+              raw: { profiles: persistedProfiles },
+            });
+            await fs.writeFile(
+              legacyPath,
+              JSON.stringify(
+                authStore({
+                  "nvidia:default": keyCredential("nvidia", "new-legacy-key"),
+                }),
+              ),
+            );
+            for (const removeSource of [false, true]) {
+              if (removeSource) {
+                await fs.rm(legacyPath);
+              }
+              await expect(
+                resolveAuth({ provider: "litellm", agentDir, cfg }),
+              ).resolves.toMatchObject({ apiKey: "litellm-key" });
+              for (const provider of ["anthropic", "nvidia"]) {
+                await expect(resolveAuth({ provider, agentDir, cfg })).rejects.toMatchObject({
+                  affectedProviders: ["anthropic", "nvidia"],
+                });
+              }
+            }
+          } finally {
+            clearAuthProfileMigrationDiagnostics();
+            clearRuntimeAuthProfileStoreSnapshots();
+          }
+        },
+      );
+    },
+  );
 
-      expect(resolved?.apiKey).toBe("gcp-vertex-credentials");
-      expect(resolved?.source).toBe("gcloud adc");
-    } finally {
-      await fs.rm(tempDir, { recursive: true, force: true });
-    }
+  it("rejects pending credential migration through provider auth", async () => {
+    await withOpenClawTestState(
+      { layout: "state-only", prefix: "openclaw-entry-migration-" },
+      async (state) => {
+        const agentDir = state.agentDir("worker");
+        await fs.mkdir(agentDir, { recursive: true });
+        await fs.writeFile(path.join(agentDir, "auth-profiles.json"), "{}\n");
+        await expect(
+          resolveAuth({
+            provider: "custom-provider",
+            agentDir,
+            cfg: configForProviders({
+              "custom-provider": providerEntry("https://provider.example.test/v1", {
+                apiKey: "custom-provider:prepared",
+              }),
+            }),
+            store: authStore({
+              "custom-provider:prepared": keyCredential("custom-provider", "prepared-key"),
+            }),
+          }).finally(() => clearAuthProfileMigrationDiagnostics()),
+        ).rejects.toMatchObject({
+          code: "AUTH_PROFILE_MIGRATION_REQUIRED",
+          action: "openclaw doctor --fix",
+        });
+      },
+    );
   });
 
-  it("resolveEnvApiKey('anthropic-vertex') accepts GOOGLE_APPLICATION_CREDENTIALS without a local project field", async () => {
-    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-adc-"));
-    const credentialsPath = path.join(tempDir, "adc.json");
-    await fs.writeFile(credentialsPath, "{}", "utf8");
-
-    try {
-      const resolved = resolveEnvApiKey("anthropic-vertex", {
-        GOOGLE_APPLICATION_CREDENTIALS: credentialsPath,
-      } as NodeJS.ProcessEnv);
-
-      expect(resolved?.apiKey).toBe("gcp-vertex-credentials");
-      expect(resolved?.source).toBe("gcloud adc");
-    } finally {
-      await fs.rm(tempDir, { recursive: true, force: true });
-    }
+  it("rejects a retired profile reference before resolving its copied credential through provider auth", async () => {
+    await expect(
+      resolveAuth({
+        provider: "anthropic",
+        cfg: configForProviders({
+          anthropic: providerEntry("https://api.anthropic.com", {
+            api: "anthropic-messages",
+            apiKey: "anthropic:claude-cli",
+          }),
+        }),
+        store: authStore({
+          "anthropic:claude-cli": {
+            type: "oauth",
+            provider: "anthropic",
+            access: "copied-native-access",
+            refresh: "copied-native-refresh",
+            expires: Date.now() + 30 * 60 * 1000,
+          },
+        }),
+      }),
+    ).rejects.toThrow(/anthropic:claude-cli.*retired.*doctor --fix/);
   });
 
-  it("resolveEnvApiKey('anthropic-vertex') accepts explicit metadata auth opt-in", async () => {
-    const resolved = resolveEnvApiKey("anthropic-vertex", {
-      ANTHROPIC_VERTEX_USE_GCP_METADATA: "true",
-    } as NodeJS.ProcessEnv);
+  it("does not treat env SecretRef ids as profile references", async () => {
+    await withEnvAsync({ OPENROUTER_PROFILE: "sk-or-env-secret" }, async () => {
+      const resolved = await resolveAuth({
+        provider: "openrouter-minimax",
+        cfg: configForProviders({
+          "openrouter-minimax": providerEntry("https://openrouter.ai/api/v1", {
+            api: "openai-completions" as const,
+            apiKey: secretRef("env", "OPENROUTER_PROFILE", "default"),
+          }),
+        }),
+        store: authStore({
+          OPENROUTER_PROFILE: keyCredential("openrouter", "sk-or-wrong-profile"),
+        }),
+      });
 
-    expect(resolved?.apiKey).toBe("gcp-vertex-credentials");
-    expect(resolved?.source).toBe("gcloud adc");
+      expect(resolved.apiKey).toBe("sk-or-env-secret");
+      expect(resolved.source).toContain("OPENROUTER_PROFILE");
+    });
   });
+
+  it("keeps env-first precedence ahead of stale inline cooldown for per-entry profile references", async () => {
+    const usageId = resolveInlineProviderApiKeyUsageId("openai");
+    await withEnvAsync({ OPENAI_API_KEY: "sk-env-first" }, async () => {
+      const store = {
+        version: 1 as const,
+        profiles: {
+          "openai:key-b": keyCredential("openai" as const, "sk-profile-key"),
+        },
+        usageStats: {
+          [usageId]: {
+            disabledUntil: Date.now() + 60_000,
+            disabledReason: "billing" as const,
+          },
+        },
+      };
+      const cfg: OpenClawConfig = configForProviders({
+        openai: providerEntry("https://api.openai.com/v1", {
+          api: "openai-completions",
+          apiKey: "openai:key-b",
+        }),
+      });
+
+      const resolved = await resolveAuth({
+        provider: "openai",
+        credentialPrecedence: "env-first",
+        cfg,
+        store,
+      });
+
+      expect(resolved.apiKey).toBe("sk-env-first");
+      expect(resolved.source).toContain("OPENAI_API_KEY");
+      await expect(hasAuth({ provider: "openai", store, cfg })).resolves.toBe(true);
+    });
+  });
+
+  it("resolves profile reference even when provider sets auth: api-key explicitly (regression for clawsweeper P3)", async () => {
+    // Regression: explicit API-key mode must not send the profile ID as the bearer.
+    const resolved = await resolveAuth({
+      provider: "openrouter-minimax",
+      cfg: {
+        ...configForProviders({
+          openrouter: providerEntry("https://openrouter.ai/api/v1", {
+            api: "openai-completions" as const,
+          }),
+          "openrouter-minimax": providerEntry("https://openrouter.ai/api/v1", {
+            api: "openai-completions" as const,
+            apiKey: "openrouter:key-b",
+            auth: "api-key" as const,
+          }),
+        }),
+        auth: { order: { openrouter: ["openrouter:key-a", "openrouter:key-b"] } },
+      },
+      store: authStore({
+        "openrouter:key-a": keyCredential("openrouter", "sk-or-key-a"),
+        "openrouter:key-b": keyCredential("openrouter", "sk-or-actual-key-b"),
+      }),
+    });
+
+    expect(resolved.apiKey).toBe("sk-or-actual-key-b");
+    expect(resolved.profileId).toBe("openrouter:key-b");
+    expect(resolved.source).toBe("profile:openrouter:key-b");
+  });
+
+  it("applies model auth-mode guards to per-entry token profile references through provider auth", async () => {
+    await expect(
+      resolveAuth({
+        provider: "openai",
+        modelApi: "openai-responses",
+        cfg: configForProviders({
+          openai: providerEntry("https://api.openai.com/v1", {
+            api: "openai-responses" as const,
+            apiKey: "openai:token",
+          }),
+        }),
+        store: authStore({
+          "openai:token": {
+            type: "token",
+            provider: "openai",
+            token: "oauth-token",
+          },
+        }),
+      }),
+    ).rejects.toThrow(/requires an OpenAI API key profile/);
+  });
+
+  it.each<{
+    name: string;
+    provider: string;
+    baseUrl: string;
+    profileId: string;
+    credential: AuthProfileCredential;
+    error: RegExp;
+  }>([
+    {
+      name: "OAuth credential class",
+      provider: "openrouter-minimax",
+      baseUrl: "https://openrouter.ai/api/v1",
+      profileId: "google:oauth-a",
+      credential: {
+        type: "oauth",
+        provider: "google",
+        access: "oauth-access",
+        refresh: "oauth-refresh",
+        expires: 0,
+      },
+      error:
+        /references a "oauth" credential for provider "google", which is not a bearer-style auth class/,
+    },
+    {
+      name: "different provider endpoint",
+      provider: "custom-proxy",
+      baseUrl: "https://example.invalid/v1",
+      profileId: "openrouter:key-b",
+      credential: keyCredential("openrouter", "sk-or-actual-key-b"),
+      error: /not compatible with this provider entry's auth binding/,
+    },
+    {
+      name: "profile with no key material",
+      provider: "openrouter-minimax",
+      baseUrl: "https://openrouter.ai/api/v1",
+      profileId: "openrouter:key-b",
+      credential: { type: "api_key", provider: "openrouter" },
+      error: /matched a stored profile but failed to resolve/,
+    },
+  ])(
+    "rejects $name instead of sending a profile ID as a literal bearer",
+    async ({ provider, baseUrl, profileId, credential, error }) => {
+      await expect(
+        resolveAuth({
+          provider,
+          cfg: configForProviders({
+            ...(credential.type === "oauth"
+              ? {}
+              : {
+                  openrouter: providerEntry("https://openrouter.ai/api/v1", {
+                    api: "openai-completions",
+                  }),
+                }),
+            [provider]: providerEntry(baseUrl, { api: "openai-completions", apiKey: profileId }),
+          }),
+          store: authStore({ [profileId]: credential }),
+        }),
+      ).rejects.toThrow(error);
+    },
+  );
 });

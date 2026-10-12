@@ -1,31 +1,30 @@
-import type { Stats } from "node:fs";
-import fs from "node:fs/promises";
+import path from "node:path";
 
-export type RegularFileStatResult = { missing: true } | { missing: false; stat: Stats };
+// Retain fs-safe's process configuration for host-side memory file operations.
+export { root } from "@openclaw/fs-safe/root";
+export { isPathInside } from "@openclaw/fs-safe/path";
+export { readRegularFile, statRegularFile } from "@openclaw/fs-safe/advanced";
+export { walkDirectory } from "@openclaw/fs-safe/walk";
 
-export function isFileMissingError(
-  err: unknown,
-): err is NodeJS.ErrnoException & { code: "ENOENT" } {
-  return Boolean(
-    err &&
-    typeof err === "object" &&
-    "code" in err &&
-    (err as Partial<NodeJS.ErrnoException>).code === "ENOENT",
-  );
+export function normalizeComparablePath(pathname: string): string {
+  const resolved = path.resolve(pathname);
+  return process.platform === "win32" ? resolved.toLowerCase() : resolved;
 }
 
-export async function statRegularFile(absPath: string): Promise<RegularFileStatResult> {
-  let stat: Stats;
-  try {
-    stat = await fs.lstat(absPath);
-  } catch (err) {
-    if (isFileMissingError(err)) {
-      return { missing: true };
-    }
-    throw err;
+/**
+ * True for missing-file errors emitted by Node or fs-safe.
+ * The narrowed union stays stable; extra-path authorization handles `not-file` separately.
+ */
+export function isFileMissingError(
+  err: unknown,
+): err is NodeJS.ErrnoException & { code: "ENOENT" | "ENOTDIR" | "not-file" | "not-found" } {
+  if (!err || typeof err !== "object" || !("code" in err)) {
+    return false;
   }
-  if (stat.isSymbolicLink() || !stat.isFile()) {
-    throw new Error("path required");
-  }
-  return { missing: false, stat };
+  return (
+    err.code === "ENOENT" ||
+    err.code === "ENOTDIR" ||
+    err.code === "not-file" ||
+    err.code === "not-found"
+  );
 }

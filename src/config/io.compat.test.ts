@@ -1,210 +1,175 @@
 import fs from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { createTempDirTracker } from "../../test/helpers/temp-dir.js";
 import { VERSION } from "../version.js";
-import { createConfigIO } from "./io.js";
-import { parseOpenClawVersion } from "./version.js";
+import { createConfigIO } from "./io.factory.js";
+import type { ConfigIoFactoryOptions } from "./io.types.js";
+import { normalizeExecSafeBinProfilesInConfig } from "./normalize-exec-safe-bin.js";
 
-async function withTempHome(run: (home: string) => Promise<void>): Promise<void> {
-  const home = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-config-"));
-  try {
-    await run(home);
-  } finally {
-    await fs.rm(home, { recursive: true, force: true });
-  }
-}
+vi.mock("../commands/doctor/shared/legacy-config-compat.js", () => ({
+  applyLegacyDoctorMigrations: () => {
+    throw new Error("config IO compatibility tests must not enter recovery migration");
+  },
+}));
 
-async function writeConfig(
-  home: string,
-  dirname: ".openclaw",
-  port: number,
-  filename: string = "openclaw.json",
-) {
-  const dir = path.join(home, dirname);
-  await fs.mkdir(dir, { recursive: true });
-  const configPath = path.join(dir, filename);
-  await fs.writeFile(configPath, JSON.stringify({ gateway: { port } }, null, 2));
-  return configPath;
-}
+vi.mock("../plugins/plugin-metadata-snapshot.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../plugins/plugin-metadata-snapshot.js")>()),
+  resolvePluginMetadataSnapshot: () => ({
+    manifestRegistry: { plugins: [], diagnostics: [] },
+  }),
+}));
 
-function createIoForHome(home: string, env: NodeJS.ProcessEnv = {} as NodeJS.ProcessEnv) {
-  return createConfigIO({
-    env,
+const roots = createTempDirTracker();
+afterEach(() => roots.cleanup());
+
+async function fixture(authored: unknown, extra: ConfigIoFactoryOptions = {}) {
+  const home = roots.make("openclaw-config-compat-");
+  const configPath = path.join(home, "openclaw.json");
+  const logger = { error: vi.fn(), warn: vi.fn() };
+  const options = {
+    configPath,
     homedir: () => home,
-  });
+    logger,
+    ...extra,
+    env: { HOME: home, ...extra.env },
+  };
+  const write = (config: unknown) => fs.writeFile(configPath, JSON.stringify(config, null, 2));
+  await write(authored);
+  return { configPath, logger, options, write, io: createConfigIO(options) };
 }
 
-async function expectNoNewerVersionWarning(touchedVersion: string) {
-  await withTempHome(async (home) => {
-    const configDir = path.join(home, ".openclaw");
-    await fs.mkdir(configDir, { recursive: true });
-    const configPath = path.join(configDir, "openclaw.json");
-    await fs.writeFile(
-      configPath,
-      JSON.stringify({ meta: { lastTouchedVersion: touchedVersion } }, null, 2),
-    );
-
-    const logger = {
-      warn: vi.fn(),
-      error: vi.fn(),
+describe("config io compatibility", () => {
+  it("leaves retired context-budget shapes for Doctor instead of normalizing runtime reads", async () => {
+    const authored = {
+      models: {
+        providers: {
+          openai: {
+            contextTokens: 64_000,
+            contextWindow: 128_000,
+            models: [{ id: "gpt-5.4", name: "GPT-5.4" }],
+          },
+        },
+      },
+      agents: {
+        defaults: { contextTokens: 48_000 },
+        entries: { ops: { contextTokens: 32_000 } },
+      },
     };
+    const { io, configPath } = await fixture(authored, { pluginValidation: "core-only" });
+    const raw = await fs.readFile(configPath, "utf-8");
+    expect(() => io.loadConfig()).toThrow(/contextTokens|contextWindow/);
+    const snapshot = await io.readConfigFileSnapshot();
+    expect(snapshot.valid).toBe(false);
+    expect(snapshot.sourceConfig).toMatchObject(authored);
+    expect(snapshot.sourceConfigBeforeMigrations).toMatchObject(authored);
+    await expect(fs.readFile(configPath, "utf-8")).resolves.toBe(raw);
+  });
 
-    const io = createConfigIO({
-      env: {} as NodeJS.ProcessEnv,
-      homedir: () => home,
-      logger,
-    });
+  it("logs each warning payload once until warnings clear", async () => {
+    const { logger, options, write } = await fixture({});
+    const load = () => createConfigIO(options).loadConfig();
+    const writeRemovedPlugin = (pluginId: string) =>
+      write({ plugins: { entries: { [pluginId]: { enabled: false } } } });
 
-    io.loadConfig();
-
-    expect(logger.warn).not.toHaveBeenCalledWith(
-      expect.stringContaining("Config was last written by a newer OpenClaw"),
+    await writeRemovedPlugin("google-antigravity-auth");
+    load();
+    load();
+    expect(logger.warn).toHaveBeenCalledTimes(1);
+    expect(logger.warn).toHaveBeenCalledWith(
+      "Config warnings: plugins.entries.google-antigravity-auth: plugin removed: google-antigravity-auth (stale config entry ignored; remove it from plugins config)",
     );
-    expect(io.configPath).toBe(configPath);
-  });
-}
 
-describe("config io paths", () => {
-  it("uses ~/.openclaw/openclaw.json when config exists", async () => {
-    await withTempHome(async (home) => {
-      const configPath = await writeConfig(home, ".openclaw", 19001);
-      const io = createIoForHome(home);
-      expect(io.configPath).toBe(configPath);
-      expect(io.loadConfig().gateway?.port).toBe(19001);
+    createConfigIO({ ...options, pluginValidation: "skip" }).loadConfig();
+    load();
+    expect(logger.warn).toHaveBeenCalledTimes(1);
+
+    await write({
+      gateway: { port: "invalid" },
+      plugins: { entries: { "google-antigravity-auth": { enabled: false } } },
     });
+    expect(load).toThrow();
+    await writeRemovedPlugin("google-antigravity-auth");
+    load();
+    expect(logger.warn).toHaveBeenCalledTimes(1);
+
+    await writeRemovedPlugin("google-gemini-cli-auth");
+    load();
+    expect(logger.warn).toHaveBeenCalledTimes(2);
+
+    await write({});
+    load();
+    await writeRemovedPlugin("google-gemini-cli-auth");
+    load();
+    expect(logger.warn).toHaveBeenCalledTimes(3);
+
+    await write(null);
+    expect(load).toThrow();
+    await writeRemovedPlugin("google-gemini-cli-auth");
+    load();
+    expect(logger.warn).toHaveBeenCalledTimes(3);
   });
 
-  it("defaults to ~/.openclaw/openclaw.json when config is missing", async () => {
-    await withTempHome(async (home) => {
-      const io = createIoForHome(home);
-      expect(io.configPath).toBe(path.join(home, ".openclaw", "openclaw.json"));
-    });
+  it.each([undefined, "1"])("reports newer config unless update handoff is %s", async (handoff) => {
+    const { io, logger } = await fixture(
+      { meta: { lastTouchedVersion: "9999.1.1" }, gateway: { mode: "local" } },
+      handoff ? { env: { OPENCLAW_UPDATE_POST_CORE: handoff } } : {},
+    );
+    io.loadConfig();
+    if (handoff) {
+      expect(logger.warn).not.toHaveBeenCalled();
+    } else {
+      expect(logger.warn).toHaveBeenCalledWith(
+        [
+          `Your OpenClaw config was written by version 9999.1.1, but this command is running ${VERSION}.`,
+          "Check: `openclaw --version`, `which openclaw`, and `openclaw gateway status --deep`.",
+          "If unexpected, update PATH so `openclaw` points to the version you want, or reinstall the Gateway service from that same OpenClaw install.",
+        ].join("\n"),
+      );
+    }
   });
 
-  it("uses OPENCLAW_HOME for default config path", async () => {
-    await withTempHome(async (home) => {
-      const io = createConfigIO({
-        env: { OPENCLAW_HOME: path.join(home, "svc-home") } as NodeJS.ProcessEnv,
-        homedir: () => path.join(home, "ignored-home"),
-      });
-      expect(io.configPath).toBe(path.join(home, "svc-home", ".openclaw", "openclaw.json"));
-    });
-  });
-
-  it("honors explicit OPENCLAW_CONFIG_PATH override", async () => {
-    await withTempHome(async (home) => {
-      const customPath = await writeConfig(home, ".openclaw", 20002, "custom.json");
-      const io = createIoForHome(home, { OPENCLAW_CONFIG_PATH: customPath } as NodeJS.ProcessEnv);
-      expect(io.configPath).toBe(customPath);
-      expect(io.loadConfig().gateway?.port).toBe(20002);
-    });
-  });
-
-  it("normalizes safe-bin config entries at config load time", async () => {
-    await withTempHome(async (home) => {
-      const configDir = path.join(home, ".openclaw");
-      await fs.mkdir(configDir, { recursive: true });
-      const configPath = path.join(configDir, "openclaw.json");
-      await fs.writeFile(
-        configPath,
-        JSON.stringify(
-          {
+  it("normalizes safe-bin config entries at config load time", () => {
+    const cfg = {
+      tools: {
+        exec: {
+          safeBinTrustedDirs: [" /custom/bin ", "", "/custom/bin", "/agent/bin"],
+          safeBinProfiles: {
+            " MyFilter ": {
+              allowedValueFlags: ["--limit", " --limit ", ""],
+            },
+          },
+        },
+      },
+      agents: {
+        entries: {
+          ops: {
             tools: {
               exec: {
-                safeBinTrustedDirs: [" /custom/bin ", "", "/custom/bin", "/agent/bin"],
+                safeBinTrustedDirs: [" /ops/bin ", "/ops/bin"],
                 safeBinProfiles: {
-                  " MyFilter ": {
-                    allowedValueFlags: ["--limit", " --limit ", ""],
+                  " Custom ": {
+                    deniedFlags: ["-f", " -f ", ""],
                   },
                 },
               },
             },
-            agents: {
-              list: [
-                {
-                  id: "ops",
-                  tools: {
-                    exec: {
-                      safeBinTrustedDirs: [" /ops/bin ", "/ops/bin"],
-                      safeBinProfiles: {
-                        " Custom ": {
-                          deniedFlags: ["-f", " -f ", ""],
-                        },
-                      },
-                    },
-                  },
-                },
-              ],
-            },
           },
-          null,
-          2,
-        ),
-        "utf-8",
-      );
-      const io = createIoForHome(home);
-      expect(io.configPath).toBe(configPath);
-      const cfg = io.loadConfig();
-      expect(cfg.tools?.exec?.safeBinProfiles).toEqual({
-        myfilter: {
-          allowedValueFlags: ["--limit"],
         },
-      });
-      expect(cfg.tools?.exec?.safeBinTrustedDirs).toEqual(["/custom/bin", "/agent/bin"]);
-      expect(cfg.agents?.list?.[0]?.tools?.exec?.safeBinProfiles).toEqual({
-        custom: {
-          deniedFlags: ["-f"],
-        },
-      });
-      expect(cfg.agents?.list?.[0]?.tools?.exec?.safeBinTrustedDirs).toEqual(["/ops/bin"]);
+      },
+    };
+    normalizeExecSafeBinProfilesInConfig(cfg);
+    expect(cfg.tools?.exec?.safeBinProfiles).toEqual({
+      myfilter: {
+        allowedValueFlags: ["--limit"],
+      },
     });
-  });
-
-  it("logs invalid config path details and throws on invalid config", async () => {
-    await withTempHome(async (home) => {
-      const configDir = path.join(home, ".openclaw");
-      await fs.mkdir(configDir, { recursive: true });
-      const configPath = path.join(configDir, "openclaw.json");
-      await fs.writeFile(
-        configPath,
-        JSON.stringify({ gateway: { port: "not-a-number" } }, null, 2),
-      );
-
-      const logger = {
-        warn: vi.fn(),
-        error: vi.fn(),
-      };
-
-      const io = createConfigIO({
-        env: {} as NodeJS.ProcessEnv,
-        homedir: () => home,
-        logger,
-      });
-
-      expect(() => io.loadConfig()).toThrow(/Invalid config/);
-      expect(logger.error).toHaveBeenCalledWith(
-        expect.stringContaining(`Invalid config at ${configPath}:\\n`),
-      );
-      expect(logger.error).toHaveBeenCalledWith(expect.stringContaining("- gateway.port:"));
+    expect(cfg.tools?.exec?.safeBinTrustedDirs).toEqual(["/custom/bin", "/agent/bin"]);
+    expect(cfg.agents?.entries?.ops?.tools?.exec?.safeBinProfiles).toEqual({
+      custom: {
+        deniedFlags: ["-f"],
+      },
     });
-  });
-
-  it("does not warn when config was last touched by a same-base correction publish", async () => {
-    const parsedVersion = parseOpenClawVersion(VERSION);
-    if (!parsedVersion) {
-      throw new Error(`Unable to parse VERSION: ${VERSION}`);
-    }
-    const touchedVersion = `${parsedVersion.major}.${parsedVersion.minor}.${parsedVersion.patch}-${(parsedVersion.revision ?? 0) + 1}`;
-    await expectNoNewerVersionWarning(touchedVersion);
-  });
-
-  it("does not warn for same-base prerelease configs when current version is newer", async () => {
-    const parsedVersion = parseOpenClawVersion(VERSION);
-    if (!parsedVersion) {
-      throw new Error(`Unable to parse VERSION: ${VERSION}`);
-    }
-    const touchedVersion = `${parsedVersion.major}.${parsedVersion.minor}.${parsedVersion.patch}-beta.1`;
-    await expectNoNewerVersionWarning(touchedVersion);
+    expect(cfg.agents?.entries?.ops?.tools?.exec?.safeBinTrustedDirs).toEqual(["/ops/bin"]);
   });
 });

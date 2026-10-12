@@ -1,27 +1,10 @@
-const ANTIGRAVITY_BARE_PRO_IDS = new Set(["gemini-3-pro", "gemini-3.1-pro", "gemini-3-1-pro"]);
+export {
+  normalizeAntigravityPreviewModelId as normalizeAntigravityModelId,
+  normalizeGooglePreviewModelId as normalizeGoogleModelId,
+} from "openclaw/plugin-sdk/model-ref-parse";
 
-export function normalizeGoogleModelId(id: string): string {
-  if (id === "gemini-3-pro") {
-    return "gemini-3-pro-preview";
-  }
-  if (id === "gemini-3-flash") {
-    return "gemini-3-flash-preview";
-  }
-  if (id === "gemini-3.1-pro") {
-    return "gemini-3.1-pro-preview";
-  }
-  if (id === "gemini-3.1-flash-lite") {
-    return "gemini-3.1-flash-lite-preview";
-  }
-  if (id === "gemini-3.1-flash" || id === "gemini-3.1-flash-preview") {
-    return "gemini-3-flash-preview";
-  }
-  return id;
-}
+const GOOGLE_PROVIDER_PREFIX = "google/";
 
-export function normalizeAntigravityModelId(id: string): string {
-  if (ANTIGRAVITY_BARE_PRO_IDS.has(id)) {
-    return `${id}-low`;
-  }
-  return id;
+export function stripGoogleProviderPrefix(id: string): string {
+  return id.startsWith(GOOGLE_PROVIDER_PREFIX) ? id.slice(GOOGLE_PROVIDER_PREFIX.length) : id;
 }

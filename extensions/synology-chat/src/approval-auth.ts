@@ -1,8 +1,4 @@
-import type { OpenClawConfig } from "openclaw/plugin-sdk/account-resolution";
-import {
-  createResolvedApproverActionAuthAdapter,
-  resolveApprovalApprovers,
-} from "openclaw/plugin-sdk/approval-auth-runtime";
+import { createChannelApprovalAuth } from "openclaw/plugin-sdk/approval-auth-runtime";
 import { resolveAccount } from "./accounts.js";
 
 function normalizeSynologyChatApproverId(value: string | number): string | undefined {
@@ -10,14 +6,11 @@ function normalizeSynologyChatApproverId(value: string | number): string | undef
   return /^\d+$/.test(trimmed) ? trimmed : undefined;
 }
 
-export const synologyChatApprovalAuth = createResolvedApproverActionAuthAdapter({
+export const synologyChatApprovalAuth = createChannelApprovalAuth({
   channelLabel: "Synology Chat",
-  resolveApprovers: ({ cfg, accountId }) => {
-    const account = resolveAccount((cfg ?? {}) as OpenClawConfig, accountId);
-    return resolveApprovalApprovers({
-      allowFrom: account.allowedUserIds,
-      normalizeApprover: normalizeSynologyChatApproverId,
-    });
+  resolveInputs: ({ cfg, accountId }) => {
+    const account = resolveAccount(cfg ?? {}, accountId);
+    return { allowFrom: account.allowedUserIds };
   },
-  normalizeSenderId: (value) => normalizeSynologyChatApproverId(value),
-});
+  normalizeApprover: normalizeSynologyChatApproverId,
+}).approvalAuth;

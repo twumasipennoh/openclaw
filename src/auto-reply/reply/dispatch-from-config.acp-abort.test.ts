@@ -1,303 +1,63 @@
+// Tests ACP dispatch abort behavior and emitted lifecycle hooks.
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { createDeferred, raceWithTimeoutResult } from "../../../test/helpers/promise.js";
+import type {
+  AcpSessionResolution,
+  SessionAcpMeta,
+} from "../../acp/control-plane/manager.types.js";
+import { resolveAcpSessionTarget } from "../../acp/control-plane/manager.utils.js";
 import type { OpenClawConfig } from "../../config/config.js";
-import type { SessionBindingRecord } from "../../infra/outbound/session-binding-service.js";
+import { createStructuredOutboundPayloadPlan } from "../../infra/outbound/payloads.js";
 import type {
   AcpRuntime,
   AcpRuntimeEnsureInput,
   AcpRuntimeEvent,
-  AcpRuntimeHandle,
   AcpRuntimeTurnInput,
 } from "../../plugin-sdk/acp-runtime.js";
-import type {
-  PluginHookBeforeDispatchResult,
-  PluginHookReplyDispatchResult,
-  PluginTargetedInboundClaimOutcome,
-} from "../../plugins/hooks.js";
-import { setActivePluginRegistry } from "../../plugins/runtime.js";
-import {
-  createChannelTestPluginBase,
-  createTestRegistry,
-} from "../../test-utils/channel-plugins.js";
 import { createInternalHookEventPayload } from "../../test-utils/internal-hook-event-payload.js";
-import type { ReplyPayload } from "../types.js";
-import type { ReplyDispatcher } from "./reply-dispatcher.js";
+import {
+  acpManagerRuntimeMocks,
+  acpMocks,
+  agentEventMocks,
+  createDispatcher,
+  diagnosticMocks,
+  hookMocks,
+  internalHookMocks,
+  mocks,
+  noAbortResult,
+  resetPluginTtsAndThreadMocks,
+  sessionBindingMocks,
+  sessionStoreMocks,
+  setDiscordTestRegistry,
+} from "./dispatch-from-config.shared.test-harness.js";
+import { createAcpRuntime } from "./dispatch-from-config.test-harness.js";
+import { expectedNoQueuedReplyResult } from "./dispatch-result-expectations.test-support.js";
+import {
+  REPLY_OPERATION_RUN_STATE,
+  resolveReplyOperationAgentTurn,
+  type ReplyOperationRunState,
+} from "./reply-operation-run-state.js";
 import { buildTestCtx } from "./test-ctx.js";
 
-type AbortResult = { handled: boolean; aborted: boolean; stoppedSubagents?: number };
-
-const mocks = vi.hoisted(() => ({
-  routeReply: vi.fn(async (_params: unknown) => ({ ok: true, messageId: "mock" })),
-  tryFastAbortFromMessage: vi.fn<() => Promise<AbortResult>>(async () => ({
-    handled: false,
-    aborted: false,
-  })),
-}));
-const diagnosticMocks = vi.hoisted(() => ({
-  logMessageQueued: vi.fn(),
-  logMessageProcessed: vi.fn(),
-  logSessionStateChange: vi.fn(),
-}));
-const hookMocks = vi.hoisted(() => ({
-  registry: {
-    plugins: [] as Array<{ id: string; status: "loaded" | "disabled" | "error" }>,
-  },
-  runner: {
-    hasHooks: vi.fn<(hookName?: string) => boolean>(() => false),
-    runInboundClaim: vi.fn(async () => undefined),
-    runInboundClaimForPlugin: vi.fn(async () => undefined),
-    runInboundClaimForPluginOutcome: vi.fn<() => Promise<PluginTargetedInboundClaimOutcome>>(
-      async () => ({ status: "no_handler" as const }),
-    ),
-    runMessageReceived: vi.fn(async () => {}),
-    runBeforeDispatch: vi.fn<
-      (_event: unknown, _ctx: unknown) => Promise<PluginHookBeforeDispatchResult | undefined>
-    >(async () => undefined),
-    runReplyDispatch: vi.fn<
-      (_event: unknown, _ctx: unknown) => Promise<PluginHookReplyDispatchResult | undefined>
-    >(async () => undefined),
-  },
-}));
-const internalHookMocks = vi.hoisted(() => ({
-  createInternalHookEvent: vi.fn(),
-  triggerInternalHook: vi.fn(async () => {}),
-}));
-const acpMocks = vi.hoisted(() => ({
-  listAcpSessionEntries: vi.fn(async () => []),
-  readAcpSessionEntry: vi.fn<(params: { sessionKey: string; cfg?: OpenClawConfig }) => unknown>(
-    () => null,
-  ),
-  upsertAcpSessionMeta: vi.fn<
-    (params: {
-      sessionKey: string;
-      cfg?: OpenClawConfig;
-      mutate: (
-        current: Record<string, unknown> | undefined,
-        entry: { acp?: Record<string, unknown> } | undefined,
-      ) => Record<string, unknown> | null | undefined;
-    }) => Promise<unknown>
-  >(async () => null),
-  requireAcpRuntimeBackend: vi.fn<() => unknown>(),
-}));
-const sessionBindingMocks = vi.hoisted(() => ({
-  listBySession: vi.fn<(targetSessionKey: string) => SessionBindingRecord[]>(() => []),
-  resolveByConversation: vi.fn<
-    (ref: {
-      channel: string;
-      accountId: string;
-      conversationId: string;
-      parentConversationId?: string;
-    }) => SessionBindingRecord | null
-  >(() => null),
-  touch: vi.fn(),
-}));
-const pluginConversationBindingMocks = vi.hoisted(() => ({
-  shownFallbackNoticeBindingIds: new Set<string>(),
-}));
-const sessionStoreMocks = vi.hoisted(() => ({
-  currentEntry: undefined as Record<string, unknown> | undefined,
-  loadSessionStore: vi.fn(() => ({})),
-  resolveStorePath: vi.fn(() => "/tmp/mock-sessions.json"),
-  resolveSessionStoreEntry: vi.fn(() => ({ existing: sessionStoreMocks.currentEntry })),
-}));
-const acpManagerRuntimeMocks = vi.hoisted(() => ({
-  getAcpSessionManager: vi.fn(),
-}));
-const agentEventMocks = vi.hoisted(() => ({
-  emitAgentEvent: vi.fn(),
-  onAgentEvent: vi.fn<(listener: unknown) => () => void>(() => () => {}),
-}));
-const ttsMocks = vi.hoisted(() => ({
-  maybeApplyTtsToPayload: vi.fn(async (paramsUnknown: unknown) => {
-    const params = paramsUnknown as { payload: ReplyPayload };
-    return params.payload;
-  }),
-  normalizeTtsAutoMode: vi.fn((value: unknown) => (typeof value === "string" ? value : undefined)),
-  resolveTtsConfig: vi.fn((_cfg: OpenClawConfig) => ({ mode: "final" })),
-}));
-const threadInfoMocks = vi.hoisted(() => ({
-  parseSessionThreadInfo: vi.fn<
-    (sessionKey: string | undefined) => {
-      baseSessionKey: string | undefined;
-      threadId: string | undefined;
-    }
-  >(),
-}));
-
-function parseGenericThreadSessionInfo(sessionKey: string | undefined) {
-  const trimmed = sessionKey?.trim();
-  if (!trimmed) {
-    return { baseSessionKey: undefined, threadId: undefined };
-  }
-  const threadMarker = ":thread:";
-  const topicMarker = ":topic:";
-  const marker = trimmed.includes(threadMarker)
-    ? threadMarker
-    : trimmed.includes(topicMarker)
-      ? topicMarker
-      : undefined;
-  if (!marker) {
-    return { baseSessionKey: trimmed, threadId: undefined };
-  }
-  const index = trimmed.lastIndexOf(marker);
-  if (index < 0) {
-    return { baseSessionKey: trimmed, threadId: undefined };
-  }
-  const baseSessionKey = trimmed.slice(0, index).trim() || undefined;
-  const threadId = trimmed.slice(index + marker.length).trim() || undefined;
-  return { baseSessionKey, threadId };
-}
-
-vi.mock("./route-reply.runtime.js", () => ({
-  isRoutableChannel: () => true,
-  routeReply: mocks.routeReply,
-}));
-vi.mock("./route-reply.js", () => ({
-  isRoutableChannel: () => true,
-  routeReply: mocks.routeReply,
-}));
-vi.mock("./abort.runtime.js", () => ({
-  tryFastAbortFromMessage: mocks.tryFastAbortFromMessage,
-  formatAbortReplyText: () => "⚙️ Agent was aborted.",
-}));
-vi.mock("../../logging/diagnostic.js", () => ({
-  logMessageQueued: diagnosticMocks.logMessageQueued,
-  logMessageProcessed: diagnosticMocks.logMessageProcessed,
-  logSessionStateChange: diagnosticMocks.logSessionStateChange,
-}));
-vi.mock("../../config/sessions/thread-info.js", () => ({
-  parseSessionThreadInfo: (sessionKey: string | undefined) =>
-    threadInfoMocks.parseSessionThreadInfo(sessionKey),
-}));
-vi.mock("./dispatch-from-config.runtime.js", () => ({
-  createInternalHookEvent: internalHookMocks.createInternalHookEvent,
-  loadSessionStore: sessionStoreMocks.loadSessionStore,
-  resolveSessionStoreEntry: sessionStoreMocks.resolveSessionStoreEntry,
-  resolveStorePath: sessionStoreMocks.resolveStorePath,
-  triggerInternalHook: internalHookMocks.triggerInternalHook,
-}));
-vi.mock("../../plugins/hook-runner-global.js", () => ({
-  getGlobalHookRunner: () => hookMocks.runner,
-  getGlobalPluginRegistry: () => hookMocks.registry,
-}));
-vi.mock("../../acp/runtime/session-meta.js", () => ({
-  listAcpSessionEntries: acpMocks.listAcpSessionEntries,
-  readAcpSessionEntry: acpMocks.readAcpSessionEntry,
-  upsertAcpSessionMeta: acpMocks.upsertAcpSessionMeta,
-}));
-vi.mock("../../acp/runtime/registry.js", () => ({
-  requireAcpRuntimeBackend: acpMocks.requireAcpRuntimeBackend,
-}));
-vi.mock("../../infra/outbound/session-binding-service.js", () => ({
-  getSessionBindingService: () => ({
-    bind: vi.fn(async () => {
-      throw new Error("bind not mocked");
-    }),
-    getCapabilities: vi.fn(() => ({
-      adapterAvailable: true,
-      bindSupported: true,
-      unbindSupported: true,
-      placements: ["current", "child"] as const,
-    })),
-    listBySession: (targetSessionKey: string) =>
-      sessionBindingMocks.listBySession(targetSessionKey),
-    resolveByConversation: sessionBindingMocks.resolveByConversation,
-    touch: sessionBindingMocks.touch,
-    unbind: vi.fn(async () => []),
-  }),
-}));
-vi.mock("../../infra/agent-events.js", () => ({
-  emitAgentEvent: (params: unknown) => agentEventMocks.emitAgentEvent(params),
-  onAgentEvent: (listener: unknown) => agentEventMocks.onAgentEvent(listener),
-}));
-vi.mock("../../plugins/conversation-binding.js", () => ({
-  buildPluginBindingDeclinedText: () => "Plugin binding request was declined.",
-  buildPluginBindingErrorText: () => "Plugin binding request failed.",
-  buildPluginBindingUnavailableText: (binding: { pluginName?: string; pluginId: string }) =>
-    `${binding.pluginName ?? binding.pluginId} is not currently loaded.`,
-  hasShownPluginBindingFallbackNotice: (bindingId: string) =>
-    pluginConversationBindingMocks.shownFallbackNoticeBindingIds.has(bindingId),
-  isPluginOwnedSessionBindingRecord: (
-    record: SessionBindingRecord | null | undefined,
-  ): record is SessionBindingRecord =>
-    record?.metadata != null &&
-    typeof record.metadata === "object" &&
-    (record.metadata as { pluginBindingOwner?: string }).pluginBindingOwner === "plugin",
-  markPluginBindingFallbackNoticeShown: (bindingId: string) => {
-    pluginConversationBindingMocks.shownFallbackNoticeBindingIds.add(bindingId);
-  },
-  toPluginConversationBinding: (record: SessionBindingRecord) => ({
-    bindingId: record.bindingId,
-    pluginId: "unknown-plugin",
-    pluginName: undefined,
-    pluginRoot: "",
-    channel: record.conversation.channel,
-    accountId: record.conversation.accountId,
-    conversationId: record.conversation.conversationId,
-    parentConversationId: record.conversation.parentConversationId,
-  }),
-}));
-vi.mock("./dispatch-acp-manager.runtime.js", () => ({
-  getAcpSessionManager: () => acpManagerRuntimeMocks.getAcpSessionManager(),
-  getSessionBindingService: () => ({
-    listBySession: (targetSessionKey: string) =>
-      sessionBindingMocks.listBySession(targetSessionKey),
-    unbind: vi.fn(async () => []),
-  }),
-}));
-vi.mock("../../tts/tts.js", () => ({
-  maybeApplyTtsToPayload: (params: unknown) => ttsMocks.maybeApplyTtsToPayload(params),
-  normalizeTtsAutoMode: (value: unknown) => ttsMocks.normalizeTtsAutoMode(value),
-  resolveTtsConfig: (cfg: OpenClawConfig) => ttsMocks.resolveTtsConfig(cfg),
-}));
-vi.mock("../../tts/tts.runtime.js", () => ({
-  maybeApplyTtsToPayload: (params: unknown) => ttsMocks.maybeApplyTtsToPayload(params),
-}));
-vi.mock("../../tts/status-config.js", () => ({
-  resolveStatusTtsSnapshot: () => ({
-    autoMode: "always",
-    provider: "auto",
-    maxLength: 1500,
-    summarize: true,
-  }),
-}));
-vi.mock("./dispatch-acp-tts.runtime.js", () => ({
-  maybeApplyTtsToPayload: (params: unknown) => ttsMocks.maybeApplyTtsToPayload(params),
-}));
-vi.mock("./dispatch-acp-session.runtime.js", () => ({
-  readAcpSessionEntry: (params: { sessionKey: string; cfg?: OpenClawConfig }) =>
-    acpMocks.readAcpSessionEntry(params),
-}));
-vi.mock("../../tts/tts-config.js", () => ({
-  normalizeTtsAutoMode: (value: unknown) => ttsMocks.normalizeTtsAutoMode(value),
-  resolveConfiguredTtsMode: (cfg: OpenClawConfig) => ttsMocks.resolveTtsConfig(cfg).mode,
-}));
-
-const noAbortResult = { handled: false, aborted: false } as const;
 let dispatchReplyFromConfig: typeof import("./dispatch-from-config.js").dispatchReplyFromConfig;
-let tryDispatchAcpReplyHook: typeof import("../../plugin-sdk/acp-runtime.js").tryDispatchAcpReplyHook;
-
-function createDispatcher(): ReplyDispatcher {
-  return {
-    sendToolResult: vi.fn(() => true),
-    sendBlockReply: vi.fn(() => true),
-    sendFinalReply: vi.fn(() => true),
-    waitForIdle: vi.fn(async () => {}),
-    getQueuedCounts: vi.fn(() => ({ tool: 0, block: 0, final: 0 })),
-    getFailedCounts: vi.fn(() => ({ tool: 0, block: 0, final: 0 })),
-    markComplete: vi.fn(),
-  };
-}
+let tryDispatchAcpReplyHook: typeof import("../../plugin-sdk/acpx.js").tryDispatchAcpReplyHook;
+let resetInboundDedupe: typeof import("./inbound-dedupe.js").resetInboundDedupe;
+let replyRunRegistry: typeof import("./reply-run-registry.js").replyRunRegistry;
+let getActiveReplyRunCount: typeof import("./reply-run-registry.registry.js").getActiveReplyRunCount;
+let createReplyOperation: typeof import("./reply-run-registry.js").createReplyOperation;
+let replyRunTesting: typeof import("./reply-run-registry.test-support.js").testing;
 
 function shouldUseAcpReplyDispatchHook(eventUnknown: unknown): boolean {
   const event = eventUnknown as {
     sessionKey?: string;
+    isTailDispatch?: boolean;
     ctx?: {
       SessionKey?: string;
       CommandTargetSessionKey?: string;
       AcpDispatchTailAfterReset?: boolean;
     };
   };
-  if (event.ctx?.AcpDispatchTailAfterReset) {
+  if (event.isTailDispatch === true) {
     return true;
   }
   return [event.sessionKey, event.ctx?.SessionKey, event.ctx?.CommandTargetSessionKey].some(
@@ -308,25 +68,43 @@ function shouldUseAcpReplyDispatchHook(eventUnknown: unknown): boolean {
   );
 }
 
+function createDispatchConfig(diagnostics = true): OpenClawConfig {
+  return {
+    diagnostics: { enabled: diagnostics },
+    session: { sendPolicy: { default: "allow" } },
+  };
+}
+
+function expectNoReplies(dispatcher: ReturnType<typeof createDispatcher>) {
+  expect(dispatcher.sendToolResult).not.toHaveBeenCalled();
+  expect(dispatcher.sendBlockReply).not.toHaveBeenCalled();
+  expect(dispatcher.sendFinalReply).not.toHaveBeenCalled();
+}
+
 function setNoAbort() {
   mocks.tryFastAbortFromMessage.mockResolvedValue(noAbortResult);
 }
 
 function createMockAcpSessionManager() {
   return {
-    resolveSession: (params: { cfg: OpenClawConfig; sessionKey: string }) => {
+    resolveSessionAsync: async (params: {
+      cfg: OpenClawConfig;
+      sessionKey: string;
+      agentId?: string;
+    }): Promise<AcpSessionResolution> => {
+      const target = resolveAcpSessionTarget(params);
       const entry = acpMocks.readAcpSessionEntry({
         cfg: params.cfg,
-        sessionKey: params.sessionKey,
-      }) as { acp?: Record<string, unknown> } | null;
+        ...target,
+      }) as { acp?: SessionAcpMeta } | null;
       if (entry?.acp) {
         return {
-          kind: "ready" as const,
-          sessionKey: params.sessionKey,
+          kind: "ready",
+          ...target,
           meta: entry.acp,
         };
       }
-      return { kind: "none" as const, sessionKey: params.sessionKey };
+      return { kind: "none", ...target };
     },
     getObservabilitySnapshot: () => ({
       runtimeCache: { activeSessions: 0, idleTtlMs: 0, evictedTotal: 0 },
@@ -344,6 +122,7 @@ function createMockAcpSessionManager() {
       async (params: {
         cfg: OpenClawConfig;
         sessionKey: string;
+        agentId?: string;
         text?: string;
         attachments?: unknown[];
         mode: string;
@@ -354,6 +133,7 @@ function createMockAcpSessionManager() {
         const entry = acpMocks.readAcpSessionEntry({
           cfg: params.cfg,
           sessionKey: params.sessionKey,
+          agentId: params.agentId,
         }) as {
           acp?: { agent?: string; mode?: string };
         } | null;
@@ -365,6 +145,7 @@ function createMockAcpSessionManager() {
         }
         const handle = await runtimeBackend.runtime.ensureSession({
           sessionKey: params.sessionKey,
+          agentId: params.agentId,
           mode: (entry?.acp?.mode || "persistent") as AcpRuntimeEnsureInput["mode"],
           agent: entry?.acp?.agent || "codex",
         });
@@ -387,23 +168,17 @@ function createMockAcpSessionManager() {
 describe("dispatchReplyFromConfig ACP abort", () => {
   beforeAll(async () => {
     ({ dispatchReplyFromConfig } = await import("./dispatch-from-config.js"));
-    ({ tryDispatchAcpReplyHook } = await import("../../plugin-sdk/acp-runtime.js"));
+    ({ tryDispatchAcpReplyHook } = await import("../../plugin-sdk/acpx.js"));
+    ({ resetInboundDedupe } = await import("./inbound-dedupe.js"));
+    ({ replyRunRegistry, createReplyOperation } = await import("./reply-run-registry.js"));
+    ({ getActiveReplyRunCount } = await import("./reply-run-registry.registry.js"));
+    ({ testing: replyRunTesting } = await import("./reply-run-registry.test-support.js"));
   });
 
   beforeEach(() => {
-    const discordTestPlugin = {
-      ...createChannelTestPluginBase({
-        id: "discord",
-        capabilities: { chatTypes: ["direct"], nativeCommands: true },
-      }),
-      outbound: {
-        deliveryMode: "direct",
-        shouldSuppressLocalPayloadPrompt: () => false,
-      },
-    };
-    setActivePluginRegistry(
-      createTestRegistry([{ pluginId: "discord", source: "test", plugin: discordTestPlugin }]),
-    );
+    setDiscordTestRegistry();
+    replyRunTesting.resetReplyRunRegistry();
+    resetInboundDedupe();
     acpManagerRuntimeMocks.getAcpSessionManager.mockReset();
     acpManagerRuntimeMocks.getAcpSessionManager.mockReturnValue(createMockAcpSessionManager());
     hookMocks.runner.hasHooks.mockReset();
@@ -432,67 +207,60 @@ describe("dispatchReplyFromConfig ACP abort", () => {
     internalHookMocks.createInternalHookEvent.mockImplementation(createInternalHookEventPayload);
     internalHookMocks.triggerInternalHook.mockReset();
     sessionStoreMocks.currentEntry = undefined;
+    sessionStoreMocks.loadSessionEntry
+      .mockReset()
+      .mockImplementation(() => sessionStoreMocks.currentEntry);
+    sessionStoreMocks.loadSessionStoreEntry.mockReset();
+    sessionStoreMocks.loadSessionStoreEntry.mockImplementation(
+      () => sessionStoreMocks.currentEntry,
+    );
     sessionStoreMocks.loadSessionStore.mockReset().mockReturnValue({});
-    sessionStoreMocks.resolveStorePath.mockReset().mockReturnValue("/tmp/mock-sessions.json");
+    sessionStoreMocks.readSessionEntry.mockReset().mockReturnValue(undefined);
+    sessionStoreMocks.resolveSessionStorePathCore
+      .mockReset()
+      .mockReturnValue("/tmp/mock-sessions.json");
     sessionStoreMocks.resolveSessionStoreEntry.mockReset().mockReturnValue({ existing: undefined });
     acpMocks.listAcpSessionEntries.mockReset().mockResolvedValue([]);
     acpMocks.readAcpSessionEntry.mockReset().mockReturnValue(null);
     acpMocks.upsertAcpSessionMeta.mockReset().mockResolvedValue(null);
+    acpMocks.getAcpRuntimeBackend.mockReset();
     acpMocks.requireAcpRuntimeBackend.mockReset();
     sessionBindingMocks.listBySession.mockReset().mockReturnValue([]);
     sessionBindingMocks.resolveByConversation.mockReset().mockReturnValue(null);
     sessionBindingMocks.touch.mockReset();
-    pluginConversationBindingMocks.shownFallbackNoticeBindingIds.clear();
-    ttsMocks.maybeApplyTtsToPayload
-      .mockReset()
-      .mockImplementation(async (paramsUnknown: unknown) => {
-        const params = paramsUnknown as { payload: ReplyPayload };
-        return params.payload;
-      });
-    ttsMocks.normalizeTtsAutoMode
-      .mockReset()
-      .mockImplementation((value: unknown) => (typeof value === "string" ? value : undefined));
-    ttsMocks.resolveTtsConfig.mockReset().mockReturnValue({ mode: "final" });
-    threadInfoMocks.parseSessionThreadInfo
-      .mockReset()
-      .mockImplementation(parseGenericThreadSessionInfo);
+    resetPluginTtsAndThreadMocks();
     diagnosticMocks.logMessageQueued.mockReset();
     diagnosticMocks.logMessageProcessed.mockReset();
     diagnosticMocks.logSessionStateChange.mockReset();
+    diagnosticMocks.markDiagnosticSessionProgress.mockReset();
     agentEventMocks.emitAgentEvent.mockReset();
+    agentEventMocks.emitAgentAuditEvent.mockReset();
     agentEventMocks.onAgentEvent.mockReset().mockImplementation(() => () => {});
     setNoAbort();
   });
 
   it("aborts ACP dispatch promptly when the caller abort signal fires", async () => {
-    let releaseTurn: (() => void) | undefined;
-    const releasePromise = new Promise<void>((resolve) => {
-      releaseTurn = resolve;
-    });
-    const runtime = {
-      ensureSession: vi.fn(
-        async (input: { sessionKey: string; mode: string; agent: string }) =>
-          ({
-            sessionKey: input.sessionKey,
-            backend: "acpx",
-            runtimeSessionName: `${input.sessionKey}:${input.mode}`,
-          }) as AcpRuntimeHandle,
-      ),
-      runTurn: vi.fn(async function* (params: { signal?: AbortSignal }) {
-        await new Promise<void>((resolve) => {
-          if (params.signal?.aborted) {
-            resolve();
-            return;
-          }
-          const onAbort = () => resolve();
-          params.signal?.addEventListener("abort", onAbort, { once: true });
-          void releasePromise.then(resolve);
+    const turnStarted = createDeferred();
+    const releaseTurn = createDeferred();
+    const runtime = createAcpRuntime([]);
+    runtime.runTurn.mockImplementation(async function* (params) {
+      turnStarted.resolve();
+      await new Promise<void>((resolve) => {
+        if (params.signal?.aborted) {
+          resolve();
+          return;
+        }
+        const onAbort = () => resolve();
+        params.signal?.addEventListener("abort", onAbort, { once: true });
+        void releaseTurn.promise.then(() => {
+          params.signal?.removeEventListener("abort", onAbort);
+          resolve();
         });
-        yield { type: "done" } as AcpRuntimeEvent;
-      }),
-      cancel: vi.fn(async () => {}),
-      close: vi.fn(async () => {}),
-    } satisfies AcpRuntime;
+      });
+      // Cancellation is prompt even while the runtime's final cleanup remains pending.
+      await releaseTurn.promise;
+      yield { type: "done" } as AcpRuntimeEvent;
+    });
     acpMocks.readAcpSessionEntry.mockReturnValue({
       sessionKey: "agent:codex-acp:session-1",
       storeSessionKey: "agent:codex-acp:session-1",
@@ -528,24 +296,791 @@ describe("dispatchReplyFromConfig ACP abort", () => {
           enabled: true,
           dispatch: { enabled: true },
         },
+        session: {
+          sendPolicy: { default: "allow" },
+        },
       } as OpenClawConfig,
       dispatcher,
       replyOptions: { abortSignal: abortController.signal },
     });
 
-    await vi.waitFor(() => {
+    let operation: ReturnType<typeof createReplyOperation> | undefined;
+    try {
+      await Promise.race([
+        turnStarted.promise,
+        dispatchPromise.then(() => {
+          throw new Error("ACP dispatch completed before its runtime turn started");
+        }),
+      ]);
       expect(runtime.runTurn).toHaveBeenCalledTimes(1);
-    });
-    abortController.abort();
-    const outcome = await Promise.race([
-      dispatchPromise.then(() => "settled" as const),
-      new Promise<"pending">((resolve) => {
-        setTimeout(() => resolve("pending"), 100);
-      }),
-    ]);
-    releaseTurn?.();
-    await dispatchPromise;
+      operation = replyRunRegistry.get("agent:codex-acp:session-1");
+      expect(operation?.ownerSettlement).toBeDefined();
+      abortController.abort();
+      await expect(dispatchPromise).resolves.toMatchObject(expectedNoQueuedReplyResult());
+      expect(replyRunRegistry.get("agent:codex-acp:session-1")).toBe(operation);
+      expect(operation?.abortSignal.aborted).toBe(true);
+      expect(runtime.runTurn.mock.calls[0]?.[0].signal?.aborted).toBe(true);
+      expectNoReplies(dispatcher);
 
-    expect(outcome).toBe("settled");
+      releaseTurn.resolve();
+      await operation?.ownerSettlement;
+      expectNoReplies(dispatcher);
+      expect(getActiveReplyRunCount()).toBe(0);
+    } finally {
+      releaseTurn.resolve();
+      await Promise.allSettled([dispatchPromise, operation?.ownerSettlement]);
+    }
+  });
+
+  it("completes the dispatch-owned operation when ACP tail dispatch handles the turn", async () => {
+    hookMocks.runner.runReplyDispatch.mockImplementation(async (eventUnknown: unknown) => {
+      const event = eventUnknown as {
+        isTailDispatch?: boolean;
+      };
+      if (event.isTailDispatch === true) {
+        return {
+          handled: true,
+          queuedFinal: false,
+          counts: { tool: 0, block: 0, final: 0 },
+        };
+      }
+      return undefined;
+    });
+
+    const dispatcher = createDispatcher();
+    const ctx = buildTestCtx({
+      Provider: "discord",
+      Surface: "discord",
+      SessionKey: "agent:main:regular-tail",
+      BodyForAgent: "/reset continue",
+    });
+    const result = await dispatchReplyFromConfig({
+      ctx,
+      cfg: {
+        acp: {
+          enabled: true,
+          dispatch: { enabled: true },
+        },
+        diagnostics: { enabled: true },
+        session: {
+          sendPolicy: { default: "allow" },
+        },
+      } as OpenClawConfig,
+      dispatcher,
+      replyResolver: async (resolverCtx) => {
+        resolverCtx.AcpDispatchTailAfterReset = true;
+        return undefined;
+      },
+    });
+
+    expect(result.counts.final).toBe(0);
+    expect(hookMocks.runner.runReplyDispatch).toHaveBeenCalledTimes(2);
+    expect(getActiveReplyRunCount()).toBe(0);
+  });
+
+  it("suppresses late reply_dispatch sends when a hook ignores a dispatch abort", async () => {
+    const hookStarted = createDeferred();
+    const releaseHook = createDeferred();
+    const lateSendResults: boolean[] = [];
+
+    hookMocks.runner.runReplyDispatch.mockImplementation(
+      async (_eventUnknown: unknown, hookCtxUnknown: unknown) => {
+        const hookCtx = hookCtxUnknown as {
+          dispatcher: {
+            sendToolResult: (payload: { text: string }) => boolean;
+            sendBlockReply: (payload: { text: string }) => boolean;
+            sendFinalReply: (payload: { text: string }) => boolean;
+            getQueuedCounts: () => { tool: number; block: number; final: number };
+          };
+        };
+        hookStarted.resolve();
+        await releaseHook.promise;
+        lateSendResults.push(
+          hookCtx.dispatcher.sendToolResult({ text: "late tool should not send" }),
+          hookCtx.dispatcher.sendBlockReply({ text: "late block should not send" }),
+          hookCtx.dispatcher.sendFinalReply({ text: "late final should not send" }),
+        );
+        return {
+          handled: true,
+          queuedFinal: false,
+          counts: hookCtx.dispatcher.getQueuedCounts(),
+        };
+      },
+    );
+
+    const dispatcher = createDispatcher();
+    const ctx = buildTestCtx({
+      Provider: "discord",
+      Surface: "discord",
+      SessionKey: "agent:main:reply-dispatch-abort",
+      BodyForAgent: "hang in reply dispatch",
+    });
+    const dispatchPromise = dispatchReplyFromConfig({
+      ctx,
+      cfg: createDispatchConfig(),
+      dispatcher,
+      replyResolver: vi.fn(),
+    });
+
+    let operation: ReturnType<typeof createReplyOperation> | undefined;
+    try {
+      await hookStarted.promise;
+      operation = replyRunRegistry.get("agent:main:reply-dispatch-abort");
+      expect(operation?.ownerSettlement).toBeDefined();
+      expect(replyRunRegistry.abort("agent:main:reply-dispatch-abort")).toBe(true);
+
+      await expect(dispatchPromise).resolves.toMatchObject(expectedNoQueuedReplyResult());
+      expect(replyRunRegistry.get("agent:main:reply-dispatch-abort")).toBe(operation);
+      expect(operation?.abortSignal.aborted).toBe(true);
+      expectNoReplies(dispatcher);
+
+      releaseHook.resolve();
+      await operation?.ownerSettlement;
+      expect(lateSendResults).toEqual([false, false, false]);
+      expectNoReplies(dispatcher);
+      expect(getActiveReplyRunCount()).toBe(0);
+    } finally {
+      releaseHook.resolve();
+      await Promise.allSettled([dispatchPromise, operation?.ownerSettlement]);
+    }
+  });
+
+  it("keys bound ACP tail abort ownership to the source dispatch session", async () => {
+    const sourceSessionKey = "agent:main:discord:channel:C1";
+    const boundAcpSessionKey = "agent:codex:acp:bound-session";
+    const boundConversation = {
+      bindingId: "binding-acp-tail",
+      targetSessionKey: boundAcpSessionKey,
+      targetKind: "session" as const,
+      status: "active" as const,
+      boundAt: Date.now(),
+      conversation: {
+        channel: "discord",
+        accountId: "default",
+        conversationId: "C1",
+      },
+    };
+    const sessionStore: Record<string, { sessionId: string; updatedAt: number }> = {
+      [sourceSessionKey]: {
+        sessionId: "source-session-id",
+        updatedAt: Date.now(),
+      },
+      [boundAcpSessionKey]: {
+        sessionId: "acp-session-id",
+        updatedAt: Date.now(),
+      },
+    };
+    sessionBindingMocks.resolveByConversation.mockReturnValue(boundConversation);
+    sessionStoreMocks.currentEntry = sessionStore[sourceSessionKey];
+    sessionStoreMocks.loadSessionStoreEntry.mockImplementation((...args: unknown[]) => {
+      const params = args[0] as { sessionKey?: string };
+      const existing = params.sessionKey ? sessionStore[params.sessionKey] : undefined;
+      return existing && typeof existing === "object"
+        ? (existing as Record<string, unknown>)
+        : undefined;
+    });
+    acpMocks.readAcpSessionEntry.mockImplementation((params: { sessionKey: string }) =>
+      params.sessionKey === boundAcpSessionKey
+        ? {
+            sessionKey: boundAcpSessionKey,
+            storeSessionKey: boundAcpSessionKey,
+            cfg: {},
+            storePath: "/tmp/mock-sessions.json",
+            entry: sessionStore[boundAcpSessionKey],
+            acp: {
+              backend: "acpx",
+              agent: "codex",
+              runtimeSessionName: "runtime:bound",
+              mode: "persistent",
+              state: "idle",
+              lastActivityAt: Date.now(),
+            },
+          }
+        : null,
+    );
+
+    const tailDispatchStarted = createDeferred();
+    const releaseTailDispatch = createDeferred();
+    let tailSessionKey: string | undefined;
+    let tailAbortSignal: AbortSignal | undefined;
+    hookMocks.runner.runReplyDispatch.mockImplementation(
+      async (eventUnknown: unknown, hookCtxUnknown: unknown) => {
+        const event = eventUnknown as {
+          sessionKey?: string;
+          isTailDispatch?: boolean;
+        };
+        if (event.isTailDispatch === true) {
+          const hookCtx = hookCtxUnknown as { abortSignal?: AbortSignal };
+          tailSessionKey = event.sessionKey;
+          tailAbortSignal = hookCtx.abortSignal;
+          tailDispatchStarted.resolve();
+          await releaseTailDispatch.promise;
+        }
+        return undefined;
+      },
+    );
+
+    const dispatcher = createDispatcher();
+    const ctx = buildTestCtx({
+      Provider: "discord",
+      Surface: "discord",
+      OriginatingChannel: "discord",
+      AccountId: "default",
+      To: "C1",
+      SessionKey: sourceSessionKey,
+      BodyForAgent: "/reset continue",
+    });
+    const dispatchPromise = dispatchReplyFromConfig({
+      ctx,
+      cfg: {
+        acp: {
+          enabled: true,
+          dispatch: { enabled: true },
+        },
+        diagnostics: { enabled: true },
+        session: {
+          sendPolicy: { default: "allow" },
+        },
+      } as OpenClawConfig,
+      dispatcher,
+      replyResolver: async (resolverCtx) => {
+        resolverCtx.AcpDispatchTailAfterReset = true;
+        return undefined;
+      },
+    });
+
+    let operation: ReturnType<typeof createReplyOperation> | undefined;
+    try {
+      await tailDispatchStarted.promise;
+      operation = replyRunRegistry.get(sourceSessionKey);
+      expect(operation?.ownerSettlement).toBeDefined();
+      expect(tailSessionKey).toBe(boundAcpSessionKey);
+      expect(tailAbortSignal).toBeDefined();
+      expect(replyRunRegistry.abort(boundAcpSessionKey)).toBe(false);
+      expect(replyRunRegistry.abort(sourceSessionKey)).toBe(true);
+
+      await expect(dispatchPromise).resolves.toMatchObject(expectedNoQueuedReplyResult());
+      expect(replyRunRegistry.get(sourceSessionKey)).toBe(operation);
+      expect(replyRunRegistry.get(boundAcpSessionKey)).toBeUndefined();
+      expect(operation?.abortSignal.aborted).toBe(true);
+      expect(tailAbortSignal?.aborted).toBe(true);
+
+      releaseTailDispatch.resolve();
+      await operation?.ownerSettlement;
+      expectNoReplies(dispatcher);
+      expect(getActiveReplyRunCount()).toBe(0);
+    } finally {
+      releaseTailDispatch.resolve();
+      await Promise.allSettled([dispatchPromise, operation?.ownerSettlement]);
+    }
+  });
+
+  it("registers pre-dispatch abort ownership when diagnostics are disabled", async () => {
+    hookMocks.runner.hasHooks.mockImplementation(
+      (hookName?: string) => hookName === "before_dispatch",
+    );
+    const beforeDispatchStarted = createDeferred();
+    const releaseBeforeDispatch = createDeferred();
+    hookMocks.runner.runBeforeDispatch.mockImplementation(async () => {
+      beforeDispatchStarted.resolve();
+      await releaseBeforeDispatch.promise;
+      return undefined;
+    });
+
+    const dispatcher = createDispatcher();
+    const ctx = buildTestCtx({
+      Provider: "discord",
+      Surface: "discord",
+      SessionKey: "agent:main:diagnostics-disabled-abort",
+      BodyForAgent: "hang in before dispatch",
+    });
+    const dispatchPromise = dispatchReplyFromConfig({
+      ctx,
+      cfg: createDispatchConfig(false),
+      dispatcher,
+      replyResolver: vi.fn(),
+    });
+
+    let operation: ReturnType<typeof createReplyOperation> | undefined;
+    try {
+      await beforeDispatchStarted.promise;
+      operation = replyRunRegistry.get("agent:main:diagnostics-disabled-abort");
+      expect(operation?.ownerSettlement).toBeDefined();
+      expect(replyRunRegistry.abort("agent:main:diagnostics-disabled-abort")).toBe(true);
+
+      await expect(dispatchPromise).resolves.toMatchObject(expectedNoQueuedReplyResult());
+      expect(replyRunRegistry.get("agent:main:diagnostics-disabled-abort")).toBe(operation);
+      expect(operation?.abortSignal.aborted).toBe(true);
+      expect(diagnosticMocks.logMessageProcessed).not.toHaveBeenCalled();
+
+      releaseBeforeDispatch.resolve();
+      await operation?.ownerSettlement;
+      expectNoReplies(dispatcher);
+      expect(getActiveReplyRunCount()).toBe(0);
+    } finally {
+      releaseBeforeDispatch.resolve();
+      await Promise.allSettled([dispatchPromise, operation?.ownerSettlement]);
+    }
+  });
+
+  it("suppresses handled before_dispatch final delivery after active source abort", async () => {
+    hookMocks.runner.hasHooks.mockImplementation(
+      (hookName?: string) => hookName === "before_dispatch",
+    );
+    mocks.routeReply.mockClear();
+    const existingOperation = createReplyOperation({
+      sessionKey: "agent:main:already-active-handled",
+      sessionId: "already-active-session",
+      resetTriggered: false,
+    });
+    hookMocks.runner.runBeforeDispatch.mockImplementation(async () => {
+      expect(replyRunRegistry.abort("agent:main:already-active-handled")).toBe(true);
+      return {
+        handled: true,
+        text: "handled by hook",
+      };
+    });
+    const dispatcher = createDispatcher();
+    const ctx = buildTestCtx({
+      Provider: "discord",
+      Surface: "discord",
+      SessionKey: "agent:main:already-active-handled",
+      BodyForAgent: "hook handles while an operation is already active",
+    });
+
+    const dispatchPromise = dispatchReplyFromConfig({
+      ctx,
+      cfg: createDispatchConfig(),
+      dispatcher,
+      replyResolver: vi.fn(),
+    });
+
+    await expect(dispatchPromise).resolves.toMatchObject(expectedNoQueuedReplyResult());
+    expect(mocks.routeReply).not.toHaveBeenCalled();
+    expect(dispatcher.sendFinalReply).not.toHaveBeenCalled();
+    expect(existingOperation.result).toEqual({ kind: "aborted", code: "aborted_by_user" });
+    expect(getActiveReplyRunCount()).toBe(0);
+  });
+
+  it("wires active source operation abort into pre-dispatch reply_dispatch hooks", async () => {
+    hookMocks.runner.hasHooks.mockImplementation(
+      (hookName?: string) => hookName === "reply_dispatch",
+    );
+    const { promise: hookStartedPromise, resolve: hookStarted } = createDeferred();
+    const { promise: releaseHookPromise, resolve: releaseHook } = createDeferred();
+    const { promise: hookCompletedPromise, resolve: hookCompleted } = createDeferred();
+    const lateSendResults: boolean[] = [];
+    const abortStates: boolean[] = [];
+    let hookAbortSignal: AbortSignal | undefined;
+
+    hookMocks.runner.runReplyDispatch.mockImplementation(
+      async (_eventUnknown: unknown, hookCtxUnknown: unknown) => {
+        const hookCtx = hookCtxUnknown as {
+          abortSignal?: AbortSignal;
+          dispatcher: {
+            sendToolResult: (payload: { text: string }) => boolean;
+            sendBlockReply: (payload: { text: string }) => boolean;
+            sendFinalReply: (payload: { text: string }) => boolean;
+            getQueuedCounts: () => { tool: number; block: number; final: number };
+          };
+        };
+        hookAbortSignal = hookCtx.abortSignal;
+        hookStarted();
+        await releaseHookPromise;
+        abortStates.push(hookCtx.abortSignal?.aborted === true);
+        lateSendResults.push(
+          hookCtx.dispatcher.sendToolResult({ text: "late tool should not send" }),
+          hookCtx.dispatcher.sendBlockReply({ text: "late block should not send" }),
+          hookCtx.dispatcher.sendFinalReply({ text: "late final should not send" }),
+        );
+        hookCompleted();
+        return {
+          handled: true,
+          queuedFinal: false,
+          counts: hookCtx.dispatcher.getQueuedCounts(),
+        };
+      },
+    );
+
+    const existingOperation = createReplyOperation({
+      sessionKey: "agent:main:already-active-reply-dispatch",
+      sessionId: "already-active-reply-dispatch-session",
+      resetTriggered: false,
+    });
+    const dispatcher = createDispatcher();
+    const ctx = buildTestCtx({
+      Provider: "discord",
+      Surface: "discord",
+      SessionKey: "agent:main:already-active-reply-dispatch",
+      BodyForAgent: "reply dispatch while an operation is already active",
+    });
+    const dispatchPromise = dispatchReplyFromConfig({
+      ctx,
+      cfg: createDispatchConfig(),
+      dispatcher,
+      replyResolver: vi.fn(),
+    });
+
+    await hookStartedPromise;
+    // The hook signal composes the operation signal with lifecycle/upstream
+    // signals, so assert propagation instead of instance identity.
+    expect(hookAbortSignal?.aborted).toBe(false);
+    expect(replyRunRegistry.abort("agent:main:already-active-reply-dispatch")).toBe(true);
+    expect(existingOperation.abortSignal.aborted).toBe(true);
+    expect(hookAbortSignal?.aborted).toBe(true);
+
+    await expect(dispatchPromise).resolves.toMatchObject(expectedNoQueuedReplyResult());
+    expect(existingOperation.result).toEqual({ kind: "aborted", code: "aborted_by_user" });
+
+    releaseHook();
+    await hookCompletedPromise;
+    expect(abortStates).toEqual([true]);
+    expect(lateSendResults).toEqual([false, false, false]);
+    expectNoReplies(dispatcher);
+    expect(getActiveReplyRunCount()).toBe(0);
+  });
+
+  it("suppresses reply resolver runs after active source abort", async () => {
+    const existingOperation = createReplyOperation({
+      sessionKey: "agent:main:already-active-resolver",
+      sessionId: "active-session",
+      resetTriggered: false,
+    });
+    existingOperation.setPhase("running");
+    const replyResolver = vi.fn(async () => undefined);
+    const dispatcher = createDispatcher();
+    const ctx = buildTestCtx({
+      Provider: "discord",
+      Surface: "discord",
+      SessionKey: "agent:main:already-active-resolver",
+      BodyForAgent: "resolver waits behind active operation",
+    });
+    const dispatchPromise = dispatchReplyFromConfig({
+      ctx,
+      cfg: createDispatchConfig(),
+      dispatcher,
+      replyResolver,
+    });
+
+    expect(replyRunRegistry.abort("agent:main:already-active-resolver")).toBe(true);
+
+    await expect(dispatchPromise).resolves.toMatchObject(expectedNoQueuedReplyResult());
+    expect(existingOperation.result).toEqual({ kind: "aborted", code: "aborted_by_user" });
+    expect(replyResolver).not.toHaveBeenCalled();
+    expect(dispatcher.sendFinalReply).not.toHaveBeenCalled();
+    existingOperation.complete();
+    expect(getActiveReplyRunCount()).toBe(0);
+  });
+
+  it("keeps caller abort active while waiting for an active source operation", async () => {
+    const existingOperation = createReplyOperation({
+      sessionKey: "agent:main:already-active-caller-abort",
+      sessionId: "active-session",
+      resetTriggered: false,
+    });
+    const callerAbort = new AbortController();
+    const replyResolver = vi.fn(async () => ({ text: "late final should not send" }));
+    const dispatcher = createDispatcher();
+    const ctx = buildTestCtx({
+      Provider: "discord",
+      Surface: "discord",
+      SessionKey: "agent:main:already-active-caller-abort",
+      BodyForAgent: "resolver should honor caller abort too",
+    });
+    const dispatchPromise = dispatchReplyFromConfig({
+      ctx,
+      cfg: createDispatchConfig(),
+      dispatcher,
+      replyOptions: { abortSignal: callerAbort.signal },
+      replyResolver,
+    });
+
+    callerAbort.abort();
+
+    await expect(dispatchPromise).resolves.toMatchObject(expectedNoQueuedReplyResult());
+    expect(existingOperation.result).toBeNull();
+    expect(replyResolver).not.toHaveBeenCalled();
+    expect(dispatcher.sendFinalReply).not.toHaveBeenCalled();
+    existingOperation.abortByUser();
+    expect(getActiveReplyRunCount()).toBe(0);
+  });
+
+  it.each([
+    { abort: "abortByUser", expected: "cancelled" },
+    { abort: "abortForRestart", expected: "cancelled" },
+    { abort: "supersede", expected: "superseded" },
+  ] as const)(
+    "records $abort before an abort-insensitive resolver settles",
+    async ({ abort, expected }) => {
+      const resolverStarted = createDeferred();
+      const releaseResolver = createDeferred();
+      const resolverFinished = createDeferred();
+      const runState: ReplyOperationRunState = {};
+      const dispatcher = createDispatcher();
+      const ctx = buildTestCtx({
+        Provider: "discord",
+        Surface: "discord",
+        SessionKey: "agent:main:resolver-abort",
+        BodyForAgent: "hang in resolver",
+      });
+      const dispatchPromise = dispatchReplyFromConfig({
+        ctx,
+        cfg: {
+          diagnostics: { enabled: true },
+          session: {
+            sendPolicy: { default: "allow" },
+          },
+        } as OpenClawConfig,
+        dispatcher,
+        replyOptions: { [REPLY_OPERATION_RUN_STATE]: runState },
+        replyResolver: async (_resolverCtx, options) => {
+          resolverStarted.resolve();
+          await releaseResolver.promise;
+          try {
+            await options?.onToolResult?.({ text: "late tool should not send" });
+            await options?.onBlockReply?.({ text: "late block should not send" });
+            const [plan] = createStructuredOutboundPayloadPlan([
+              { text: "late prepared block should not send" },
+            ]);
+            if (!plan || !options?.onPreparedBlockReply) {
+              throw new Error("Prepared block callback unavailable");
+            }
+            await options.onPreparedBlockReply(plan);
+            return { text: "late final should not send" };
+          } finally {
+            resolverFinished.resolve();
+          }
+        },
+      });
+
+      await resolverStarted.promise;
+      const operation = replyRunRegistry.get("agent:main:resolver-abort");
+      try {
+        expect(operation?.[abort]()).toBe(true);
+        await expect(dispatchPromise).resolves.toMatchObject(expectedNoQueuedReplyResult());
+        expect(runState.agentTurnOwner).toBe(operation);
+        expect(resolveReplyOperationAgentTurn(runState)).toBe(expected);
+        expect(dispatcher.sendFinalReply).not.toHaveBeenCalled();
+      } finally {
+        releaseResolver.resolve();
+        await resolverFinished.promise;
+        await replyRunRegistry.waitForIdle("agent:main:resolver-abort");
+      }
+
+      expect(dispatcher.sendToolResult).not.toHaveBeenCalled();
+      expect(dispatcher.sendBlockReply).not.toHaveBeenCalled();
+      expect(dispatcher.sendFinalReply).not.toHaveBeenCalled();
+      expect(getActiveReplyRunCount()).toBe(0);
+    },
+  );
+
+  it("treats a resolver AbortError after dispatch abort as a handled dispatch", async () => {
+    const { promise: resolverStartedPromise, resolve: resolverStarted } = createDeferred();
+
+    const dispatcher = createDispatcher();
+    const ctx = buildTestCtx({
+      Provider: "discord",
+      Surface: "discord",
+      SessionKey: "agent:main:resolver-abort-error",
+      BodyForAgent: "abort in resolver",
+    });
+    const dispatchPromise = dispatchReplyFromConfig({
+      ctx,
+      cfg: createDispatchConfig(),
+      dispatcher,
+      replyResolver: async (_resolverCtx, options) => {
+        resolverStarted();
+        const abortSignal = options?.abortSignal;
+        if (!abortSignal) {
+          throw new Error("expected dispatch abort signal");
+        }
+        await new Promise<void>((resolve) => {
+          abortSignal.addEventListener("abort", () => resolve(), { once: true });
+        });
+        const err = new Error("resolver aborted");
+        err.name = "AbortError";
+        throw err;
+      },
+    });
+
+    await resolverStartedPromise;
+    expect(replyRunRegistry.abort("agent:main:resolver-abort-error")).toBe(true);
+
+    await expect(dispatchPromise).resolves.toMatchObject(expectedNoQueuedReplyResult());
+    expect(diagnosticMocks.logMessageProcessed).toHaveBeenCalledWith(
+      expect.objectContaining({
+        outcome: "skipped",
+        reason: "reply_operation_aborted",
+      }),
+    );
+    expect(getActiveReplyRunCount()).toBe(0);
+  });
+
+  it("keys native command pre-dispatch ownership to the source session", async () => {
+    // Contract: reply-run admission is source-keyed for native command turns.
+    // Command handlers still resolve the target via CommandTargetSessionKey /
+    // initialSessionStoreEntry; only the reply-operation key is source-owned
+    // so mid-run status/stop/etc. do not wait on the target's active run.
+    hookMocks.runner.hasHooks.mockImplementation(
+      (hookName?: string) => hookName === "before_dispatch",
+    );
+    const beforeDispatchStarted = createDeferred();
+    const releaseBeforeDispatch = createDeferred();
+    hookMocks.runner.runBeforeDispatch.mockImplementation(async () => {
+      beforeDispatchStarted.resolve();
+      await releaseBeforeDispatch.promise;
+      return undefined;
+    });
+
+    const sourceSessionKey = "agent:main:discord:slash:user-1";
+    const targetSessionKey = "agent:main:discord:channel:target-1";
+    const dispatcher = createDispatcher();
+    const ctx = buildTestCtx({
+      Provider: "discord",
+      Surface: "discord",
+      CommandSource: "native",
+      CommandTurn: {
+        kind: "native",
+        source: "native",
+        authorized: true,
+      },
+      SessionKey: sourceSessionKey,
+      CommandTargetSessionKey: targetSessionKey,
+      BodyForAgent: "hang before command source dispatch",
+    });
+    const dispatchPromise = dispatchReplyFromConfig({
+      ctx,
+      cfg: createDispatchConfig(),
+      dispatcher,
+      replyResolver: vi.fn(),
+    });
+
+    let operation: ReturnType<typeof createReplyOperation> | undefined;
+    try {
+      await expect(
+        raceWithTimeoutResult(
+          beforeDispatchStarted.promise.then(() => "started" as const),
+          100,
+          "pending" as const,
+        ),
+      ).resolves.toBe("started");
+      operation = replyRunRegistry.get(sourceSessionKey);
+      expect(operation?.ownerSettlement).toBeDefined();
+      expect(replyRunRegistry.abort(targetSessionKey)).toBe(false);
+      expect(replyRunRegistry.abort(sourceSessionKey)).toBe(true);
+
+      await expect(dispatchPromise).resolves.toMatchObject(expectedNoQueuedReplyResult());
+      expect(replyRunRegistry.get(sourceSessionKey)).toBe(operation);
+      expect(replyRunRegistry.get(targetSessionKey)).toBeUndefined();
+      expect(operation?.abortSignal.aborted).toBe(true);
+
+      releaseBeforeDispatch.resolve();
+      await operation?.ownerSettlement;
+      expectNoReplies(dispatcher);
+      expect(getActiveReplyRunCount()).toBe(0);
+    } finally {
+      releaseBeforeDispatch.resolve();
+      await Promise.allSettled([dispatchPromise, operation?.ownerSettlement]);
+    }
+  });
+
+  it("admits unauthorized native /stop on the source while the target has an active run", async () => {
+    const sourceSessionKey = "agent:main:telegram:slash:user-unauth";
+    const targetSessionKey = "agent:main:telegram:group:target-run";
+    const targetOperation = createReplyOperation({
+      sessionKey: targetSessionKey,
+      sessionId: "target-active-session",
+      resetTriggered: false,
+    });
+    targetOperation.setPhase("running");
+
+    const replyResolver = vi.fn(async () => ({
+      text: "You are not authorized to use this command.",
+    }));
+    const dispatcher = createDispatcher();
+    const ctx = buildTestCtx({
+      Provider: "telegram",
+      Surface: "telegram",
+      CommandSource: "native",
+      CommandAuthorized: false,
+      CommandTurn: {
+        kind: "native",
+        source: "native",
+        authorized: false,
+        commandName: "stop",
+        body: "/stop",
+      },
+      SessionKey: sourceSessionKey,
+      CommandTargetSessionKey: targetSessionKey,
+      Body: "/stop",
+      RawBody: "/stop",
+      CommandBody: "/stop",
+      BodyForAgent: "/stop",
+    });
+
+    const dispatchPromise = dispatchReplyFromConfig({
+      ctx,
+      cfg: createDispatchConfig(),
+      dispatcher,
+      replyResolver,
+    });
+
+    type DispatchOutcome =
+      | { status: "settled"; result: Awaited<typeof dispatchPromise> }
+      | { status: "pending" };
+    const outcome = await raceWithTimeoutResult<DispatchOutcome>(
+      dispatchPromise.then((result) => ({ status: "settled" as const, result })),
+      200,
+      { status: "pending" as const },
+    );
+    expect(outcome).toMatchObject({
+      status: "settled",
+      result: {
+        queuedFinal: true,
+      },
+    });
+    expect(replyResolver).toHaveBeenCalledOnce();
+    expect(dispatcher.sendFinalReply).toHaveBeenCalledWith({
+      text: "You are not authorized to use this command.",
+    });
+    // Target run must remain active — command admission is source-keyed.
+    expect(targetOperation.result).toBeNull();
+    expect(replyRunRegistry.get(targetSessionKey)).toBe(targetOperation);
+    expect(replyRunRegistry.get(sourceSessionKey)).toBeUndefined();
+    targetOperation.complete();
+    expect(getActiveReplyRunCount()).toBe(0);
+  });
+
+  it("does not let a current-session fast abort abort its own dispatch operation", async () => {
+    const dispatcher = createDispatcher();
+    const ctx = buildTestCtx({
+      Provider: "discord",
+      Surface: "discord",
+      SessionKey: "agent:main:self-stop",
+      BodyForAgent: "/stop",
+    });
+    const replyResolver = vi.fn();
+
+    await expect(
+      dispatchReplyFromConfig({
+        ctx,
+        cfg: createDispatchConfig(),
+        dispatcher,
+        replyOptions: { sourceReplyDeliveryMode: "automatic" },
+        replyResolver,
+        fastAbortResolver: async () => {
+          expect(replyRunRegistry.abort("agent:main:self-stop")).toBe(false);
+          return { handled: true, aborted: true };
+        },
+        formatAbortReplyTextResolver: () => "stopped",
+      }),
+    ).resolves.toMatchObject({
+      queuedFinal: true,
+    });
+
+    expect(replyResolver).not.toHaveBeenCalled();
+    expect(dispatcher.sendFinalReply).toHaveBeenCalledWith({ text: "stopped" });
+    expect(getActiveReplyRunCount()).toBe(0);
   });
 });
+/* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

@@ -1,35 +1,9 @@
-/**
- * Tests for token.ts module
- *
- * Tests cover:
- * - Token resolution from config
- * - Token resolution from environment variable
- * - Fallback behavior when token not found
- * - Account ID normalization
- */
-
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import type { OpenClawConfig } from "../api.js";
-import { resolveTwitchToken, type TwitchTokenSource } from "./token.js";
+import { resolveTwitchToken } from "./token.js";
 
 describe("token", () => {
-  // Multi-account config for testing non-default accounts
-  const mockMultiAccountConfig = {
-    channels: {
-      twitch: {
-        accounts: {
-          default: {
-            username: "testbot",
-            accessToken: "oauth:config-token",
-          },
-          other: {
-            username: "otherbot",
-            accessToken: "oauth:other-token",
-          },
-        },
-      },
-    },
-  } as unknown as OpenClawConfig;
+  const originalAccessToken = process.env.OPENCLAW_TWITCH_ACCESS_TOKEN;
 
   // Simplified single-account config
   const mockSimplifiedConfig = {
@@ -41,30 +15,15 @@ describe("token", () => {
     },
   } as unknown as OpenClawConfig;
 
-  beforeEach(() => {
-    vi.clearAllMocks();
-  });
-
   afterEach(() => {
-    vi.restoreAllMocks();
-    delete process.env.OPENCLAW_TWITCH_ACCESS_TOKEN;
+    if (originalAccessToken === undefined) {
+      delete process.env.OPENCLAW_TWITCH_ACCESS_TOKEN;
+    } else {
+      process.env.OPENCLAW_TWITCH_ACCESS_TOKEN = originalAccessToken;
+    }
   });
 
   describe("resolveTwitchToken", () => {
-    it("should resolve token from simplified config for default account", () => {
-      const result = resolveTwitchToken(mockSimplifiedConfig, { accountId: "default" });
-
-      expect(result.token).toBe("oauth:config-token");
-      expect(result.source).toBe("config");
-    });
-
-    it("should resolve token from config for non-default account (multi-account)", () => {
-      const result = resolveTwitchToken(mockMultiAccountConfig, { accountId: "other" });
-
-      expect(result.token).toBe("oauth:other-token");
-      expect(result.source).toBe("config");
-    });
-
     it("should prioritize config token over env var (simplified config)", () => {
       process.env.OPENCLAW_TWITCH_ACCESS_TOKEN = "oauth:env-token";
 
@@ -156,16 +115,6 @@ describe("token", () => {
 
       expect(result.token).toBe("");
       expect(result.source).toBe("none");
-    });
-  });
-
-  describe("TwitchTokenSource type", () => {
-    it("should have correct values", () => {
-      const sources: TwitchTokenSource[] = ["env", "config", "none"];
-
-      expect(sources).toContain("env");
-      expect(sources).toContain("config");
-      expect(sources).toContain("none");
     });
   });
 });

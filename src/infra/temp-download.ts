@@ -1,60 +1,38 @@
-import crypto from "node:crypto";
-import { mkdtemp, rm } from "node:fs/promises";
+// Creates private temporary workspaces for downloads.
 import path from "node:path";
+import {
+  buildRandomTempFilePath as buildRandomTempFilePathBase,
+  sanitizeTempFileName,
+} from "@openclaw/fs-safe/advanced";
+import { tempWorkspace } from "@openclaw/fs-safe/temp";
+import { createSubsystemLogger } from "../logging/subsystem.js";
 import { resolvePreferredOpenClawTmpDir } from "./tmp-openclaw-dir.js";
 
-export { resolvePreferredOpenClawTmpDir } from "./tmp-openclaw-dir.js";
+const logger = createSubsystemLogger("infra:temp-download");
 
-export type TempDownloadTarget = {
+export { resolvePreferredOpenClawTmpDir } from "./tmp-openclaw-dir.js";
+export { sanitizeTempFileName };
+
+// Download targets expose both a default path and a name-safe file builder so
+// callers can keep all transient files inside the same workspace.
+type TempDownloadTarget = {
   dir: string;
   path: string;
+  file(fileName?: string): string;
   cleanup: () => Promise<void>;
+  [Symbol.asyncDispose](): Promise<void>;
 };
-
-function sanitizePrefix(prefix: string): string {
-  const normalized = prefix.replace(/[^a-zA-Z0-9_-]+/g, "-").replace(/^-+|-+$/g, "");
-  return normalized || "tmp";
-}
-
-function sanitizeExtension(extension?: string): string {
-  if (!extension) {
-    return "";
-  }
-  const normalized = extension.startsWith(".") ? extension : `.${extension}`;
-  const suffix = normalized.match(/[a-zA-Z0-9._-]+$/)?.[0] ?? "";
-  const token = suffix.replace(/^[._-]+/, "");
-  return token ? `.${token}` : "";
-}
-
-export function sanitizeTempFileName(fileName: string): string {
-  const base = path.basename(fileName).replace(/[^a-zA-Z0-9._-]+/g, "-");
-  const normalized = base.replace(/^-+|-+$/g, "");
-  return normalized || "download.bin";
-}
 
 function resolveTempRoot(tmpDir?: string): string {
   return tmpDir ?? resolvePreferredOpenClawTmpDir();
 }
 
-function isNodeErrorWithCode(err: unknown, code: string): boolean {
-  return (
-    typeof err === "object" &&
-    err !== null &&
-    "code" in err &&
-    (err as { code?: string }).code === code
-  );
+function sanitizeTempPrefix(prefix: string): string {
+  const normalized = prefix.replace(/[^a-zA-Z0-9_-]+/g, "-").replace(/^-+|-+$/g, "");
+  return normalized || "tmp";
 }
 
-async function cleanupTempDir(dir: string) {
-  try {
-    await rm(dir, { recursive: true, force: true });
-  } catch (err) {
-    if (!isNodeErrorWithCode(err, "ENOENT")) {
-      console.warn(`temp-path cleanup failed for ${dir}: ${String(err)}`);
-    }
-  }
-}
-
+/** Build a stable temp path shape while keeping caller-controlled text filename-safe. */
 export function buildRandomTempFilePath(params: {
   prefix: string;
   extension?: string;
@@ -62,15 +40,13 @@ export function buildRandomTempFilePath(params: {
   now?: number;
   uuid?: string;
 }): string {
-  const prefix = sanitizePrefix(params.prefix);
-  const extension = sanitizeExtension(params.extension);
-  const nowCandidate = params.now;
-  const now =
-    typeof nowCandidate === "number" && Number.isFinite(nowCandidate)
-      ? Math.trunc(nowCandidate)
-      : Date.now();
-  const uuid = params.uuid?.trim() || crypto.randomUUID();
-  return path.join(resolveTempRoot(params.tmpDir), `${prefix}-${now}-${uuid}${extension}`);
+  const rootDir = resolveTempRoot(params.tmpDir);
+  const filePath = buildRandomTempFilePathBase({
+    ...params,
+    rootDir,
+    uuid: params.uuid?.trim() || undefined,
+  });
+  return path.join(rootDir, path.basename(filePath));
 }
 
 export async function createTempDownloadTarget(params: {
@@ -78,18 +54,30 @@ export async function createTempDownloadTarget(params: {
   fileName?: string;
   tmpDir?: string;
 }): Promise<TempDownloadTarget> {
-  const tempRoot = resolveTempRoot(params.tmpDir);
-  const prefix = `${sanitizePrefix(params.prefix)}-`;
-  const dir = await mkdtemp(path.join(tempRoot, prefix));
+  const workspace = await tempWorkspace({
+    rootDir: resolveTempRoot(params.tmpDir),
+    prefix: sanitizeTempPrefix(params.prefix),
+  });
+  const fileName = params.fileName;
+  const file = (nextName?: string) =>
+    workspace.path(sanitizeTempFileName(nextName ?? fileName ?? "download.bin"));
+  const cleanup = async () => {
+    try {
+      await workspace.cleanup();
+    } catch (err) {
+      logger.warn(`temp-path cleanup failed: ${String(err)}`, { error: err });
+    }
+  };
   return {
-    dir,
-    path: path.join(dir, sanitizeTempFileName(params.fileName ?? "download.bin")),
-    cleanup: async () => {
-      await cleanupTempDir(dir);
-    },
+    dir: workspace.dir,
+    path: file(),
+    file,
+    cleanup,
+    [Symbol.asyncDispose]: cleanup,
   };
 }
 
+/** Run with a private temp download path and always attempt workspace cleanup. */
 export async function withTempDownloadPath<T>(
   params: {
     prefix: string;

@@ -2,8 +2,12 @@ import { normalizeAccountId } from "openclaw/plugin-sdk/account-id";
 import {
   createResolvedDirectoryEntriesLister,
   type DirectoryConfigParams,
-} from "openclaw/plugin-sdk/directory-runtime";
-import { mergeDiscordAccountConfig, resolveDefaultDiscordAccountId } from "./accounts.js";
+} from "openclaw/plugin-sdk/directory-config-runtime";
+import {
+  mergeDiscordAccountConfig,
+  resolveDefaultDiscordAccountId,
+  resolveDiscordAccountAllowFrom,
+} from "./accounts.js";
 
 function resolveDiscordDirectoryConfigAccount(
   cfg: DirectoryConfigParams["cfg"],
@@ -12,9 +16,8 @@ function resolveDiscordDirectoryConfigAccount(
   const resolvedAccountId = normalizeAccountId(accountId ?? resolveDefaultDiscordAccountId(cfg));
   const config = mergeDiscordAccountConfig(cfg, resolvedAccountId);
   return {
-    accountId: resolvedAccountId,
     config,
-    dm: config.dm,
+    allowFrom: resolveDiscordAccountAllowFrom({ cfg, accountId: resolvedAccountId }) ?? [],
   };
 }
 
@@ -22,14 +25,14 @@ export const listDiscordDirectoryPeersFromConfig = createResolvedDirectoryEntrie
   ReturnType<typeof resolveDiscordDirectoryConfigAccount>
 >({
   kind: "user",
-  resolveAccount: (cfg, accountId) => resolveDiscordDirectoryConfigAccount(cfg, accountId),
+  resolveAccount: resolveDiscordDirectoryConfigAccount,
   resolveSources: (account) => {
-    const allowFrom = account.config.allowFrom ?? account.config.dm?.allowFrom ?? [];
-    const guildUsers = Object.values(account.config.guilds ?? {}).flatMap((guild) => [
-      ...(guild.users ?? []),
-      ...Object.values(guild.channels ?? {}).flatMap((channel) => channel.users ?? []),
-    ]);
-    return [allowFrom, Object.keys(account.config.dms ?? {}), guildUsers];
+    const guildUsers = Object.values(account.config.guilds ?? {}).flatMap((guild) =>
+      (guild.users ?? []).concat(
+        Object.values(guild.channels ?? {}).flatMap((channel) => channel.users ?? []),
+      ),
+    );
+    return [account.allowFrom, Object.keys(account.config.dms ?? {}), guildUsers];
   },
   normalizeId: (raw) => {
     const mention = raw.match(/^<@!?(\d+)>$/);
@@ -42,7 +45,7 @@ export const listDiscordDirectoryGroupsFromConfig = createResolvedDirectoryEntri
   ReturnType<typeof resolveDiscordDirectoryConfigAccount>
 >({
   kind: "group",
-  resolveAccount: (cfg, accountId) => resolveDiscordDirectoryConfigAccount(cfg, accountId),
+  resolveAccount: resolveDiscordDirectoryConfigAccount,
   resolveSources: (account) =>
     Object.values(account.config.guilds ?? {}).map((guild) => Object.keys(guild.channels ?? {})),
   normalizeId: (raw) => {

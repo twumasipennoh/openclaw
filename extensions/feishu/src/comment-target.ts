@@ -1,4 +1,4 @@
-export const FEISHU_COMMENT_FILE_TYPES = ["doc", "docx", "file", "sheet", "slides"] as const;
+const FEISHU_COMMENT_FILE_TYPES = ["doc", "docx", "file", "sheet", "slides"] as const;
 
 export type CommentFileType = (typeof FEISHU_COMMENT_FILE_TYPES)[number];
 
@@ -9,7 +9,7 @@ export function normalizeCommentFileType(value: unknown): CommentFileType | unde
     : undefined;
 }
 
-export type FeishuCommentTarget = {
+type FeishuCommentTarget = {
   fileType: CommentFileType;
   fileToken: string;
   commentId: string;

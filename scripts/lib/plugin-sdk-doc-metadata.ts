@@ -1,3 +1,4 @@
+// Plugin Sdk Doc Metadata script supports OpenClaw repository automation.
 export type PluginSdkDocCategory =
   | "channel"
   | "core"
@@ -6,18 +7,18 @@ export type PluginSdkDocCategory =
   | "runtime"
   | "utilities";
 
-export type PluginSdkDocMetadata = {
+type PluginSdkDocMetadata = {
   category: PluginSdkDocCategory;
 };
 
 export const pluginSdkDocMetadata = {
-  index: {
-    category: "legacy",
-  },
-  "channel-runtime": {
-    category: "legacy",
+  "control-ui-link-reader": {
+    category: "core",
   },
   core: {
+    category: "core",
+  },
+  health: {
     category: "core",
   },
   "approval-runtime": {
@@ -30,6 +31,9 @@ export const pluginSdkDocMetadata = {
     category: "runtime",
   },
   "approval-delivery-runtime": {
+    category: "runtime",
+  },
+  "approval-gateway-runtime": {
     category: "runtime",
   },
   "approval-native-runtime": {
@@ -53,13 +57,19 @@ export const pluginSdkDocMetadata = {
   "channel-pairing": {
     category: "channel",
   },
-  "channel-reply-pipeline": {
+  "channel-ingress-runtime": {
+    category: "channel",
+  },
+  "channel-outbound": {
     category: "channel",
   },
   "channel-setup": {
     category: "channel",
   },
-  "command-auth": {
+  "channel-dm-policy": {
+    category: "channel",
+  },
+  "command-status": {
     category: "channel",
   },
   "secret-input": {
@@ -68,11 +78,35 @@ export const pluginSdkDocMetadata = {
   "webhook-ingress": {
     category: "channel",
   },
-  "provider-onboard": {
-    category: "provider",
+  "widget-html": {
+    category: "utilities",
   },
   "runtime-store": {
     category: "runtime",
+  },
+  "plugin-command-runtime": {
+    category: "runtime",
+  },
+  "session-store-runtime": {
+    category: "runtime",
+  },
+  "conversation-binding-inspection-runtime": {
+    category: "runtime",
+  },
+  "agent-scope-runtime": {
+    category: "runtime",
+  },
+  "agent-runtime": {
+    category: "runtime",
+  },
+  "agent-harness-runtime": {
+    category: "runtime",
+  },
+  "agent-workspace-runtime": {
+    category: "runtime",
+  },
+  "speech-settings": {
+    category: "provider",
   },
   "allow-from": {
     category: "utilities",
@@ -80,26 +114,9 @@ export const pluginSdkDocMetadata = {
   "reply-payload": {
     category: "utilities",
   },
-  testing: {
+  "media-local-roots": {
     category: "utilities",
   },
 } as const satisfies Record<string, PluginSdkDocMetadata>;
 
 export type PluginSdkDocEntrypoint = keyof typeof pluginSdkDocMetadata;
-
-export const pluginSdkDocCategories = [
-  "core",
-  "channel",
-  "provider",
-  "runtime",
-  "utilities",
-  "legacy",
-] as const satisfies readonly PluginSdkDocCategory[];
-
-export const pluginSdkDocEntrypoints = Object.keys(
-  pluginSdkDocMetadata,
-) as PluginSdkDocEntrypoint[];
-
-export function resolvePluginSdkDocImportSpecifier(entrypoint: PluginSdkDocEntrypoint): string {
-  return entrypoint === "index" ? "openclaw/plugin-sdk" : `openclaw/plugin-sdk/${entrypoint}`;
-}

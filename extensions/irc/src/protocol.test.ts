@@ -1,10 +1,10 @@
+// Irc tests cover protocol plugin behavior.
 import { describe, expect, it } from "vitest";
 import {
   parseIrcLine,
   parseIrcPrefix,
   sanitizeIrcOutboundText,
   sanitizeIrcTarget,
-  splitIrcText,
 } from "./protocol.js";
 
 describe("irc protocol", () => {
@@ -36,9 +36,31 @@ describe("irc protocol", () => {
     expect(() => sanitizeIrcTarget(" user")).toThrow(/Invalid IRC target/);
   });
 
-  it("splits long text on boundaries", () => {
-    const chunks = splitIrcText("a ".repeat(300), 120);
-    expect(chunks.length).toBeGreaterThan(2);
-    expect(chunks.every((chunk) => chunk.length <= 120)).toBe(true);
+  describe("\\u escape surrogate-range guard", () => {
+    const LONE_SURROGATE = /[\uD800-\uDFFF]/;
+
+    it("preserves literal \\uXXXX when codepoint is a low surrogate", () => {
+      const out = sanitizeIrcOutboundText("\\uDFFF");
+      expect(LONE_SURROGATE.test(out)).toBe(false);
+    });
+
+    it("decodes adjacent surrogate-pair escapes to the astral character", () => {
+      expect(sanitizeIrcOutboundText("\\uD83D\\uDE00")).toBe("😀");
+      expect(sanitizeIrcOutboundText("\\uD83D\\uDE00\\uD83D\\uDE01")).toBe("😀😁");
+    });
+
+    it("decodes BMP-escaped prefix before a surrogate pair correctly", () => {
+      // Regression: \\u0041\\uD83D\\uDE00 must yield A😀, not A\\uD83D\\uDE00.
+      // The old step-1 regex \\u(xxxx)\\u(xxxx) would consume \\u0041\\uD83D as a
+      // non-pair, leaving \\uDE00 as a lone surrogate.
+      expect(sanitizeIrcOutboundText("\\u0041\\uD83D\\uDE00")).toBe("A😀");
+    });
+
+    it("handles lone high surrogate followed by a different surrogate pair", () => {
+      // \\uD800\\uD83D\\uDE00: D800 is lone (no matching low), D83D+DE00 form 😀.
+      // Use toBe rather than LONE_SURROGATE regex: emoji contains surrogate
+      // code units internally that would trigger a naive /[\uD800-\uDFFF]/ check.
+      expect(sanitizeIrcOutboundText("\\uD800\\uD83D\\uDE00")).toBe("\\uD800😀");
+    });
   });
 });

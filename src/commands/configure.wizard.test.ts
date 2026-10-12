@@ -1,454 +1,331 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { OpenClawConfig } from "../config/config.js";
+import { formatCliCommand } from "../cli/command-format.js";
+import { ConfigMutationConflictError } from "../config/mutate.js";
+import type { OpenClawConfig } from "../config/types.openclaw.js";
+import { committedConfigFiles } from "./committed-config.test-support.js";
+import {
+  createEnabledWebSearchConfig,
+  createWizardTestRuntime as createRuntime,
+  EMPTY_CONFIG_SNAPSHOT,
+  queueWizardTestPrompts as queueWizardPrompts,
+  runConfigureWizard,
+  setupWizardTestDefaults,
+  setupBaseWizardTestState as setupBaseWizardState,
+  wizardTestMocks as mocks,
+} from "./configure.wizard.test-support.js";
 
-const mocks = vi.hoisted(() => {
-  const writeConfigFile = vi.fn();
-  return {
-    clackIntro: vi.fn(),
-    clackOutro: vi.fn(),
-    clackSelect: vi.fn(),
-    clackText: vi.fn(),
-    clackConfirm: vi.fn(),
-    resolveSearchProviderOptions: vi.fn(),
-    setupSearch: vi.fn(),
-    readConfigFileSnapshot: vi.fn(),
-    writeConfigFile,
-    replaceConfigFile: vi.fn(async (params: { nextConfig: unknown }) => {
-      await writeConfigFile(params.nextConfig);
-    }),
-    resolveGatewayPort: vi.fn(),
-    ensureControlUiAssetsBuilt: vi.fn(),
-    createClackPrompter: vi.fn(),
-    note: vi.fn(),
-    printWizardHeader: vi.fn(),
-    probeGatewayReachable: vi.fn(),
-    waitForGatewayReachable: vi.fn(),
-    resolveControlUiLinks: vi.fn(),
-    summarizeExistingConfig: vi.fn(),
-  };
-});
+const { configureCommandFromSectionsArg } = await import("./configure.commands.js");
 
-vi.mock("@clack/prompts", () => ({
-  intro: mocks.clackIntro,
-  outro: mocks.clackOutro,
-  select: mocks.clackSelect,
-  text: mocks.clackText,
-  confirm: mocks.clackConfirm,
-}));
-
-vi.mock("../config/config.js", () => ({
-  CONFIG_PATH: "~/.openclaw/openclaw.json",
-  readConfigFileSnapshot: mocks.readConfigFileSnapshot,
-  writeConfigFile: mocks.writeConfigFile,
-  replaceConfigFile: mocks.replaceConfigFile,
-  resolveGatewayPort: mocks.resolveGatewayPort,
-}));
-
-vi.mock("../infra/control-ui-assets.js", () => ({
-  ensureControlUiAssetsBuilt: mocks.ensureControlUiAssetsBuilt,
-}));
-
-vi.mock("../wizard/clack-prompter.js", () => ({
-  createClackPrompter: mocks.createClackPrompter,
-}));
-
-vi.mock("../terminal/note.js", () => ({
-  note: mocks.note,
-}));
-
-vi.mock("./onboard-helpers.js", () => ({
-  DEFAULT_WORKSPACE: "~/.openclaw/workspace",
-  applyWizardMetadata: (cfg: OpenClawConfig) => cfg,
-  ensureWorkspaceAndSessions: vi.fn(),
-  guardCancel: <T>(value: T) => value,
-  printWizardHeader: mocks.printWizardHeader,
-  probeGatewayReachable: mocks.probeGatewayReachable,
-  resolveControlUiLinks: mocks.resolveControlUiLinks,
-  summarizeExistingConfig: mocks.summarizeExistingConfig,
-  waitForGatewayReachable: mocks.waitForGatewayReachable,
-}));
-
-vi.mock("./health.js", () => ({
-  healthCommand: vi.fn(),
-}));
-
-vi.mock("./health-format.js", () => ({
-  formatHealthCheckFailure: vi.fn(),
-}));
-
-vi.mock("./configure.gateway.js", () => ({
-  promptGatewayConfig: vi.fn(),
-}));
-
-vi.mock("./configure.gateway-auth.js", () => ({
-  promptAuthConfig: vi.fn(),
-}));
-
-vi.mock("./configure.channels.js", () => ({
-  removeChannelConfigWizard: vi.fn(),
-}));
-
-vi.mock("./configure.daemon.js", () => ({
-  maybeInstallDaemon: vi.fn(),
-}));
-
-vi.mock("./onboard-remote.js", () => ({
-  promptRemoteGatewayConfig: vi.fn(),
-}));
-
-vi.mock("./onboard-skills.js", () => ({
-  setupSkills: vi.fn(),
-}));
-
-vi.mock("./onboard-channels.js", () => ({
-  setupChannels: vi.fn(),
-}));
-
-vi.mock("./onboard-search.js", () => ({
-  resolveSearchProviderOptions: mocks.resolveSearchProviderOptions,
-  setupSearch: mocks.setupSearch,
-}));
-
-import { WizardCancelledError } from "../wizard/prompts.js";
-import { runConfigureWizard } from "./configure.wizard.js";
-
-const EMPTY_CONFIG_SNAPSHOT = {
-  exists: false,
-  valid: true,
-  config: {},
-  issues: [],
+const written = () => mocks.writeConfigFile.mock.calls.at(-1)![0];
+const configureWeb = () =>
+  runConfigureWizard({ command: "configure", sections: ["web"] }, createRuntime());
+const nativeSearchConfig: OpenClawConfig = {
+  auth: { profiles: { "openai:default": { provider: "openai", mode: "oauth" } } },
 };
 
-function createRuntime() {
-  return {
-    log: vi.fn(),
-    error: vi.fn(),
-    exit: vi.fn(),
-  };
-}
-
-function createSearchProviderOption(overrides: Record<string, unknown>) {
-  return overrides;
-}
-
-function createEnabledWebSearchConfig(provider: string, pluginEntry: Record<string, unknown>) {
-  return (cfg: OpenClawConfig) => ({
-    ...cfg,
-    tools: {
-      ...cfg.tools,
-      web: {
-        ...cfg.tools?.web,
-        search: {
-          provider,
-          enabled: true,
-        },
-      },
-    },
-    plugins: {
-      ...cfg.plugins,
-      entries: {
-        ...cfg.plugins?.entries,
-        [provider]: pluginEntry,
-      },
-    },
-  });
-}
-
-function setupBaseWizardState(config: OpenClawConfig = {}) {
+function agentConfig(config: OpenClawConfig) {
+  setupBaseWizardState(config);
   mocks.readConfigFileSnapshot.mockResolvedValue({
     ...EMPTY_CONFIG_SNAPSHOT,
+    exists: true,
     config,
+    sourceConfig: config,
   });
-  mocks.resolveGatewayPort.mockReturnValue(18789);
-  mocks.probeGatewayReachable.mockResolvedValue({ ok: false });
-  mocks.resolveControlUiLinks.mockReturnValue({ wsUrl: "ws://127.0.0.1:18789" });
-  mocks.summarizeExistingConfig.mockReturnValue("");
-  mocks.createClackPrompter.mockReturnValue({
-    intro: vi.fn(async () => {}),
-    outro: vi.fn(async () => {}),
-    note: vi.fn(async () => {}),
-    select: vi.fn(async () => "firecrawl"),
-    multiselect: vi.fn(async () => []),
-    text: vi.fn(async () => ""),
-    confirm: vi.fn(async () => true),
-    progress: vi.fn(() => ({ update: vi.fn(), stop: vi.fn() })),
-  });
+  queueWizardPrompts({ select: ["configure"], confirm: [], text: "/tmp/new-workspace" });
 }
 
-function queueWizardPrompts(params: { select: string[]; confirm: boolean[]; text?: string }) {
-  const selectQueue = [...params.select];
-  const confirmQueue = [...params.confirm];
-  mocks.clackSelect.mockImplementation(async () => selectQueue.shift());
-  mocks.clackConfirm.mockImplementation(async () => confirmQueue.shift());
-  mocks.clackText.mockResolvedValue(params.text ?? "");
-  mocks.clackIntro.mockResolvedValue(undefined);
-  mocks.clackOutro.mockResolvedValue(undefined);
-}
-
-async function runWebConfigureWizard() {
-  await runConfigureWizard({ command: "configure", sections: ["web"] }, createRuntime());
+function expectWorkspaceSetup(workspaceDir: string, agentId: string) {
+  expect(mocks.setupPluginConfig).toHaveBeenCalledWith(expect.objectContaining({ workspaceDir }));
+  expect(mocks.setupSkills).toHaveBeenCalledWith(
+    expect.any(Object),
+    workspaceDir,
+    expect.any(Object),
+    expect.any(Object),
+  );
+  expect(mocks.ensureWorkspaceAndSessions).toHaveBeenCalledWith(
+    workspaceDir,
+    expect.any(Object),
+    expect.objectContaining({ agentId }),
+  );
 }
 
 describe("runConfigureWizard", () => {
   beforeEach(() => {
-    vi.clearAllMocks();
-    mocks.ensureControlUiAssetsBuilt.mockResolvedValue({ ok: true });
-    mocks.resolveSearchProviderOptions.mockReturnValue([
-      {
-        id: "firecrawl",
-        label: "Firecrawl Search",
-        hint: "Structured results with optional result scraping",
-        credentialLabel: "Firecrawl API key",
-        envVars: ["FIRECRAWL_API_KEY"],
-        placeholder: "fc-...",
-        signupUrl: "https://www.firecrawl.dev/",
-        credentialPath: "plugins.entries.firecrawl.config.webSearch.apiKey",
-      },
-    ]);
-    mocks.setupSearch.mockReset();
-    mocks.setupSearch.mockImplementation(async (cfg: OpenClawConfig) => cfg);
+    vi.resetAllMocks();
+    setupWizardTestDefaults();
+    setupBaseWizardState();
   });
 
-  it("persists gateway.mode=local when only the run mode is selected", async () => {
-    setupBaseWizardState();
-    queueWizardPrompts({
-      select: ["local", "__continue"],
-      confirm: [false],
+  it("directs invalid config to Doctor before making changes", async () => {
+    mocks.readConfigFileSnapshot.mockResolvedValueOnce({
+      ...EMPTY_CONFIG_SNAPSHOT,
+      exists: true,
+      valid: false,
+      issues: [{ path: "browser.actionTimeoutTypoMs", message: "Unknown key" }],
     });
-
-    await runConfigureWizard({ command: "configure" }, createRuntime());
-
-    expect(mocks.writeConfigFile).toHaveBeenCalledWith(
-      expect.objectContaining({
-        gateway: expect.objectContaining({ mode: "local" }),
-      }),
-    );
-  });
-
-  it("exits with code 1 when configure wizard is cancelled", async () => {
     const runtime = createRuntime();
-    setupBaseWizardState();
-    mocks.clackSelect.mockRejectedValueOnce(new WizardCancelledError());
-
     await runConfigureWizard({ command: "configure" }, runtime);
-
+    expect(mocks.clackOutro).toHaveBeenCalledWith(
+      "Config invalid. Run `openclaw doctor --fix` to apply supported repairs, then re-run configure.",
+    );
     expect(runtime.exit).toHaveBeenCalledWith(1);
+    expect(mocks.clackSelect).not.toHaveBeenCalled();
+    expect(mocks.writeConfigFile).not.toHaveBeenCalled();
   });
 
-  it("persists provider-owned web search config changes returned by setupSearch", async () => {
-    setupBaseWizardState();
-    mocks.setupSearch.mockImplementation(async (cfg: OpenClawConfig) =>
-      createEnabledWebSearchConfig("firecrawl", {
+  it("persists provider-owned search and fetch settings", async () => {
+    mocks.setupSearch.mockImplementation(async (cfg: OpenClawConfig) => {
+      const config = createEnabledWebSearchConfig("firecrawl", {
         enabled: true,
         config: { webSearch: { apiKey: "fc-entered-key" } },
-      })(cfg),
-    );
-    queueWizardPrompts({
-      select: ["local"],
-      confirm: [true, false],
-    });
-
-    await runWebConfigureWizard();
-
-    expect(mocks.writeConfigFile).toHaveBeenCalledWith(
-      expect.objectContaining({
-        tools: expect.objectContaining({
-          web: expect.objectContaining({
-            search: expect.objectContaining({
-              provider: "firecrawl",
-              enabled: true,
-            }),
-          }),
-        }),
-        plugins: expect.objectContaining({
-          entries: expect.objectContaining({
-            firecrawl: expect.objectContaining({
-              enabled: true,
-              config: expect.objectContaining({
-                webSearch: expect.objectContaining({ apiKey: "fc-entered-key" }),
-              }),
-            }),
-          }),
-        }),
-      }),
-    );
-    expect(mocks.setupSearch).toHaveBeenCalledOnce();
-  });
-
-  it("delegates provider selection to the shared search setup flow", async () => {
-    setupBaseWizardState();
-    mocks.setupSearch.mockImplementation(async (cfg: OpenClawConfig) =>
-      createEnabledWebSearchConfig("firecrawl", {
-        enabled: true,
-      })(cfg),
-    );
-    queueWizardPrompts({
-      select: ["local"],
-      confirm: [true, false],
-    });
-
-    await runWebConfigureWizard();
-
-    expect(mocks.setupSearch).toHaveBeenCalledWith(
-      expect.objectContaining({
-        gateway: expect.objectContaining({ mode: "local" }),
-      }),
-      expect.anything(),
-      expect.anything(),
-    );
-    expect(mocks.writeConfigFile).toHaveBeenCalledWith(
-      expect.objectContaining({
-        plugins: expect.objectContaining({
-          entries: expect.objectContaining({
-            firecrawl: expect.objectContaining({
-              enabled: true,
-            }),
-          }),
-        }),
-      }),
-    );
-  });
-
-  it("does not crash when web search providers are unavailable under plugin policy", async () => {
-    setupBaseWizardState();
-    mocks.resolveSearchProviderOptions.mockReturnValue([]);
-    queueWizardPrompts({
-      select: ["local"],
-      confirm: [true, false],
-    });
-
-    await expect(runWebConfigureWizard()).resolves.toBeUndefined();
-
-    expect(mocks.note).toHaveBeenCalledWith(
-      expect.stringContaining(
-        "No web search providers are currently available under this plugin policy.",
-      ),
-      "Web search",
-    );
-    expect(mocks.writeConfigFile).toHaveBeenCalledWith(
-      expect.objectContaining({
-        tools: expect.objectContaining({
-          web: expect.objectContaining({
-            search: expect.objectContaining({
-              enabled: false,
-            }),
-          }),
-        }),
-      }),
-    );
-  });
-
-  it("still supports keyless web search providers through the shared setup flow", async () => {
-    setupBaseWizardState();
-    mocks.resolveSearchProviderOptions.mockReturnValue([
-      createSearchProviderOption({
-        id: "duckduckgo",
-        label: "DuckDuckGo Search (experimental)",
-        hint: "Free fallback",
-        requiresCredential: false,
-        envVars: [],
-        placeholder: "(no key needed)",
-        signupUrl: "https://duckduckgo.com/",
-        docsUrl: "https://docs.openclaw.ai/tools/web",
-        credentialPath: "",
-      }),
-    ]);
-    mocks.setupSearch.mockImplementation(async (cfg: OpenClawConfig) =>
-      createEnabledWebSearchConfig("duckduckgo", {
-        enabled: true,
-      })(cfg),
-    );
-    queueWizardPrompts({
-      select: ["local"],
-      confirm: [true, false],
-    });
-
-    await runWebConfigureWizard();
-
-    expect(mocks.clackText).not.toHaveBeenCalled();
-    expect(mocks.setupSearch).toHaveBeenCalledOnce();
-  });
-
-  it("can enable native Codex search without configuring a managed provider", async () => {
-    setupBaseWizardState({
-      auth: {
-        profiles: {
-          "openai-codex:default": {
-            provider: "openai-codex",
-            mode: "oauth",
+      })(cfg);
+      return {
+        outcome: "completed",
+        config: {
+          ...config,
+          tools: {
+            ...config.tools,
+            web: { ...config.tools.web, fetch: { provider: "firecrawl" } },
           },
         },
-      },
+      };
     });
-    queueWizardPrompts({
-      select: ["local", "cached"],
-      confirm: [true, true, false, true],
+    queueWizardPrompts({ select: [], confirm: [true, true] });
+    await configureWeb();
+    expect(written().tools?.web).toMatchObject({
+      search: { provider: "firecrawl", enabled: true },
+      fetch: { provider: "firecrawl", enabled: true },
     });
-
-    await runWebConfigureWizard();
-
-    expect(mocks.writeConfigFile).toHaveBeenCalledWith(
-      expect.objectContaining({
-        tools: expect.objectContaining({
-          web: expect.objectContaining({
-            search: expect.objectContaining({
-              enabled: true,
-              openaiCodex: expect.objectContaining({
-                enabled: true,
-                mode: "cached",
-              }),
-            }),
-          }),
-        }),
-      }),
+    expect(written().plugins?.entries?.firecrawl).toEqual({
+      enabled: true,
+      config: { webSearch: { apiKey: "fc-entered-key" } },
+    });
+    expect(mocks.setupSearch).toHaveBeenCalledExactlyOnceWith(
+      expect.not.objectContaining({ gateway: expect.anything() }),
+      expect.anything(),
+      expect.anything(),
+      { preserveDisabledSearchState: false },
     );
+  });
+
+  it("disables search when plugin policy leaves no available provider", async () => {
+    mocks.resolveSearchProviderOptions.mockReturnValue([]);
+    queueWizardPrompts({ select: [], confirm: [true, false] });
+    await configureWeb();
+    expect(mocks.note).toHaveBeenCalledWith(
+      expect.stringContaining("No web search providers are currently available"),
+      "Web search",
+    );
+    expect(written().tools?.web?.search?.enabled).toBe(false);
+  });
+
+  it("disables managed search without loading providers or selecting an agent", async () => {
+    setupBaseWizardState({ agents: { ownership: "explicit", entries: { alpha: {}, beta: {} } } });
+    queueWizardPrompts({ select: [], confirm: [false, true] });
+    await configureWeb();
+    expect(mocks.clackSelect).not.toHaveBeenCalled();
+    expect(mocks.resolveSearchProviderOptions).not.toHaveBeenCalled();
+    expect(mocks.setupSearch).not.toHaveBeenCalled();
+    expect(written().tools?.web?.search?.enabled).toBe(false);
+  });
+
+  it("enables native search without a managed provider", async () => {
+    setupBaseWizardState(nativeSearchConfig);
+    queueWizardPrompts({ select: ["cached"], confirm: [true, true, false, true] });
+    await configureWeb();
+    expect(written().tools?.web).toMatchObject({
+      search: { enabled: true, openaiCodex: { enabled: true, mode: "cached" } },
+      fetch: { enabled: true },
+    });
     expect(mocks.setupSearch).not.toHaveBeenCalled();
   });
 
-  it("preserves disabled native Codex search when toggled off", async () => {
+  it("preserves the native search mode when disabling it", async () => {
     setupBaseWizardState({
-      auth: {
-        profiles: {
-          "openai-codex:default": {
-            provider: "openai-codex",
-            mode: "oauth",
+      ...nativeSearchConfig,
+      tools: { web: { search: { enabled: true, openaiCodex: { enabled: true, mode: "live" } } } },
+    });
+    queueWizardPrompts({ select: ["firecrawl"], confirm: [true, false, true, false] });
+    await configureWeb();
+    expect(written().tools?.web?.search).toMatchObject({
+      enabled: true,
+      openaiCodex: { enabled: false, mode: "live" },
+    });
+    expect(mocks.setupSearch).toHaveBeenCalledOnce();
+  });
+
+  it("preserves concurrent nested plugin writes on conflict (#64188)", async () => {
+    const config: OpenClawConfig = {
+      plugins: {
+        entries: { "github-copilot": { enabled: false, config: { region: "us-east-1" } } },
+      },
+    };
+    const updated: OpenClawConfig = {
+      plugins: {
+        entries: {
+          "github-copilot": {
+            enabled: false,
+            config: { region: "us-east-1", accessToken: "plugin-wrote-this" },
           },
         },
       },
-      tools: {
-        web: {
-          search: {
-            enabled: true,
-            openaiCodex: {
-              enabled: true,
-              mode: "live",
-            },
-          },
-        },
+    };
+    queueWizardPrompts({ select: [], confirm: [] });
+    const snapshot = (source: OpenClawConfig, hash: string) => ({
+      ...EMPTY_CONFIG_SNAPSHOT,
+      config: source,
+      sourceConfig: source,
+      hash,
+    });
+    mocks.readConfigFileSnapshot
+      .mockResolvedValueOnce(snapshot(config, "before"))
+      .mockResolvedValueOnce(snapshot(config, "before"))
+      .mockResolvedValueOnce(snapshot(updated, "after"));
+    mocks.replaceConfigFile
+      .mockImplementationOnce(async ({ baseHash }) => {
+        expect(baseHash).toBe("before");
+        throw new ConfigMutationConflictError("config changed since last load");
+      })
+      .mockImplementationOnce(async ({ nextConfig, baseHash }) => {
+        expect(baseHash).toBe("after");
+        await mocks.writeConfigFile(nextConfig);
+        return committedConfigFiles.write(nextConfig);
+      });
+    await runConfigureWizard({ command: "configure", sections: ["workspace"] }, createRuntime());
+    expect(mocks.replaceConfigFile).toHaveBeenCalledTimes(2);
+    expect(mocks.writeConfigFile).toHaveBeenCalledOnce();
+    expect(mocks.readConfigFileSnapshot).toHaveBeenCalledTimes(3);
+    expect(written().agents?.defaults?.workspace).toContain("/.openclaw/workspace");
+    expect(written().plugins).toEqual(updated.plugins);
+  });
+
+  it("does not retry after config path ownership changes", async () => {
+    queueWizardPrompts({ select: [], confirm: [] });
+    mocks.assertConfigPathForWrite.mockImplementation(() => {
+      throw new ConfigMutationConflictError("config path changed since last load", {
+        retryable: false,
+      });
+    });
+    await expect(
+      runConfigureWizard({ command: "configure", sections: ["workspace"] }, createRuntime()),
+    ).rejects.toThrow("config path changed since last load");
+    expect(mocks.replaceConfigFile).toHaveBeenCalledOnce();
+    expect(mocks.readConfigFileSnapshot).toHaveBeenCalledTimes(2);
+    expect(mocks.writeConfigFile).not.toHaveBeenCalled();
+  });
+
+  it("uses one selected agent through setup and commits before channel hooks", async () => {
+    agentConfig({
+      agents: {
+        ownership: "explicit",
+        defaults: { workspace: "/tmp/global" },
+        entries: { alpha: { workspace: "/tmp/alpha" }, beta: {} },
       },
     });
-    queueWizardPrompts({
-      select: ["firecrawl"],
-      confirm: [true, false, true, false],
+    queueWizardPrompts({ select: ["beta", "configure"], confirm: [], text: "/tmp/new-workspace" });
+    const hook = vi.fn(async () => {});
+    mocks.setupChannels.mockImplementationOnce(async (config, _runtime, _prompter, options) => {
+      options?.onPostWriteHook?.({ channel: "matrix", accountId: "beta", run: hook });
+      return config;
     });
-
-    await runWebConfigureWizard();
-
-    expect(mocks.writeConfigFile).toHaveBeenCalledWith(
+    await runConfigureWizard(
+      { command: "configure", sections: ["workspace", "plugins", "skills", "channels"] },
+      createRuntime(),
+    );
+    expect(written().agents).toEqual({
+      ownership: "explicit",
+      defaults: { workspace: "/tmp/global" },
+      entries: { alpha: { workspace: "/tmp/alpha" }, beta: { workspace: "/tmp/new-workspace" } },
+    });
+    expectWorkspaceSetup("/tmp/new-workspace", "beta");
+    expect(mocks.setupChannels).toHaveBeenCalledWith(
+      expect.any(Object),
+      expect.any(Object),
+      expect.any(Object),
       expect.objectContaining({
-        tools: expect.objectContaining({
-          web: expect.objectContaining({
-            search: expect.objectContaining({
-              enabled: true,
-              openaiCodex: expect.objectContaining({
-                enabled: false,
-                mode: "live",
-              }),
-            }),
-          }),
-        }),
+        workspaceDir: "/tmp/new-workspace",
+        deferStatusUntilSelection: true,
+        skipStatusNote: true,
       }),
     );
-    expect(mocks.setupSearch).toHaveBeenCalledOnce();
+    expect(
+      mocks.clackSelect.mock.calls.filter(
+        ([params]) => params.message === "Which agent do you want to configure?",
+      ),
+    ).toHaveLength(1);
+    expect(hook).toHaveBeenCalledOnce();
+    expect(mocks.writeConfigFile.mock.invocationCallOrder[0]!).toBeLessThan(
+      hook.mock.invocationCallOrder[0]!,
+    );
+  });
+
+  it("does not persist an unprovisionable workspace", async () => {
+    agentConfig({ agents: { entries: { ops: { workspace: "/tmp/ops" } } } });
+    mocks.ensureWorkspaceAndSessions.mockRejectedValueOnce(new Error("workspace is unwritable"));
+    await expect(
+      runConfigureWizard(
+        { command: "configure", sections: ["workspace", "plugins", "skills"] },
+        createRuntime(),
+      ),
+    ).rejects.toThrow("workspace is unwritable");
+    expect(mocks.setupPluginConfig).not.toHaveBeenCalled();
+    expect(mocks.setupSkills).not.toHaveBeenCalled();
+    expect(mocks.writeConfigFile).not.toHaveBeenCalled();
+  });
+
+  it("removes channel config without selecting an agent", async () => {
+    const config: OpenClawConfig = {
+      agents: { ownership: "explicit", entries: { alpha: {}, beta: {} } },
+    };
+    agentConfig(config);
+    mocks.clackSelect.mockResolvedValueOnce("remove");
+    await runConfigureWizard({ command: "configure", sections: ["channels"] }, createRuntime());
+    expect(mocks.setupChannels).not.toHaveBeenCalled();
+    expect(mocks.clackSelect).toHaveBeenCalledOnce();
+    expect(written()).toEqual(config);
+  });
+  it("rejects non-interactive configure before prompting (#93953)", async () => {
+    const runtime = createRuntime();
+    await configureCommandFromSectionsArg(undefined, runtime, { interactive: false });
+    expect(runtime.exit).toHaveBeenCalledWith(1);
+    expect(runtime.error).toHaveBeenCalledOnce();
+    const message = runtime.error.mock.calls[0]?.[0];
+    expect(message).toContain("requires an interactive terminal (TTY)");
+    expect(message).toContain(formatCliCommand("openclaw config set"));
+    expect(message).toContain(formatCliCommand("openclaw config validate"));
+    expect(mocks.clackIntro).not.toHaveBeenCalled();
+    expect(mocks.writeConfigFile).not.toHaveBeenCalled();
+  });
+
+  it("opens the full wizard for Commander's empty section list", async () => {
+    queueWizardPrompts({ select: ["local", "__continue"], confirm: [] });
+    await configureCommandFromSectionsArg([], createRuntime(), { interactive: true });
+    expect(written().gateway?.mode).toBe("local");
+    expect(mocks.writeConfigFile).toHaveBeenCalledOnce();
+  });
+
+  it("dispatches trimmed section names through the wizard", async () => {
+    queueWizardPrompts({ select: ["configure"], confirm: [] });
+    await configureCommandFromSectionsArg(["  channels  ", "\tplugins\t"], createRuntime(), {
+      interactive: true,
+    });
+    expect(mocks.setupChannels).toHaveBeenCalledOnce();
+    expect(mocks.setupPluginConfig).toHaveBeenCalledOnce();
+    expect(mocks.promptGatewayConfig).not.toHaveBeenCalled();
+    expect(mocks.writeConfigFile).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    ["  ", '""'],
+    ["bogus", "bogus"],
+  ])("rejects section %j before the terminal guard", async (section, diagnostic) => {
+    const runtime = createRuntime();
+    await configureCommandFromSectionsArg(["channels", section], runtime, { interactive: false });
+    expect(runtime.exit).toHaveBeenCalledWith(1);
+    expect(runtime.error).toHaveBeenCalledWith(
+      expect.stringContaining(`Invalid --section: ${diagnostic}`),
+    );
+    expect(mocks.clackIntro).not.toHaveBeenCalled();
+    expect(mocks.writeConfigFile).not.toHaveBeenCalled();
   });
 });

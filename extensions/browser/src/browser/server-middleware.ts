@@ -1,7 +1,18 @@
-import type { Express } from "express";
+import type { Express, Request } from "express";
 import express from "express";
+import type { BrowserControlAuth } from "./control-auth.js";
 import { browserMutationGuardMiddleware } from "./csrf.js";
 import { isAuthorizedBrowserRequest } from "./http-auth.js";
+
+const BROWSER_AUTH_VERIFIED_FLAG = "__openclawBrowserAuthVerified";
+
+type BrowserAuthMarkedRequest = Request & {
+  [BROWSER_AUTH_VERIFIED_FLAG]?: boolean;
+};
+
+export function hasVerifiedBrowserAuth(req: Request): boolean {
+  return (req as BrowserAuthMarkedRequest)[BROWSER_AUTH_VERIFIED_FLAG] === true;
+}
 
 export function installBrowserCommonMiddleware(app: Express) {
   app.use((req, res, next) => {
@@ -13,23 +24,25 @@ export function installBrowserCommonMiddleware(app: Express) {
         abort();
       }
     });
-    // Make the signal available to browser route handlers (best-effort).
-    (req as unknown as { signal?: AbortSignal }).signal = ctrl.signal;
+    // Node 24.16+'s native request signal aborts when a POST body finishes.
+    // Browser work follows the client/response lifetime instead.
+    Object.defineProperty(req, "signal", {
+      value: ctrl.signal,
+      configurable: true,
+    });
     next();
   });
-  app.use(express.json({ limit: "1mb" }));
   app.use(browserMutationGuardMiddleware());
+  app.use(express.json({ limit: "1mb" }));
 }
 
-export function installBrowserAuthMiddleware(
-  app: Express,
-  auth: { token?: string; password?: string },
-) {
+export function installBrowserAuthMiddleware(app: Express, auth: BrowserControlAuth) {
   if (!auth.token && !auth.password) {
     return;
   }
   app.use((req, res, next) => {
     if (isAuthorizedBrowserRequest(req, auth)) {
+      (req as BrowserAuthMarkedRequest)[BROWSER_AUTH_VERIFIED_FLAG] = true;
       return next();
     }
     res.status(401).send("Unauthorized");

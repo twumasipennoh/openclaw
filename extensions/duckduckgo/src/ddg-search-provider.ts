@@ -1,43 +1,40 @@
-import { Type } from "@sinclair/typebox";
+import { createLazyRuntimeModule } from "openclaw/plugin-sdk/lazy-runtime";
+import { readPositiveIntegerParam, readStringParam } from "openclaw/plugin-sdk/param-readers";
 import {
-  enablePluginInConfig,
-  getScopedCredentialValue,
-  readNumberParam,
-  readStringParam,
-  setScopedCredentialValue,
+  createWebSearchProviderContractFields,
   type WebSearchProviderPlugin,
-} from "openclaw/plugin-sdk/provider-web-search";
-import { runDuckDuckGoSearch } from "./ddg-client.js";
+} from "openclaw/plugin-sdk/provider-web-search-contract";
 
-const DuckDuckGoSearchSchema = Type.Object(
-  {
-    query: Type.String({ description: "Search query string." }),
-    count: Type.Optional(
-      Type.Number({
-        description: "Number of results to return (1-10).",
-        minimum: 1,
-        maximum: 10,
-      }),
-    ),
-    region: Type.Optional(
-      Type.String({
-        description: "Optional DuckDuckGo region code such as us-en, uk-en, or de-de.",
-      }),
-    ),
-    safeSearch: Type.Optional(
-      Type.String({
-        description: "SafeSearch level: strict, moderate, or off.",
-      }),
-    ),
+const loadDuckDuckGoClientModule = createLazyRuntimeModule(() => import("./ddg-client.js"));
+
+const DuckDuckGoSearchSchema = {
+  type: "object",
+  properties: {
+    query: { type: "string", description: "Search query string." },
+    count: {
+      type: "integer",
+      description: "Number of results to return (1-10).",
+      minimum: 1,
+      maximum: 10,
+    },
+    region: {
+      type: "string",
+      description: "Optional DuckDuckGo region code such as us-en, uk-en, or de-de.",
+    },
+    safeSearch: {
+      type: "string",
+      description: "SafeSearch level: strict, moderate, or off.",
+    },
   },
-  { additionalProperties: false },
-);
+  additionalProperties: false,
+} satisfies Record<string, unknown>;
 
 export function createDuckDuckGoWebSearchProvider(): WebSearchProviderPlugin {
   return {
     id: "duckduckgo",
     label: "DuckDuckGo Search (experimental)",
     hint: "Free web search fallback with no API key required",
+    onboardingScopes: ["text-inference"],
     requiresCredential: false,
     envVars: [],
     placeholder: "(no key needed)",
@@ -45,27 +42,34 @@ export function createDuckDuckGoWebSearchProvider(): WebSearchProviderPlugin {
     docsUrl: "https://docs.openclaw.ai/tools/web",
     autoDetectOrder: 100,
     credentialPath: "",
-    inactiveSecretPaths: [],
-    getCredentialValue: (searchConfig) => getScopedCredentialValue(searchConfig, "duckduckgo"),
-    setCredentialValue: (searchConfigTarget, value) =>
-      setScopedCredentialValue(searchConfigTarget, "duckduckgo", value),
-    applySelectionConfig: (config) => enablePluginInConfig(config, "duckduckgo").config,
+    ...createWebSearchProviderContractFields({
+      credentialPath: "",
+      searchCredential: { type: "scoped", scopeId: "duckduckgo" },
+      selectionPluginId: "duckduckgo",
+    }),
     createTool: (ctx) => ({
       description:
         "Search the web using DuckDuckGo. Returns titles, URLs, and snippets with no API key required.",
       parameters: DuckDuckGoSearchSchema,
-      execute: async (args) =>
-        await runDuckDuckGoSearch({
+      execute: async (args, context) => {
+        context?.signal?.throwIfAborted();
+        const { runDuckDuckGoSearch } = await loadDuckDuckGoClientModule();
+        return await runDuckDuckGoSearch({
           config: ctx.config,
           query: readStringParam(args, "query", { required: true }),
-          count: readNumberParam(args, "count", { integer: true }),
+          count: readPositiveIntegerParam(args, "count", {
+            max: 10,
+            message: "count must be an integer from 1 to 10.",
+          }),
           region: readStringParam(args, "region"),
           safeSearch: readStringParam(args, "safeSearch") as
             | "strict"
             | "moderate"
             | "off"
             | undefined,
-        }),
+          ...(context?.signal ? { signal: context.signal } : {}),
+        });
+      },
     }),
   };
 }

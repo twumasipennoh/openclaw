@@ -1,86 +1,65 @@
+import {
+  normalizeLowercaseStringOrEmpty,
+  normalizeOptionalString,
+} from "@openclaw/normalization-core/string-coerce";
+import { uniqueStrings } from "@openclaw/normalization-core/string-normalization";
 import type { OpenClawConfig } from "../../config/types.js";
 import type { DirectoryConfigParams } from "./directory-types.js";
-import type { ChannelDirectoryEntry } from "./types.js";
-
-function resolveDirectoryQuery(query?: string | null): string {
-  return query?.trim().toLowerCase() || "";
-}
-
-function resolveDirectoryLimit(limit?: number | null): number | undefined {
-  return typeof limit === "number" && limit > 0 ? limit : undefined;
-}
+import type { ChannelDirectoryEntry } from "./types.public.js";
 
 export function applyDirectoryQueryAndLimit(
   ids: string[],
   params: { query?: string | null; limit?: number | null },
 ): string[] {
-  const q = resolveDirectoryQuery(params.query);
-  const limit = resolveDirectoryLimit(params.limit);
-  const filtered = ids.filter((id) => (q ? id.toLowerCase().includes(q) : true));
-  return typeof limit === "number" ? filtered.slice(0, limit) : filtered;
+  const q = normalizeLowercaseStringOrEmpty(params.query);
+  const limit = typeof params.limit === "number" && params.limit > 0 ? params.limit : undefined;
+  const filtered: string[] = [];
+  for (const id of ids) {
+    if (q && !normalizeLowercaseStringOrEmpty(id).includes(q)) {
+      continue;
+    }
+    filtered.push(id);
+    if (typeof limit === "number" && filtered.length >= limit) {
+      break;
+    }
+  }
+  return filtered;
 }
 
 export function toDirectoryEntries(kind: "user" | "group", ids: string[]): ChannelDirectoryEntry[] {
-  return ids.map((id) => ({ kind, id }) as const);
+  return Array.from(ids, (id) => ({ kind, id }));
 }
 
-function normalizeDirectoryIds(params: {
-  rawIds: readonly string[];
-  normalizeId?: (entry: string) => string | null | undefined;
-}): string[] {
-  return params.rawIds
-    .map((entry) => entry.trim())
-    .filter((entry) => Boolean(entry) && entry !== "*")
-    .map((entry) => {
-      const normalized = params.normalizeId ? params.normalizeId(entry) : entry;
-      return typeof normalized === "string" ? normalized.trim() : "";
-    })
-    .filter(Boolean);
-}
-
-function collectDirectoryIdsFromEntries(params: {
-  entries?: readonly unknown[];
-  normalizeId?: (entry: string) => string | null | undefined;
-}): string[] {
-  return normalizeDirectoryIds({
-    rawIds: (params.entries ?? []).map((entry) => String(entry)),
-    normalizeId: params.normalizeId,
-  });
-}
-
-function collectDirectoryIdsFromMapKeys(params: {
-  groups?: Record<string, unknown>;
-  normalizeId?: (entry: string) => string | null | undefined;
-}): string[] {
-  return normalizeDirectoryIds({
-    rawIds: Object.keys(params.groups ?? {}),
-    normalizeId: params.normalizeId,
-  });
-}
-
-function dedupeDirectoryIds(ids: string[]): string[] {
-  return Array.from(new Set(ids));
+function collectDirectoryIds(
+  values: Iterable<unknown>,
+  normalizeId?: (entry: string) => string | null | undefined,
+  readEntry: (value: unknown) => string | undefined = String,
+): string[] {
+  const ids: string[] = [];
+  for (const value of values) {
+    const entry = normalizeOptionalString(readEntry(value)) ?? "";
+    if (!entry || entry === "*") {
+      continue;
+    }
+    const normalized = normalizeId ? normalizeId(entry) : entry;
+    const id = normalizeOptionalString(normalized) ?? "";
+    if (id) {
+      ids.push(id);
+    }
+  }
+  return ids;
 }
 
 export function collectNormalizedDirectoryIds(params: {
   sources: Iterable<unknown>[];
   normalizeId: (entry: string) => string | null | undefined;
 }): string[] {
-  const ids = new Set<string>();
-  for (const source of params.sources) {
-    for (const value of source) {
-      const raw = String(value).trim();
-      if (!raw || raw === "*") {
-        continue;
-      }
-      const normalized = params.normalizeId(raw);
-      const trimmed = typeof normalized === "string" ? normalized.trim() : "";
-      if (trimmed) {
-        ids.add(trimmed);
-      }
-    }
-  }
-  return Array.from(ids);
+  // Arbitrary source helpers accept strings only; allowFrom helpers also stringify ids.
+  return uniqueStrings(
+    params.sources.flatMap((source) =>
+      collectDirectoryIds(source, params.normalizeId, normalizeOptionalString),
+    ),
+  );
 }
 
 export function listDirectoryEntriesFromSources(params: {
@@ -90,10 +69,7 @@ export function listDirectoryEntriesFromSources(params: {
   limit?: number | null;
   normalizeId: (entry: string) => string | null | undefined;
 }): ChannelDirectoryEntry[] {
-  const ids = collectNormalizedDirectoryIds({
-    sources: params.sources,
-    normalizeId: params.normalizeId,
-  });
+  const ids = collectNormalizedDirectoryIds(params);
   return toDirectoryEntries(params.kind, applyDirectoryQueryAndLimit(ids, params));
 }
 
@@ -109,6 +85,8 @@ export function listInspectedDirectoryEntriesFromSources<InspectedAccount>(
   },
 ): ChannelDirectoryEntry[] {
   const account = params.inspectAccount(params.cfg, params.accountId);
+  // Missing optional accounts produce an empty directory instead of forcing
+  // setup callers to special-case unconfigured channel state.
   if (!account) {
     return [];
   }
@@ -121,15 +99,12 @@ export function listInspectedDirectoryEntriesFromSources<InspectedAccount>(
   });
 }
 
-export function createInspectedDirectoryEntriesLister<InspectedAccount>(params: {
-  kind: "user" | "group";
-  inspectAccount: (
-    cfg: OpenClawConfig,
-    accountId?: string | null,
-  ) => InspectedAccount | null | undefined;
-  resolveSources: (account: InspectedAccount) => Iterable<unknown>[];
-  normalizeId: (entry: string) => string | null | undefined;
-}) {
+export function createInspectedDirectoryEntriesLister<InspectedAccount>(
+  params: Omit<
+    Parameters<typeof listInspectedDirectoryEntriesFromSources<InspectedAccount>>[0],
+    keyof DirectoryConfigParams
+  >,
+) {
   return async (configParams: DirectoryConfigParams): Promise<ChannelDirectoryEntry[]> =>
     listInspectedDirectoryEntriesFromSources({
       ...configParams,
@@ -155,12 +130,12 @@ export function listResolvedDirectoryEntriesFromSources<ResolvedAccount>(
   });
 }
 
-export function createResolvedDirectoryEntriesLister<ResolvedAccount>(params: {
-  kind: "user" | "group";
-  resolveAccount: (cfg: OpenClawConfig, accountId?: string | null) => ResolvedAccount;
-  resolveSources: (account: ResolvedAccount) => Iterable<unknown>[];
-  normalizeId: (entry: string) => string | null | undefined;
-}) {
+export function createResolvedDirectoryEntriesLister<ResolvedAccount>(
+  params: Omit<
+    Parameters<typeof listResolvedDirectoryEntriesFromSources<ResolvedAccount>>[0],
+    keyof DirectoryConfigParams
+  >,
+) {
   return async (configParams: DirectoryConfigParams): Promise<ChannelDirectoryEntry[]> =>
     listResolvedDirectoryEntriesFromSources({
       ...configParams,
@@ -174,12 +149,7 @@ export function listDirectoryUserEntriesFromAllowFrom(params: {
   limit?: number | null;
   normalizeId?: (entry: string) => string | null | undefined;
 }): ChannelDirectoryEntry[] {
-  const ids = dedupeDirectoryIds(
-    collectDirectoryIdsFromEntries({
-      entries: params.allowFrom,
-      normalizeId: params.normalizeId,
-    }),
-  );
+  const ids = uniqueStrings(collectDirectoryIds(params.allowFrom ?? [], params.normalizeId));
   return toDirectoryEntries("user", applyDirectoryQueryAndLimit(ids, params));
 }
 
@@ -191,15 +161,9 @@ export function listDirectoryUserEntriesFromAllowFromAndMapKeys(params: {
   normalizeAllowFromId?: (entry: string) => string | null | undefined;
   normalizeMapKeyId?: (entry: string) => string | null | undefined;
 }): ChannelDirectoryEntry[] {
-  const ids = dedupeDirectoryIds([
-    ...collectDirectoryIdsFromEntries({
-      entries: params.allowFrom,
-      normalizeId: params.normalizeAllowFromId,
-    }),
-    ...collectDirectoryIdsFromMapKeys({
-      groups: params.map,
-      normalizeId: params.normalizeMapKeyId,
-    }),
+  const ids = uniqueStrings([
+    ...collectDirectoryIds(params.allowFrom ?? [], params.normalizeAllowFromId),
+    ...collectDirectoryIds(Object.keys(params.map ?? {}), params.normalizeMapKeyId),
   ]);
   return toDirectoryEntries("user", applyDirectoryQueryAndLimit(ids, params));
 }
@@ -210,11 +174,8 @@ export function listDirectoryGroupEntriesFromMapKeys(params: {
   limit?: number | null;
   normalizeId?: (entry: string) => string | null | undefined;
 }): ChannelDirectoryEntry[] {
-  const ids = dedupeDirectoryIds(
-    collectDirectoryIdsFromMapKeys({
-      groups: params.groups,
-      normalizeId: params.normalizeId,
-    }),
+  const ids = uniqueStrings(
+    collectDirectoryIds(Object.keys(params.groups ?? {}), params.normalizeId),
   );
   return toDirectoryEntries("group", applyDirectoryQueryAndLimit(ids, params));
 }
@@ -227,15 +188,9 @@ export function listDirectoryGroupEntriesFromMapKeysAndAllowFrom(params: {
   normalizeMapKeyId?: (entry: string) => string | null | undefined;
   normalizeAllowFromId?: (entry: string) => string | null | undefined;
 }): ChannelDirectoryEntry[] {
-  const ids = dedupeDirectoryIds([
-    ...collectDirectoryIdsFromMapKeys({
-      groups: params.groups,
-      normalizeId: params.normalizeMapKeyId,
-    }),
-    ...collectDirectoryIdsFromEntries({
-      entries: params.allowFrom,
-      normalizeId: params.normalizeAllowFromId,
-    }),
+  const ids = uniqueStrings([
+    ...collectDirectoryIds(Object.keys(params.groups ?? {}), params.normalizeMapKeyId),
+    ...collectDirectoryIds(params.allowFrom ?? [], params.normalizeAllowFromId),
   ]);
   return toDirectoryEntries("group", applyDirectoryQueryAndLimit(ids, params));
 }

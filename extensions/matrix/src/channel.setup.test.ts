@@ -1,4 +1,5 @@
-import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+// Matrix tests cover channel.setup plugin behavior.
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { RuntimeEnv } from "../runtime-api.js";
 
 const verificationMocks = vi.hoisted(() => ({
@@ -9,13 +10,12 @@ vi.mock("./matrix/actions/verification.js", () => ({
   bootstrapMatrixVerification: verificationMocks.bootstrapMatrixVerification,
 }));
 
-import { matrixPlugin } from "./channel.js";
+import { matrixSetupPlugin } from "./channel.setup.js";
+import { matrixConfigAdapter } from "./config-adapter.js";
+import { runMatrixSetupBootstrapAfterConfigWrite } from "./setup-bootstrap.js";
 import { matrixSetupAdapter } from "./setup-core.js";
-import { matrixSetupWizard } from "./setup-surface.js";
 import { installMatrixTestRuntime } from "./test-runtime.js";
 import type { CoreConfig } from "./types.js";
-
-let runMatrixSetupBootstrapAfterConfigWrite: typeof import("./setup-bootstrap.js").runMatrixSetupBootstrapAfterConfigWrite;
 
 describe("matrix setup post-write bootstrap", () => {
   const log = vi.fn();
@@ -101,32 +101,15 @@ describe("matrix setup post-write bootstrap", () => {
     values: Record<string, string | undefined>,
     run: () => Promise<T> | T,
   ) {
-    const previousEnv = Object.fromEntries(
-      Object.keys(values).map((key) => [key, process.env[key]]),
-    ) as Record<string, string | undefined>;
     for (const [key, value] of Object.entries(values)) {
-      if (value === undefined) {
-        delete process.env[key];
-      } else {
-        process.env[key] = value;
-      }
+      vi.stubEnv(key, value);
     }
     try {
       return await run();
     } finally {
-      for (const [key, value] of Object.entries(previousEnv)) {
-        if (value === undefined) {
-          delete process.env[key];
-        } else {
-          process.env[key] = value;
-        }
-      }
+      vi.unstubAllEnvs();
     }
   }
-
-  beforeAll(async () => {
-    ({ runMatrixSetupBootstrapAfterConfigWrite } = await import("./setup-bootstrap.js"));
-  });
 
   beforeEach(() => {
     verificationMocks.bootstrapMatrixVerification.mockReset();
@@ -136,9 +119,36 @@ describe("matrix setup post-write bootstrap", () => {
     installMatrixTestRuntime();
   });
 
-  it("registers the Matrix guided setup wizard on the channel plugin", () => {
-    expect(matrixPlugin.setupWizard).toBe(matrixSetupWizard);
-    expect(matrixPlugin.setupWizard?.channel).toBe("matrix");
+  it("exposes config-promotion declarations on the setup-only adapter", () => {
+    expect(matrixSetupAdapter.singleAccountKeysToMove).toEqual(
+      expect.arrayContaining(["homeserver", "accessToken", "deviceName", "rooms"]),
+    );
+    expect(matrixSetupAdapter.namedAccountPromotionKeys).toContain("homeserver");
+    expect(matrixSetupAdapter.resolveSingleAccountPromotionTarget).toBeTypeOf("function");
+  });
+
+  it.each([
+    { name: "empty", env: {}, configured: false },
+    {
+      name: "scoped account",
+      env: {
+        MATRIX_OPS_HOMESERVER: "https://matrix.example.org",
+        MATRIX_OPS_ACCESS_TOKEN: "scoped-token",
+      },
+      configured: true,
+    },
+  ])("uses the supplied $name environment for configured state", async ({ env, configured }) => {
+    await withSavedEnv(
+      { MATRIX_HOMESERVER: "https://ambient.example.org", MATRIX_ACCESS_TOKEN: "ambient-token" },
+      async () => {
+        await expect(
+          matrixSetupPlugin.config.hasConfiguredStateAsync!({
+            cfg: { channels: { matrix: {} } },
+            env,
+          }),
+        ).resolves.toBe(configured);
+      },
+    );
   });
 
   it("bootstraps verification for newly added encrypted accounts", async () => {
@@ -149,6 +159,7 @@ describe("matrix setup post-write bootstrap", () => {
 
     expect(verificationMocks.bootstrapMatrixVerification).toHaveBeenCalledWith({
       accountId: "default",
+      cfg: nextCfg,
     });
     expect(log).toHaveBeenCalledWith('Matrix verification bootstrap: complete for "default".');
     expect(log).toHaveBeenCalledWith('Matrix backup version for "default": 7');
@@ -188,6 +199,44 @@ describe("matrix setup post-write bootstrap", () => {
     expect(error).not.toHaveBeenCalled();
   });
 
+  it("bootstraps verification when setup enables encryption for an existing account", async () => {
+    const previousCfg = {
+      channels: {
+        matrix: {
+          homeserver: "https://matrix.example.org",
+          userId: "@flurry:example.org",
+          accessToken: "token",
+          encryption: false,
+        },
+      },
+    } as CoreConfig;
+    const nextCfg = {
+      channels: {
+        matrix: {
+          homeserver: "https://matrix.example.org",
+          userId: "@flurry:example.org",
+          accessToken: "token",
+          encryption: true,
+        },
+      },
+    } as CoreConfig;
+    mockBootstrapResult({ success: true, backupVersion: "8" });
+
+    await runAfterAccountConfigWritten({
+      previousCfg,
+      nextCfg,
+      accountId: "default",
+      input: {},
+    });
+
+    expect(verificationMocks.bootstrapMatrixVerification).toHaveBeenCalledWith({
+      accountId: "default",
+      cfg: nextCfg,
+    });
+    expect(log).toHaveBeenCalledWith('Matrix verification bootstrap: complete for "default".');
+    expect(log).toHaveBeenCalledWith('Matrix backup version for "default": 8');
+  });
+
   it("logs a warning when verification bootstrap fails", async () => {
     const { previousCfg, nextCfg, accountId, input } = applyDefaultAccountConfig();
     mockBootstrapResult({
@@ -218,6 +267,7 @@ describe("matrix setup post-write bootstrap", () => {
 
         expect(verificationMocks.bootstrapMatrixVerification).toHaveBeenCalledWith({
           accountId: "default",
+          cfg: nextCfg,
         });
         expect(log).toHaveBeenCalledWith('Matrix verification bootstrap: complete for "default".');
       },
@@ -249,7 +299,7 @@ describe("matrix setup post-write bootstrap", () => {
   });
 
   it("clears allowPrivateNetwork and proxy when deleting the default Matrix account config", () => {
-    const updated = matrixPlugin.config.deleteAccount?.({
+    const updated = matrixConfigAdapter.deleteAccount?.({
       cfg: {
         channels: {
           matrix: {

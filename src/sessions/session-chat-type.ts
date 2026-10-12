@@ -1,54 +1,36 @@
-import { iterateBootstrapChannelPlugins } from "../channels/plugins/bootstrap-registry.js";
-import { parseAgentSessionKey } from "./session-key-utils.js";
+import { getBootstrapChannelPlugin } from "../channels/plugins/bootstrap-registry.js";
+import {
+  deriveSessionChatTypeFromKey,
+  type SessionKeyChatType,
+} from "./session-chat-type-shared.js";
 
-export type SessionKeyChatType = "direct" | "group" | "channel" | "unknown";
-
-function deriveBuiltInLegacySessionChatType(
-  scopedSessionKey: string,
-): SessionKeyChatType | undefined {
-  if (/^group:[^:]+$/.test(scopedSessionKey)) {
-    return "group";
+// Session chat-type derivation first uses generic key parsing, then falls back
+// to bootstrap channel plugins for legacy platform-specific session keys.
+function collectLegacyChatTypeCandidatePluginIds(scopedSessionKey: string): string[] {
+  const ids = new Set<string>();
+  const firstToken = scopedSessionKey.split(":").find(Boolean);
+  if (firstToken) {
+    ids.add(firstToken);
   }
-  if (/^[0-9]+(?:-[0-9]+)*@g\.us$/.test(scopedSessionKey)) {
-    return "group";
+  // Historical WhatsApp group keys can be bare JIDs without a channel prefix.
+  if (scopedSessionKey.includes("@g.us")) {
+    ids.add("whatsapp");
   }
-  if (/^whatsapp:(?!.*:group:).+@g\.us$/.test(scopedSessionKey)) {
-    return "group";
-  }
-  if (/^discord:(?:[^:]+:)?guild-[^:]+:channel-[^:]+$/.test(scopedSessionKey)) {
-    return "channel";
-  }
-  return undefined;
+  return Array.from(ids);
 }
 
-/**
- * Best-effort chat-type extraction from session keys across canonical and legacy formats.
- */
 export function deriveSessionChatType(sessionKey: string | undefined | null): SessionKeyChatType {
-  const raw = (sessionKey ?? "").trim().toLowerCase();
-  if (!raw) {
-    return "unknown";
-  }
-  const scoped = parseAgentSessionKey(raw)?.rest ?? raw;
-  const tokens = new Set(scoped.split(":").filter(Boolean));
-  if (tokens.has("group")) {
-    return "group";
-  }
-  if (tokens.has("channel")) {
-    return "channel";
-  }
-  if (tokens.has("direct") || tokens.has("dm")) {
-    return "direct";
-  }
-  const builtInLegacy = deriveBuiltInLegacySessionChatType(scoped);
-  if (builtInLegacy) {
-    return builtInLegacy;
-  }
-  for (const plugin of iterateBootstrapChannelPlugins()) {
-    const derived = plugin.messaging?.deriveLegacySessionChatType?.(scoped);
-    if (derived) {
-      return derived;
-    }
-  }
-  return "unknown";
+  return deriveSessionChatTypeFromKey(sessionKey, [
+    (scopedSessionKey) => {
+      for (const pluginId of collectLegacyChatTypeCandidatePluginIds(scopedSessionKey)) {
+        const deriveLegacySessionChatType =
+          getBootstrapChannelPlugin(pluginId)?.messaging?.deriveLegacySessionChatType;
+        const derived = deriveLegacySessionChatType?.(scopedSessionKey);
+        if (derived) {
+          return derived;
+        }
+      }
+      return undefined;
+    },
+  ]);
 }

@@ -1,8 +1,17 @@
-import { describe, expect, it, vi } from "vitest";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
+import * as gatewayServiceLayout from "../daemon/service-layout.js";
+import type { GatewayServiceEnvArgs } from "../daemon/service-types.js";
 import type { GatewayService } from "../daemon/service.js";
-import type { GatewayServiceEnvArgs } from "../daemon/service.js";
 import { createMockGatewayService } from "../daemon/service.test-helpers.js";
+import { withEnvAsync } from "../test-utils/env.js";
 import { readServiceStatusSummary } from "./status.service-summary.js";
+import { getStatusOverviewRowValue } from "./status.test-support.ts";
+
+const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 
 function createService(overrides: Partial<GatewayService>): GatewayService {
   return createMockGatewayService({
@@ -14,22 +23,92 @@ function createService(overrides: Partial<GatewayService>): GatewayService {
 }
 
 describe("readServiceStatusSummary", () => {
-  it("marks OpenClaw-managed services as installed", async () => {
+  it.each([
+    { serviceVersion: "2026.9.4" },
+    { serviceVersion: "2026.9.4", refusal: "Nix mode detected", nix: true },
+    { serviceVersion: "2026.9.4", refusal: "managed by an external supervisor", external: true },
+  ])(
+    "reports installation facts with usable guidance ($serviceVersion, $refusal)",
+    async ({ serviceVersion, refusal, nix, external }) => {
+      const root = await fs.realpath(tempDirs.make("openclaw-status-prefix-drift-"));
+      const serviceRoot = path.join(root, "prefix-a", "lib", "node_modules", "openclaw");
+      const activeRoot = path.join(root, "prefix-b", "lib", "node_modules", "openclaw");
+      for (const [packageRoot, version] of [
+        [serviceRoot, serviceVersion],
+        [activeRoot, "2026.9.17"],
+      ] as const) {
+        await fs.mkdir(path.join(packageRoot, "dist"), { recursive: true });
+        await fs.writeFile(
+          path.join(packageRoot, "package.json"),
+          JSON.stringify({ name: "openclaw", version }),
+        );
+        await fs.writeFile(path.join(packageRoot, "dist", "index.js"), "export {};\n");
+      }
+      const service = createService({
+        isLoaded: vi.fn(async () => true),
+        readCommand: vi.fn(async () => ({
+          programArguments: [
+            process.execPath,
+            path.join(serviceRoot, "dist", "index.js"),
+            "gateway",
+          ],
+        })),
+        readRuntime: vi.fn(async () => ({ status: "running" })),
+      });
+      const accountHome = os.userInfo().homedir;
+      const summary = await withEnvAsync(
+        {
+          HOME: accountHome,
+          USERPROFILE: accountHome,
+          OPENCLAW_HOME: undefined,
+          OPENCLAW_STATE_DIR: undefined,
+          OPENCLAW_CONFIG_PATH: undefined,
+          OPENCLAW_PROFILE: undefined,
+          OPENCLAW_CONTAINER_HINT: undefined,
+          OPENCLAW_NIX_MODE: nix ? "1" : undefined,
+          OPENCLAW_SUPERVISOR_MODE: external ? "external" : undefined,
+          OPENCLAW_LAUNCHD_LABEL: undefined,
+          OPENCLAW_SYSTEMD_UNIT: undefined,
+          OPENCLAW_WINDOWS_TASK_NAME: undefined,
+        },
+        () => readServiceStatusSummary(service, "Daemon", undefined, activeRoot),
+      );
+      const output = getStatusOverviewRowValue("Gateway service", {
+        gatewayService: summary,
+        gatewayReachable: false,
+        gatewayProbe: { error: "protocol mismatch" },
+        gatewaySelf: null,
+      });
+      expect(output).toContain(`${serviceRoot} (${serviceVersion})`);
+      expect(output).toContain(`${activeRoot} (2026.9.17)`);
+      expect(typeof summary.installationDrift).toBe("string");
+      if (refusal) {
+        expect(output).toContain(refusal);
+        expect(output).not.toContain("openclaw doctor --fix");
+        expect(output).not.toContain("openclaw gateway install --force");
+      } else {
+        expect(output).toContain("openclaw doctor --fix");
+        expect(output).toContain("openclaw gateway install --force");
+      }
+
+      const alias = path.join(root, "active-package");
+      await fs.symlink(serviceRoot, alias, "dir");
+      const aligned = await readServiceStatusSummary(service, "Daemon", undefined, alias);
+      expect(aligned.installationDrift).toBeUndefined();
+      expect(
+        getStatusOverviewRowValue("Gateway service", { gatewayService: aligned }),
+      ).not.toContain("different OpenClaw install");
+    },
+  );
+  it.each(["system"] as const)("labels the observed %s manager", async (scope) => {
     const summary = await readServiceStatusSummary(
       createService({
-        isLoaded: vi.fn(async () => true),
-        readCommand: vi.fn(async () => ({ programArguments: ["openclaw", "gateway", "run"] })),
-        readRuntime: vi.fn(async () => ({ status: "running" })),
+        readRuntime: vi.fn(async () => ({ status: "running", systemd: { scope } })),
       }),
       "Daemon",
     );
-
-    expect(summary.installed).toBe(true);
-    expect(summary.managedByOpenClaw).toBe(true);
-    expect(summary.externallyManaged).toBe(false);
-    expect(summary.loadedText).toBe("enabled");
+    expect(summary.label).toBe(`systemd ${scope}`);
   });
-
   it("marks running unmanaged services as externally managed", async () => {
     const summary = await readServiceStatusSummary(
       createService({
@@ -44,13 +123,102 @@ describe("readServiceStatusSummary", () => {
     expect(summary.loadedText).toBe("running (externally managed)");
   });
 
-  it("keeps missing services as not installed when nothing is running", async () => {
-    const summary = await readServiceStatusSummary(createService({}), "Daemon");
+  it.each([{ status: "unknown", missingUnit: true }])(
+    "keeps missing services as not installed with runtime $status",
+    async (runtime) => {
+      const summary = await readServiceStatusSummary(
+        createService({ readRuntime: vi.fn(async () => runtime) }),
+        "Daemon",
+      );
 
-    expect(summary.installed).toBe(false);
-    expect(summary.managedByOpenClaw).toBe(false);
-    expect(summary.externallyManaged).toBe(false);
-    expect(summary.loadedText).toBe("disabled");
+      expect(summary.installed).toBe(false);
+      expect(summary.managedByOpenClaw).toBe(false);
+      expect(summary.externallyManaged).toBe(false);
+      expect(summary.loadedText).toBe("disabled");
+      expect(getStatusOverviewRowValue("Gateway service", { gatewayService: summary })).toBe(
+        "systemd not installed",
+      );
+    },
+  );
+
+  it.each(["load", "runtime", "runtime with missing unit"])(
+    "reports %s inspection failures without a readable definition",
+    async (probe) => {
+      const failInspection = vi.fn(async () => {
+        throw new Error("service manager permission denied");
+      });
+      const summary = await readServiceStatusSummary(
+        createService(
+          probe === "load"
+            ? { isLoaded: failInspection }
+            : {
+                readRuntime:
+                  probe === "runtime"
+                    ? failInspection
+                    : vi.fn(async () => ({
+                        status: "unknown",
+                        detail: "Error: service manager permission denied",
+                        missingUnit: true,
+                      })),
+              },
+        ),
+        "Daemon",
+      );
+
+      expect(summary.installed).toBe(false);
+      expect(summary.loadState).toEqual(
+        probe === "load"
+          ? {
+              status: "unknown",
+              detail: "Error: service manager permission denied",
+            }
+          : { status: "not-loaded" },
+      );
+      expect(getStatusOverviewRowValue("Gateway service", { gatewayService: summary })).toBe(
+        probe === "load"
+          ? "systemd unknown (inspection failed: Error: service manager permission denied) · stopped"
+          : probe === "runtime"
+            ? "systemd disabled (inspection failed: service runtime inspection failed) · unknown"
+            : "systemd disabled (inspection failed: Error: service manager permission denied) · unknown",
+      );
+      if (probe === "runtime") {
+        expect(summary.runtime?.inspectionFailure).toEqual({
+          code: "service-runtime-inspection-failed",
+          detail: "service manager permission denied",
+        });
+      }
+    },
+  );
+
+  it("preserves running service state when optional layout diagnostics fail", async () => {
+    const layoutSpy = vi
+      .spyOn(gatewayServiceLayout, "summarizeGatewayServiceLayout")
+      .mockRejectedValueOnce(new Error("package metadata is unreadable"));
+
+    try {
+      const summary = await readServiceStatusSummary(
+        createService({
+          isLoaded: vi.fn(async () => true),
+          readCommand: vi.fn(async () => ({ programArguments: ["openclaw", "gateway", "run"] })),
+          readRuntime: vi.fn(async () => ({ status: "running", pid: 1234 })),
+        }),
+        "Daemon",
+      );
+
+      expect(layoutSpy).toHaveBeenCalledOnce();
+      expect(summary).toMatchObject({
+        label: "systemd",
+        installed: true,
+        loadState: { status: "loaded" },
+        managedByOpenClaw: true,
+        externallyManaged: false,
+        loadedText: "enabled",
+        runtime: { status: "running", pid: 1234 },
+      });
+      expect(summary.layout).toBeUndefined();
+    } finally {
+      layoutSpy.mockRestore();
+    }
   });
 
   it("passes command environment to runtime and loaded checks", async () => {
@@ -73,20 +241,12 @@ describe("readServiceStatusSummary", () => {
       "Daemon",
     );
 
-    expect(isLoaded).toHaveBeenCalledWith(
-      expect.objectContaining({
-        env: expect.objectContaining({
-          OPENCLAW_GATEWAY_PORT: "18789",
-        }),
-      }),
-    );
-    expect(readRuntime).toHaveBeenCalledWith(
-      expect.objectContaining({
-        OPENCLAW_GATEWAY_PORT: "18789",
-      }),
-    );
+    const loadedArgs = isLoaded.mock.calls[0]?.[0];
+    expect(loadedArgs?.env?.OPENCLAW_GATEWAY_PORT).toBe("18789");
+    const runtimeEnv = readRuntime.mock.calls[0]?.[0];
+    expect(runtimeEnv?.OPENCLAW_GATEWAY_PORT).toBe("18789");
     expect(summary.installed).toBe(true);
-    expect(summary.loaded).toBe(true);
-    expect(summary.runtime).toMatchObject({ status: "running" });
+    expect(summary.loadState).toEqual({ status: "loaded" });
+    expect(summary.runtime?.status).toBe("running");
   });
 });

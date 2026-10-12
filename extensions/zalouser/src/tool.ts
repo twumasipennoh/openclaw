@@ -1,33 +1,25 @@
-import { Type } from "@sinclair/typebox";
-import type { AnyAgentTool, OpenClawPluginToolContext } from "../runtime-api.js";
-import { sendImageZalouser, sendLinkZalouser, sendMessageZalouser } from "./send.js";
+import { resolveChannelMediaMaxBytes } from "openclaw/plugin-sdk/account-helpers";
+import { stringEnum } from "openclaw/plugin-sdk/channel-actions";
+import type { AnyAgentTool, OpenClawPluginToolContext } from "openclaw/plugin-sdk/core";
+import { formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";
+import { jsonResult as json, type AgentToolResult } from "openclaw/plugin-sdk/tool-results";
+import { Type, type Static } from "typebox";
+import { resolveZalouserAccountSync } from "./accounts.js";
+import { sendImageZalouser, sendMessageZalouser } from "./send.js";
 import { parseZalouserOutboundTarget } from "./session-route.js";
+import { normalizeZalouserCredentialProfile } from "./session-state.js";
+import type { ZalouserConfig } from "./types.js";
 import {
   checkZaloAuthenticated,
   getZaloUserInfo,
   listZaloFriendsMatching,
   listZaloGroupsMatching,
+  sendZaloLink,
 } from "./zalo-js.js";
 
 const ACTIONS = ["send", "image", "link", "friends", "groups", "me", "status"] as const;
 
-type AgentToolResult = {
-  content: Array<{ type: "text"; text: string }>;
-  details: unknown;
-};
-
-function stringEnum<T extends readonly string[]>(
-  values: T,
-  options: { description?: string } = {},
-) {
-  return Type.Unsafe<T[number]>({
-    type: "string",
-    enum: [...values],
-    ...options,
-  });
-}
-
-export const ZalouserToolSchema = Type.Object(
+const ZalouserToolSchema = Type.Object(
   {
     action: stringEnum(ACTIONS, { description: `Action to perform: ${ACTIONS.join(", ")}` }),
     threadId: Type.Optional(Type.String({ description: "Thread ID for messaging" })),
@@ -40,23 +32,31 @@ export const ZalouserToolSchema = Type.Object(
   { additionalProperties: false },
 );
 
-type ToolParams = {
-  action: (typeof ACTIONS)[number];
-  threadId?: string;
-  message?: string;
-  isGroup?: boolean;
-  profile?: string;
-  query?: string;
-  url?: string;
-};
+type ToolParams = Static<typeof ZalouserToolSchema>;
 
-type ZalouserToolContext = Pick<OpenClawPluginToolContext, "deliveryContext">;
+type ZalouserToolContext = Pick<
+  OpenClawPluginToolContext,
+  "deliveryContext" | "config" | "runtimeConfig" | "getRuntimeConfig"
+>;
 
-function json(payload: unknown): AgentToolResult {
-  return {
-    content: [{ type: "text", text: JSON.stringify(payload, null, 2) }],
-    details: payload,
-  };
+function resolveToolMediaMaxBytes(profile: string | undefined, context?: ZalouserToolContext) {
+  const cfg = context?.getRuntimeConfig?.() ?? context?.runtimeConfig ?? context?.config ?? {};
+  const route = context?.deliveryContext;
+  if (route?.channel === "zalouser" && route.accountId) {
+    const account = resolveZalouserAccountSync({ cfg, accountId: route.accountId });
+    // Profiles are credentials, not account IDs; only the actual route can select an account cap.
+    if (
+      normalizeZalouserCredentialProfile(account.profile) ===
+      normalizeZalouserCredentialProfile(profile)
+    ) {
+      return account.mediaMaxBytes;
+    }
+  }
+  return resolveChannelMediaMaxBytes({
+    cfg,
+    // SAFETY: The plugin schema validates this open-world channel config section.
+    resolveChannelLimitMb: () => (cfg.channels?.zalouser as ZalouserConfig | undefined)?.mediaMaxMb,
+  });
 }
 
 function resolveAmbientZalouserTarget(context?: ZalouserToolContext): {
@@ -98,13 +98,11 @@ function resolveZalouserSendTarget(params: ToolParams, context?: ZalouserToolCon
   };
 }
 
-export async function executeZalouserTool(
-  _toolCallId: string,
+async function executeZalouserTool(
   params: ToolParams,
-  _signal?: AbortSignal,
-  _onUpdate?: unknown,
+  signal?: AbortSignal,
   context?: ZalouserToolContext,
-): Promise<AgentToolResult> {
+): Promise<AgentToolResult<unknown>> {
   try {
     switch (params.action) {
       case "send": {
@@ -113,6 +111,7 @@ export async function executeZalouserTool(
           throw new Error("threadId and message required for send action");
         }
         const result = await sendMessageZalouser(target.threadId, params.message, {
+          signal,
           profile: params.profile,
           isGroup: target.isGroup,
         });
@@ -131,7 +130,9 @@ export async function executeZalouserTool(
           throw new Error("url required for image action");
         }
         const result = await sendImageZalouser(target.threadId, params.url, {
+          signal,
           profile: params.profile,
+          mediaMaxBytes: resolveToolMediaMaxBytes(params.profile, context),
           caption: params.message,
           isGroup: target.isGroup,
         });
@@ -146,7 +147,8 @@ export async function executeZalouserTool(
         if (!target.threadId || !params.url) {
           throw new Error("threadId and url required for link action");
         }
-        const result = await sendLinkZalouser(target.threadId, params.url, {
+        const result = await sendZaloLink(target.threadId, params.url, {
+          signal,
           profile: params.profile,
           caption: params.message,
           isGroup: target.isGroup,
@@ -189,7 +191,7 @@ export async function executeZalouserTool(
     }
   } catch (err) {
     return json({
-      error: err instanceof Error ? err.message : String(err),
+      error: formatErrorMessage(err),
     });
   }
 }
@@ -203,7 +205,7 @@ export function createZalouserTool(context?: ZalouserToolContext): AnyAgentTool 
       "Actions: send (text message), image (send image URL), link (send link), " +
       "friends (list/search friends), groups (list groups), me (profile info), status (auth check).",
     parameters: ZalouserToolSchema,
-    execute: async (toolCallId, params, signal, onUpdate) =>
-      await executeZalouserTool(toolCallId, params as ToolParams, signal, onUpdate, context),
+    execute: async (_toolCallId, params, signal) =>
+      await executeZalouserTool(params as ToolParams, signal, context),
   } satisfies AnyAgentTool;
 }

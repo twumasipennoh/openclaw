@@ -1,105 +1,65 @@
-import type {
-  ChannelDoctorConfigMutation,
-  ChannelDoctorLegacyConfigRule,
-} from "openclaw/plugin-sdk/channel-contract";
-import type { OpenClawConfig } from "openclaw/plugin-sdk/config-runtime";
+import type { ChannelDoctorConfigMutation } from "openclaw/plugin-sdk/channel-contract";
+import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import {
-  hasLegacyFlatAllowPrivateNetworkAlias,
-  migrateLegacyFlatAllowPrivateNetworkAlias,
-} from "openclaw/plugin-sdk/ssrf-runtime";
+  createLegacyWebhookListenerDoctorContract,
+  defineChannelAliasMigration,
+} from "openclaw/plugin-sdk/runtime-doctor-migrations";
+import {
+  hasConfiguredNextcloudTalkChannelState,
+  listNextcloudTalkAccountIds,
+  mergeNextcloudTalkAccountConfig,
+} from "../configured-state.js";
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
-}
+const webhookContract = createLegacyWebhookListenerDoctorContract({
+  channelKey: "nextcloud-talk",
+  defaultHost: "0.0.0.0",
+  defaultPort: 8788,
+});
+export const { historicalWebhookListener } = webhookContract;
 
-function hasLegacyAllowPrivateNetworkInAccounts(value: unknown): boolean {
-  const accounts = isRecord(value) ? value : null;
-  return Boolean(
-    accounts &&
-    Object.values(accounts).some((account) =>
-      hasLegacyFlatAllowPrivateNetworkAlias(isRecord(account) ? account : {}),
-    ),
-  );
-}
+// Nextcloud Talk's nested streaming schema is delivery-only ({chunkMode,
+// block}); it has no preview mode, so only the delivery flat aliases are
+// legal legacy input. Account merge replaces the root streaming object
+// wholesale (resolveMergedAccountConfig without a streaming deep-merge), so
+// migration seeds materialized account objects with inherited root settings.
+const streamingAliasMigration = defineChannelAliasMigration({
+  channelId: "nextcloud-talk",
+  streaming: { defaultMode: "partial", deliveryOnly: true },
+  accountStreamingReplacesRoot: true,
+});
 
-export const legacyConfigRules: ChannelDoctorLegacyConfigRule[] = [
-  {
-    path: ["channels", "nextcloud-talk"],
-    message:
-      'channels.nextcloud-talk.allowPrivateNetwork is legacy; use channels.nextcloud-talk.network.dangerouslyAllowPrivateNetwork instead. Run "openclaw doctor --fix".',
-    match: (value) => hasLegacyFlatAllowPrivateNetworkAlias(isRecord(value) ? value : {}),
-  },
-  {
-    path: ["channels", "nextcloud-talk", "accounts"],
-    message:
-      'channels.nextcloud-talk.accounts.<id>.allowPrivateNetwork is legacy; use channels.nextcloud-talk.accounts.<id>.network.dangerouslyAllowPrivateNetwork instead. Run "openclaw doctor --fix".',
-    match: hasLegacyAllowPrivateNetworkInAccounts,
-  },
+export const legacyConfigRules = [
+  ...webhookContract.legacyConfigRules,
+  ...streamingAliasMigration.legacyConfigRules,
 ];
+
+export function normalizeHistoricalWebhookConfig({
+  cfg,
+}: {
+  cfg: OpenClawConfig;
+}): ChannelDoctorConfigMutation {
+  const webhook = webhookContract.normalizeCompatibilityConfig({ cfg });
+  return {
+    ...webhook,
+    historicalWebhookAccountIds: !hasConfiguredNextcloudTalkChannelState({ cfg })
+      ? []
+      : listNextcloudTalkAccountIds(cfg).filter(
+          (accountId) => mergeNextcloudTalkAccountConfig(cfg, accountId).enabled !== false,
+        ),
+  };
+}
 
 export function normalizeCompatibilityConfig({
   cfg,
 }: {
   cfg: OpenClawConfig;
 }): ChannelDoctorConfigMutation {
-  const channels = isRecord(cfg.channels) ? cfg.channels : null;
-  const nextcloudTalk = isRecord(channels?.["nextcloud-talk"]) ? channels["nextcloud-talk"] : null;
-  if (!nextcloudTalk) {
-    return { config: cfg, changes: [] };
-  }
-
-  const changes: string[] = [];
-  let updatedNextcloudTalk = nextcloudTalk;
-  let changed = false;
-
-  const topLevel = migrateLegacyFlatAllowPrivateNetworkAlias({
-    entry: updatedNextcloudTalk,
-    pathPrefix: "channels.nextcloud-talk",
-    changes,
-  });
-  updatedNextcloudTalk = topLevel.entry;
-  changed = changed || topLevel.changed;
-
-  const accounts = isRecord(updatedNextcloudTalk.accounts) ? updatedNextcloudTalk.accounts : null;
-  if (accounts) {
-    let accountsChanged = false;
-    const nextAccounts: Record<string, unknown> = { ...accounts };
-    for (const [accountId, accountValue] of Object.entries(accounts)) {
-      const account = isRecord(accountValue) ? accountValue : null;
-      if (!account) {
-        continue;
-      }
-      const migrated = migrateLegacyFlatAllowPrivateNetworkAlias({
-        entry: account,
-        pathPrefix: `channels.nextcloud-talk.accounts.${accountId}`,
-        changes,
-      });
-      if (!migrated.changed) {
-        continue;
-      }
-      nextAccounts[accountId] = migrated.entry;
-      accountsChanged = true;
-    }
-    if (accountsChanged) {
-      updatedNextcloudTalk = { ...updatedNextcloudTalk, accounts: nextAccounts };
-      changed = true;
-    }
-  }
-
-  if (!changed) {
-    return { config: cfg, changes: [] };
-  }
-
+  const webhook = normalizeHistoricalWebhookConfig({ cfg });
   return {
-    config: {
-      ...cfg,
-      channels: {
-        ...cfg.channels,
-        "nextcloud-talk": updatedNextcloudTalk as NonNullable<
-          OpenClawConfig["channels"]
-        >["nextcloud-talk"],
-      },
-    },
-    changes,
+    ...streamingAliasMigration.normalizeChannelConfig({
+      cfg: webhook.config,
+      changes: webhook.changes,
+    }),
+    historicalWebhookAccountIds: webhook.historicalWebhookAccountIds,
   };
 }

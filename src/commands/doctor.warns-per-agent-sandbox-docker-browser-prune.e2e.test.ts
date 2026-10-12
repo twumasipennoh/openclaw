@@ -1,3 +1,4 @@
+// Doctor sandbox browser prune e2e tests cover per-agent stale browser artifacts and warning output.
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -10,8 +11,18 @@ let doctorCommand: typeof import("./doctor.js").doctorCommand;
 
 describe("doctor command", () => {
   beforeEach(async () => {
+    vi.doMock("./doctor-sandbox.js", async (importOriginal) => {
+      const actual = await importOriginal<typeof import("./doctor-sandbox.js")>();
+      return {
+        ...actual,
+        maybeRepairSandboxImages: async (
+          cfg: Parameters<typeof actual.maybeRepairSandboxImages>[0],
+        ) => cfg,
+        maybeRepairSandboxRegistryFiles: async () => {},
+      };
+    });
     doctorCommand = await loadDoctorCommandForTest({
-      unmockModules: ["./doctor-sandbox.js"],
+      unmockModules: ["../flows/doctor-health-contributions.js"],
     });
   });
 
@@ -25,9 +36,8 @@ describe("doctor command", () => {
               scope: "shared",
             },
           },
-          list: [
-            {
-              id: "work",
+          entries: {
+            work: {
               workspace: "~/openclaw-work",
               sandbox: {
                 mode: "all",
@@ -37,25 +47,24 @@ describe("doctor command", () => {
                 },
               },
             },
-          ],
+          },
         },
       },
     });
 
     await doctorCommand(createDoctorRuntime(), { nonInteractive: true });
 
-    expect(
-      terminalNoteMock.mock.calls.some(([message, title]) => {
-        if (title !== "Sandbox" || typeof message !== "string") {
-          return false;
-        }
-        const normalized = message.replace(/\s+/g, " ").trim();
-        return (
-          normalized.includes('agents.list (id "work") sandbox docker') &&
-          normalized.includes('scope resolves to "shared"')
-        );
-      }),
-    ).toBe(true);
+    const matchingSandboxNotes = terminalNoteMock.mock.calls.filter(([message, title]) => {
+      if (title !== "Sandbox" || typeof message !== "string") {
+        return false;
+      }
+      const normalized = message.replace(/\s+/g, " ").trim();
+      return (
+        normalized.includes("agents.entries.work sandbox docker") &&
+        normalized.includes('scope resolves to "shared"')
+      );
+    });
+    expect(matchingSandboxNotes.length).toBeGreaterThan(0);
   }, 30_000);
 
   it("does not warn when only the active workspace is present", async () => {
@@ -82,9 +91,8 @@ describe("doctor command", () => {
 
     await doctorCommand(createDoctorRuntime(), { nonInteractive: true });
 
-    expect(terminalNoteMock.mock.calls.some(([_, title]) => title === "Extra workspace")).toBe(
-      false,
-    );
+    const noteTitles = terminalNoteMock.mock.calls.map(([, title]) => title);
+    expect(noteTitles).not.toContain("Extra workspace");
 
     homedirSpy.mockRestore();
     existsSpy.mockRestore();

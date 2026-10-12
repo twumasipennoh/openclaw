@@ -1,31 +1,9 @@
+import { parseDateStringTimestampMs } from "openclaw/plugin-sdk/number-runtime";
+import { normalizeLowercaseStringOrEmpty } from "openclaw/plugin-sdk/string-coerce-runtime";
 import type {
   MSTeamsConversationStoreEntry,
   StoredConversationReference,
 } from "./conversation-store.js";
-
-export function normalizeStoredConversationId(raw: string): string {
-  return raw.split(";")[0] ?? raw;
-}
-
-export function parseStoredConversationTimestamp(value: string | undefined): number | null {
-  if (!value) {
-    return null;
-  }
-  const parsed = Date.parse(value);
-  if (!Number.isFinite(parsed)) {
-    return null;
-  }
-  return parsed;
-}
-
-export function toConversationStoreEntries(
-  entries: Iterable<[string, StoredConversationReference]>,
-): MSTeamsConversationStoreEntry[] {
-  return Array.from(entries, ([conversationId, reference]) => ({
-    conversationId,
-    reference,
-  }));
-}
 
 export function mergeStoredConversationReference(
   existing: StoredConversationReference | undefined,
@@ -33,9 +11,15 @@ export function mergeStoredConversationReference(
   nowIso: string,
 ): StoredConversationReference {
   return {
-    // Preserve fields from previous entry that may not be present on every activity
-    // (e.g. timezone is only sent when clientInfo entity is available).
+    // Preserve fields from the previous entry that may not be present on every
+    // inbound activity. Without this, sparse activities (e.g. conversationUpdate,
+    // reactions) would clear previously captured values. Some fields are only
+    // populated opportunistically, such as timezone from clientInfo entities.
     ...(existing?.timezone && !incoming.timezone ? { timezone: existing.timezone } : {}),
+    ...(existing?.tenantId && !incoming.tenantId ? { tenantId: existing.tenantId } : {}),
+    ...(existing?.aadObjectId && !incoming.aadObjectId
+      ? { aadObjectId: existing.aadObjectId }
+      : {}),
     ...incoming,
     lastSeenAt: nowIso,
   };
@@ -50,30 +34,33 @@ export function findPreferredDmConversationByUserId(
     return null;
   }
 
-  const matches: MSTeamsConversationStoreEntry[] = [];
+  // Shared conversations carry the sender's aadObjectId too; never return one
+  // for a user-targeted DM. Confirmed personal DMs outrank legacy unknown types.
+  let preferred: MSTeamsConversationStoreEntry | null = null;
+  let preferredIsPersonal = false;
+  let preferredTimestamp = 0;
   for (const entry of entries) {
-    if (entry.reference.user?.aadObjectId === target || entry.reference.user?.id === target) {
-      matches.push(entry);
+    if (entry.reference.user?.aadObjectId !== target && entry.reference.user?.id !== target) {
+      continue;
     }
-  }
-
-  if (matches.length === 0) {
-    return null;
-  }
-
-  matches.sort((a, b) => {
-    const aType = a.reference.conversation?.conversationType?.toLowerCase() ?? "";
-    const bType = b.reference.conversation?.conversationType?.toLowerCase() ?? "";
-    const aPersonal = aType === "personal" ? 1 : 0;
-    const bPersonal = bType === "personal" ? 1 : 0;
-    if (aPersonal !== bPersonal) {
-      return bPersonal - aPersonal;
-    }
-    return (
-      (parseStoredConversationTimestamp(b.reference.lastSeenAt) ?? 0) -
-      (parseStoredConversationTimestamp(a.reference.lastSeenAt) ?? 0)
+    const convType = normalizeLowercaseStringOrEmpty(
+      entry.reference.conversation?.conversationType ?? "",
     );
-  });
+    if (convType === "channel" || convType === "groupchat") {
+      continue;
+    }
+    const isPersonal = convType === "personal";
+    const timestamp = parseDateStringTimestampMs(entry.reference.lastSeenAt) ?? 0;
+    if (
+      !preferred ||
+      (isPersonal && !preferredIsPersonal) ||
+      (isPersonal === preferredIsPersonal && timestamp > preferredTimestamp)
+    ) {
+      preferred = entry;
+      preferredIsPersonal = isPersonal;
+      preferredTimestamp = timestamp;
+    }
+  }
 
-  return matches[0] ?? null;
+  return preferred;
 }

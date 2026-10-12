@@ -1,104 +1,166 @@
-export type DraftStreamLoop = {
-  update: (text: string) => void;
+import { resolveTimerTimeoutMs } from "@openclaw/normalization-core/number-coercion";
+
+/** Throttled draft-stream sender used by channels that edit in-progress replies. */
+export type DraftStreamLoop<T = string> = {
+  update: (value: T) => void;
   flush: () => Promise<void>;
   stop: () => void;
   resetPending: () => void;
   resetThrottleWindow: () => void;
   waitForInFlight: () => Promise<void>;
+  /** Removes queued (not in-flight) text atomically and cancels its scheduled flush. */
+  takePending?: () => T;
 };
 
-export function createDraftStreamLoop(params: {
+type CreatedDraftStreamLoop<T> = DraftStreamLoop<T> & {
+  takePending: () => T;
+};
+
+export function createDraftStreamLoop<T = string>(params: {
   throttleMs: number;
+  /** Keep background updates arriving during a send in the next throttle window. */
+  coalesceInFlight?: boolean;
   isStopped: () => boolean;
-  sendOrEditStreamMessage: (text: string) => Promise<void | boolean>;
-}): DraftStreamLoop {
+  sendOrEditStreamMessage: (value: T) => Promise<void | boolean>;
+  /** Empty sentinel and predicate for non-string payloads. */
+  emptyValue?: T;
+  isEmpty?: (value: T) => boolean;
+  onBackgroundFlushError?: (err: unknown) => void;
+}): CreatedDraftStreamLoop<T> {
+  const throttleMs = resolveTimerTimeoutMs(params.throttleMs, 0, 0);
+  const emptyValue = params.emptyValue ?? ("" as T);
+  const isEmpty =
+    params.isEmpty ?? ((value: T) => typeof value === "string" && value.trim().length === 0);
+  // String callers historically treated only "" as absent between sends,
+  // while trim-empty text is discarded at the top of the next flush.
+  const hasPendingValue = (value: T) =>
+    typeof value === "string" ? value.length > 0 : !isEmpty(value);
   let lastSentAt = 0;
-  let pendingText = "";
+  let pendingValue = emptyValue;
   let inFlightPromise: Promise<void | boolean> | undefined;
   let timer: ReturnType<typeof setTimeout> | undefined;
 
-  const flush = async () => {
+  const clearTimer = () => {
     if (timer) {
       clearTimeout(timer);
       timer = undefined;
     }
+  };
+
+  const retainUnsentValue = (value: T, background: boolean) => {
+    if (!hasPendingValue(pendingValue)) {
+      pendingValue = value;
+    } else if (background && params.coalesceInFlight) {
+      // Only newer work owns another attempt; never retry the failed/rejected value.
+      schedule();
+    }
+  };
+
+  const flush = async (background = false) => {
+    clearTimer();
     while (!params.isStopped()) {
       if (inFlightPromise) {
         await inFlightPromise;
+        if (background && params.coalesceInFlight) {
+          return;
+        }
         continue;
       }
-      const text = pendingText;
-      if (!text.trim()) {
-        pendingText = "";
+      const value = pendingValue;
+      if (isEmpty(value)) {
+        pendingValue = emptyValue;
         return;
       }
-      pendingText = "";
-      const current = params.sendOrEditStreamMessage(text).finally(() => {
-        if (inFlightPromise === current) {
-          inFlightPromise = undefined;
-        }
-      });
-      inFlightPromise = current;
-      const sent = await current;
+      pendingValue = emptyValue;
+      let current: Promise<void | boolean> | undefined;
+      let sent: void | boolean;
+      try {
+        current = Promise.resolve(params.sendOrEditStreamMessage(value)).finally(() => {
+          if (inFlightPromise === current) {
+            inFlightPromise = undefined;
+          }
+        });
+        inFlightPromise = current;
+        sent = await current;
+      } catch (err) {
+        retainUnsentValue(value, background);
+        throw err;
+      }
       if (sent === false) {
-        pendingText = text;
+        retainUnsentValue(value, background);
         return;
       }
       lastSentAt = Date.now();
-      if (!pendingText) {
+      if (!hasPendingValue(pendingValue)) {
+        return;
+      }
+      if (background && params.coalesceInFlight) {
+        schedule();
         return;
       }
     }
+  };
+
+  const startBackgroundFlush = () => {
+    void flush(true).catch((err: unknown) => {
+      try {
+        params.onBackgroundFlushError?.(err);
+      } catch {
+        // Error reporting must not recreate the unhandled background rejection path.
+      }
+    });
   };
 
   const schedule = () => {
     if (timer) {
       return;
     }
-    const delay = Math.max(0, params.throttleMs - (Date.now() - lastSentAt));
+    const delay = Math.max(0, throttleMs - (Date.now() - lastSentAt));
     timer = setTimeout(() => {
-      void flush();
+      startBackgroundFlush();
     }, delay);
   };
 
   return {
-    update: (text: string) => {
+    update: (value: T) => {
       if (params.isStopped()) {
         return;
       }
-      pendingText = text;
+      pendingValue = value;
       if (inFlightPromise) {
-        schedule();
+        if (!params.coalesceInFlight) {
+          schedule();
+        }
         return;
       }
-      if (!timer && Date.now() - lastSentAt >= params.throttleMs) {
-        void flush();
+      if (!timer && Date.now() - lastSentAt >= throttleMs) {
+        startBackgroundFlush();
         return;
       }
       schedule();
     },
-    flush,
+    flush: () => flush(),
     stop: () => {
-      pendingText = "";
-      if (timer) {
-        clearTimeout(timer);
-        timer = undefined;
-      }
+      pendingValue = emptyValue;
+      clearTimer();
     },
     resetPending: () => {
-      pendingText = "";
+      pendingValue = emptyValue;
     },
     resetThrottleWindow: () => {
       lastSentAt = 0;
-      if (timer) {
-        clearTimeout(timer);
-        timer = undefined;
-      }
+      clearTimer();
     },
     waitForInFlight: async () => {
       if (inFlightPromise) {
         await inFlightPromise;
       }
+    },
+    takePending: () => {
+      const value = pendingValue;
+      pendingValue = emptyValue;
+      clearTimer();
+      return value;
     },
   };
 }

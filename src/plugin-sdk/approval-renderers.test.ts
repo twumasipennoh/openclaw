@@ -1,50 +1,130 @@
+/**
+ * Tests approval renderer payload and text formatting.
+ */
 import { describe, expect, it } from "vitest";
 import {
   buildApprovalPendingReplyPayload,
   buildApprovalResolvedReplyPayload,
   buildPluginApprovalPendingReplyPayload,
   buildPluginApprovalResolvedReplyPayload,
+  buildTypedApprovalPendingReplyPayload,
+  buildTypedPluginApprovalPendingReplyPayload,
 } from "./approval-renderers.js";
 
+const buttonLabels = {
+  "allow-once": { label: "Allow Once", style: "success" },
+  "allow-always": { label: "Allow Always", style: "primary" },
+  deny: { label: "Deny", style: "danger" },
+};
+
+function pluginPresentation(
+  approvalId: string,
+  decisions: Array<keyof typeof buttonLabels> = ["allow-once", "allow-always", "deny"],
+) {
+  return {
+    blocks: [
+      {
+        type: "buttons",
+        buttons: decisions.map((decision) => ({
+          ...buttonLabels[decision],
+          action: { type: "approval", approvalId, approvalKind: "plugin", decision },
+        })),
+      },
+    ],
+  };
+}
+
 describe("plugin-sdk/approval-renderers", () => {
-  it.each([
-    {
-      name: "builds shared approval payloads with generic interactive commands",
-      payload: buildApprovalPendingReplyPayload({
-        approvalId: "plugin:approval-123",
-        approvalSlug: "plugin:a",
-        text: "Approval required @everyone",
+  it("preserves command controls when shipped approvalKind metadata is supplied", () => {
+    expect(
+      buildApprovalPendingReplyPayload({
+        approvalKind: "plugin",
+        approvalId: "plugin:legacy-approval",
+        approvalSlug: "legacy-a",
+        text: "Approval required",
+        allowedDecisions: ["deny"],
       }),
-      textExpected: (text: string) => expect(text).toContain("@everyone"),
-      interactiveExpected: {
+    ).toEqual({
+      text: "Approval required",
+      presentation: {
         blocks: [
           {
             type: "buttons",
             buttons: [
               {
-                label: "Allow Once",
-                value: "/approve plugin:approval-123 allow-once",
-                style: "success",
-              },
-              {
-                label: "Allow Always",
-                value: "/approve plugin:approval-123 allow-always",
-                style: "primary",
-              },
-              {
                 label: "Deny",
-                value: "/approve plugin:approval-123 deny",
+                action: { type: "command", command: "/approve plugin:legacy-approval deny" },
+                value: "/approve plugin:legacy-approval deny",
                 style: "danger",
               },
             ],
           },
         ],
       },
+      channelData: {
+        execApproval: {
+          approvalId: "plugin:legacy-approval",
+          approvalSlug: "legacy-a",
+          approvalKind: "plugin",
+          agentId: undefined,
+          allowedDecisions: ["deny"],
+          sessionKey: undefined,
+          state: "pending",
+        },
+      },
+    });
+  });
+
+  it("preserves command controls in the shipped plugin approval builder", () => {
+    const payload = buildPluginApprovalPendingReplyPayload({
+      request: {
+        id: "plugin-legacy",
+        request: {
+          title: "Sensitive action",
+          description: "Needs approval",
+          allowedDecisions: ["allow-once"],
+        },
+        createdAtMs: 1_000,
+        expiresAtMs: 61_000,
+      },
+      nowMs: 1_000,
+    });
+
+    expect(payload.text).toContain("Reply with: /approve plugin-legacy allow-once");
+    expect(payload.text).not.toContain("allow-once|deny");
+    expect(payload.presentation).toEqual({
+      blocks: [
+        {
+          type: "buttons",
+          buttons: [
+            {
+              label: "Allow Once",
+              action: { type: "command", command: "/approve plugin-legacy allow-once" },
+              value: "/approve plugin-legacy allow-once",
+              style: "success",
+            },
+          ],
+        },
+      ],
+    });
+  });
+
+  it.each([
+    {
+      name: "builds shared approval payloads with typed plugin decisions",
+      payload: buildTypedApprovalPendingReplyPayload({
+        approvalKind: "plugin",
+        approvalId: "plugin:approval-123",
+        approvalSlug: "plugin:a",
+        text: "Approval required @everyone",
+      }),
+      textExpected: (text: string) => expect(text).toContain("@everyone"),
+      presentationExpected: pluginPresentation("plugin:approval-123"),
       channelDataExpected: undefined,
     },
     {
       name: "builds plugin pending payloads with approval metadata and extra channel data",
-      payload: buildPluginApprovalPendingReplyPayload({
+      payload: buildTypedPluginApprovalPendingReplyPayload({
         request: {
           id: "plugin-approval-123",
           request: {
@@ -63,30 +143,7 @@ describe("plugin-sdk/approval-renderers", () => {
         },
       }),
       textExpected: (text: string) => expect(text).toContain("Plugin approval required"),
-      interactiveExpected: {
-        blocks: [
-          {
-            type: "buttons",
-            buttons: [
-              {
-                label: "Allow Once",
-                value: "/approve plugin-approval-123 allow-once",
-                style: "success",
-              },
-              {
-                label: "Allow Always",
-                value: "/approve plugin-approval-123 allow-always",
-                style: "primary",
-              },
-              {
-                label: "Deny",
-                value: "/approve plugin-approval-123 deny",
-                style: "danger",
-              },
-            ],
-          },
-        ],
-      },
+      presentationExpected: pluginPresentation("plugin-approval-123"),
       channelDataExpected: {
         execApproval: {
           agentId: undefined,
@@ -103,6 +160,39 @@ describe("plugin-sdk/approval-renderers", () => {
       },
     },
     {
+      name: "adds fail-closed deny to request-scoped plugin decisions",
+      payload: buildTypedPluginApprovalPendingReplyPayload({
+        request: {
+          id: "plugin-approval-123",
+          request: {
+            title: "Sensitive action",
+            description: "Needs approval",
+            allowedDecisions: ["allow-once"],
+          },
+          createdAtMs: 1_000,
+          expiresAtMs: 61_000,
+        },
+        nowMs: 1_000,
+        allowedDecisions: ["allow-once"],
+      }),
+      textExpected: (text: string) => {
+        expect(text).toContain("Reply with: /approve plugin-approval-123 allow-once");
+        expect(text).not.toContain("allow-once|deny");
+      },
+      presentationExpected: pluginPresentation("plugin-approval-123", ["allow-once", "deny"]),
+      channelDataExpected: {
+        execApproval: {
+          agentId: undefined,
+          approvalId: "plugin-approval-123",
+          approvalKind: "plugin",
+          approvalSlug: "plugin-a",
+          allowedDecisions: ["allow-once", "deny"],
+          sessionKey: undefined,
+          state: "pending",
+        },
+      },
+    },
+    {
       name: "builds generic resolved payloads with approval metadata",
       payload: buildApprovalResolvedReplyPayload({
         approvalId: "req-123",
@@ -110,7 +200,7 @@ describe("plugin-sdk/approval-renderers", () => {
         text: "resolved @everyone",
       }),
       textExpected: (text: string) => expect(text).toBe("resolved @everyone"),
-      interactiveExpected: undefined,
+      presentationExpected: undefined,
       channelDataExpected: {
         execApproval: {
           approvalId: "req-123",
@@ -135,7 +225,7 @@ describe("plugin-sdk/approval-renderers", () => {
         },
       }),
       textExpected: (text: string) => expect(text).toContain("Plugin approval allowed once"),
-      interactiveExpected: undefined,
+      presentationExpected: undefined,
       channelDataExpected: {
         execApproval: {
           approvalId: "plugin-approval-123",
@@ -147,13 +237,14 @@ describe("plugin-sdk/approval-renderers", () => {
         },
       },
     },
-  ])("$name", ({ payload, textExpected, interactiveExpected, channelDataExpected }) => {
-    expect(payload.text).toBeDefined();
-    if (payload.text !== undefined) {
-      textExpected(payload.text);
+  ])("$name", ({ payload, textExpected, presentationExpected, channelDataExpected }) => {
+    if (payload.text === undefined) {
+      throw new Error("expected rendered approval text");
     }
-    if (interactiveExpected) {
-      expect(payload.interactive).toEqual(interactiveExpected);
+    textExpected(payload.text);
+    if (presentationExpected) {
+      expect(payload.presentation).toEqual(presentationExpected);
+      expect(payload.interactive).toBeUndefined();
     }
     if (channelDataExpected) {
       expect(payload.channelData).toEqual(channelDataExpected);

@@ -1,20 +1,23 @@
-import type { OpenClawConfig } from "../../config/config.js";
+import type { OpenClawConfig } from "../../config/types.openclaw.js";
+import { resolveGlobalMap } from "../../shared/global-singleton.js";
 import type {
   ConfiguredBindingResolution,
   StatefulBindingTargetDescriptor,
 } from "./binding-types.js";
 
-export type StatefulBindingTargetReadyResult = { ok: true } | { ok: false; error: string };
-export type StatefulBindingTargetSessionResult =
+type StatefulBindingTargetReadyResult = { ok: true } | { ok: false; error: string };
+type StatefulBindingTargetSessionResult =
   | { ok: true; sessionKey: string }
   | { ok: false; sessionKey: string; error: string };
 export type StatefulBindingTargetResetResult =
-  | { ok: true }
+  | { ok: true; sessionKey?: string; sessionId?: string; storePath?: string }
   | { ok: false; skipped?: boolean; error?: string };
 
+/** Driver contract for lifecycle operations on one stateful target family. */
 export type StatefulBindingTargetDriver = {
   id: string;
   ensureReady: (params: {
+    assertActive?: () => void;
     cfg: OpenClawConfig;
     bindingResolution: ConfiguredBindingResolution;
   }) => Promise<StatefulBindingTargetReadyResult>;
@@ -25,22 +28,25 @@ export type StatefulBindingTargetDriver = {
   resolveTargetBySessionKey?: (params: {
     cfg: OpenClawConfig;
     sessionKey: string;
-  }) => StatefulBindingTargetDescriptor | null;
+    agentId?: string;
+  }) => Promise<StatefulBindingTargetDescriptor | null> | StatefulBindingTargetDescriptor | null;
   resetInPlace?: (params: {
     cfg: OpenClawConfig;
     sessionKey: string;
     bindingTarget: StatefulBindingTargetDescriptor;
     reason: "new" | "reset";
+    commandSource?: string;
   }) => Promise<StatefulBindingTargetResetResult>;
 };
 
-const registeredStatefulBindingTargetDrivers = new Map<string, StatefulBindingTargetDriver>();
+const registeredStatefulBindingTargetDrivers = resolveGlobalMap<
+  string,
+  StatefulBindingTargetDriver
+>(Symbol.for("openclaw.statefulBindingTargetDrivers"), "plugin-registry");
 
-function listStatefulBindingTargetDrivers(): StatefulBindingTargetDriver[] {
-  return [...registeredStatefulBindingTargetDrivers.values()];
-}
-
-export function registerStatefulBindingTargetDriver(driver: StatefulBindingTargetDriver): void {
+export function registerStatefulBindingTargetDriver(
+  driver: StatefulBindingTargetDriver,
+): () => void {
   const id = driver.id.trim();
   if (!id) {
     throw new Error("Stateful binding target driver id is required");
@@ -48,37 +54,46 @@ export function registerStatefulBindingTargetDriver(driver: StatefulBindingTarge
   const normalized = { ...driver, id };
   const existing = registeredStatefulBindingTargetDrivers.get(id);
   if (existing) {
-    return;
+    // Builtins and tests may register through multiple load paths. First writer
+    // wins so process-local sessions keep using the same driver instance.
+    return () => {};
   }
   registeredStatefulBindingTargetDrivers.set(id, normalized);
-}
-
-export function unregisterStatefulBindingTargetDriver(id: string): void {
-  registeredStatefulBindingTargetDrivers.delete(id.trim());
+  return () => {
+    // Cleanup owns only this registration; a later replacement must survive stale disposal.
+    if (registeredStatefulBindingTargetDrivers.get(id) === normalized) {
+      registeredStatefulBindingTargetDrivers.delete(id);
+    }
+  };
 }
 
 export function getStatefulBindingTargetDriver(id: string): StatefulBindingTargetDriver | null {
-  const normalizedId = id.trim();
-  if (!normalizedId) {
-    return null;
-  }
-  return registeredStatefulBindingTargetDrivers.get(normalizedId) ?? null;
+  return registeredStatefulBindingTargetDrivers.get(id.trim()) ?? null;
 }
 
-export function resolveStatefulBindingTargetBySessionKey(params: {
+export async function resolveStatefulBindingTargetBySessionKey(params: {
   cfg: OpenClawConfig;
   sessionKey: string;
-}): { driver: StatefulBindingTargetDriver; bindingTarget: StatefulBindingTargetDescriptor } | null {
+  agentId?: string;
+}): Promise<{
+  driver: StatefulBindingTargetDriver;
+  bindingTarget: StatefulBindingTargetDescriptor;
+} | null> {
   const sessionKey = params.sessionKey.trim();
   if (!sessionKey) {
     return null;
   }
-  for (const driver of listStatefulBindingTargetDrivers()) {
-    const bindingTarget = driver.resolveTargetBySessionKey?.({
+  // Session keys are globally opaque to callers. Ask each registered driver so
+  // channel-specific encodings stay private to their owner.
+  // Freeze the candidates before awaiting drivers that may change the registry.
+  const drivers = [...registeredStatefulBindingTargetDrivers.values()];
+  for (const driver of drivers) {
+    const bindingTarget = await driver.resolveTargetBySessionKey?.({
       cfg: params.cfg,
       sessionKey,
+      agentId: params.agentId,
     });
-    if (bindingTarget) {
+    if (bindingTarget && getStatefulBindingTargetDriver(driver.id) === driver) {
       return {
         driver,
         bindingTarget,

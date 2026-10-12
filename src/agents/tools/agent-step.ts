@@ -1,73 +1,88 @@
 import crypto from "node:crypto";
-import { callGateway } from "../../gateway/call.js";
+import { getRuntimeConfig } from "../../config/config.js";
+import { resolveSessionStorePathCore } from "../../config/sessions/paths.js";
+import { stringifyRouteThreadId } from "../../plugin-sdk/channel-route.js";
+import { annotateInterSessionPromptText } from "../../sessions/input-provenance.js";
+import { recordSessionParticipantBestEffort } from "../../sessions/session-participant-recording.js";
+import type { DeliveryContext } from "../../utils/delivery-context.types.js";
 import { INTERNAL_MESSAGE_CHANNEL } from "../../utils/message-channel.js";
-import { AGENT_LANE_NESTED } from "../lanes.js";
-import { waitForAgentRunAndReadUpdatedAssistantReply } from "../run-wait.js";
+import { resolveNestedAgentLaneForSession } from "../lanes.js";
+import { waitForAgentRunReply } from "../run-wait.js";
+import {
+  callAgentToolGatewayRequest,
+  type AgentToolGatewayRequestCaller as GatewayCaller,
+} from "./in-process-gateway.js";
 
-export { readLatestAssistantReply } from "../run-wait.js";
-
-type GatewayCaller = typeof callGateway;
-
-const defaultAgentStepDeps = {
-  callGateway,
+export type AgentStepSession = {
+  sessionId: string;
+  lifecycleRevision?: string;
 };
 
-let agentStepDeps: {
-  callGateway: GatewayCaller;
-} = defaultAgentStepDeps;
-
 export async function runAgentStep(params: {
+  agentId?: string;
   sessionKey: string;
   message: string;
   extraSystemPrompt: string;
   timeoutMs: number;
-  channel?: string;
-  lane?: string;
+  sourceAgentId?: string;
   sourceSessionKey?: string;
-  sourceChannel?: string;
   sourceTool?: string;
-}): Promise<string | undefined> {
+  sourceRole?: "subagent";
+  callGateway?: GatewayCaller;
+  deliveryContext?: DeliveryContext;
+  expectedSession?: AgentStepSession;
+}): Promise<void> {
+  const promptedAt = Date.now();
   const stepIdem = crypto.randomUUID();
-  const response = await agentStepDeps.callGateway<{ runId?: string }>({
+  const inputProvenance = {
+    kind: "inter_session" as const,
+    sourceSessionKey: params.sourceSessionKey,
+    sourceTool: params.sourceTool ?? "sessions_send",
+    ...(params.sourceRole ? { sourceRole: params.sourceRole } : {}),
+  };
+  const gatewayCall = params.callGateway ?? callAgentToolGatewayRequest;
+  const response = await gatewayCall({
     method: "agent",
     params: {
-      message: params.message,
+      message: annotateInterSessionPromptText(params.message, inputProvenance),
+      ...(params.agentId ? { agentId: params.agentId } : {}),
       sessionKey: params.sessionKey,
-      idempotencyKey: stepIdem,
       deliver: false,
-      channel: params.channel ?? INTERNAL_MESSAGE_CHANNEL,
-      lane: params.lane ?? AGENT_LANE_NESTED,
+      sourceReplyDeliveryMode: "message_tool_only",
+      channel: params.deliveryContext?.channel ?? INTERNAL_MESSAGE_CHANNEL,
+      lane: resolveNestedAgentLaneForSession(params.sessionKey),
       extraSystemPrompt: params.extraSystemPrompt,
-      inputProvenance: {
-        kind: "inter_session",
-        sourceSessionKey: params.sourceSessionKey,
-        sourceChannel: params.sourceChannel,
-        sourceTool: params.sourceTool ?? "sessions_send",
-      },
+      inputProvenance,
+      idempotencyKey: stepIdem,
+      expectedExistingSessionId: params.expectedSession?.sessionId,
+      expectedExistingSessionLifecycleRevision: params.expectedSession
+        ? (params.expectedSession.lifecycleRevision ?? null)
+        : undefined,
+      accountId: params.deliveryContext?.accountId,
+      to: params.deliveryContext?.to,
+      threadId: stringifyRouteThreadId(params.deliveryContext?.threadId),
     },
     timeoutMs: 10_000,
   });
 
-  const stepRunId = typeof response?.runId === "string" && response.runId ? response.runId : "";
-  const resolvedRunId = stepRunId || stepIdem;
-  const result = await waitForAgentRunAndReadUpdatedAssistantReply({
-    runId: resolvedRunId,
-    sessionKey: params.sessionKey,
-    timeoutMs: Math.min(params.timeoutMs, 60_000),
-  });
-  if (result.status !== "ok") {
-    return undefined;
+  if (params.sourceAgentId && params.agentId) {
+    recordSessionParticipantBestEffort({
+      identity: { type: "agent", id: params.sourceAgentId },
+      agentId: params.agentId,
+      sessionKey: params.sessionKey,
+      storePath: resolveSessionStorePathCore(getRuntimeConfig().session?.store, {
+        agentId: params.agentId,
+      }),
+      promptedAt,
+    });
   }
-  return result.replyText;
-}
 
-export const __testing = {
-  setDepsForTest(overrides?: Partial<{ callGateway: GatewayCaller }>) {
-    agentStepDeps = overrides
-      ? {
-          ...defaultAgentStepDeps,
-          ...overrides,
-        }
-      : defaultAgentStepDeps;
-  },
-};
+  const resolvedRunId =
+    typeof response?.runId === "string" && response.runId ? response.runId : stepIdem;
+  await waitForAgentRunReply({
+    runId: resolvedRunId,
+    timeoutMs: Math.min(params.timeoutMs, 60_000),
+    callGateway: gatewayCall,
+    untilTerminal: true,
+  });
+}

@@ -1,3 +1,4 @@
+// Tests system-run approval context construction.
 import { describe, expect, test } from "vitest";
 import {
   parsePreparedSystemRunPayload,
@@ -22,9 +23,20 @@ describe("resolveSystemRunApprovalRequestContext", () => {
         },
       },
       expected: {
+        plan: {
+          argv: ["./env", "sh", "-c", "jq --version"],
+          cwd: "/tmp",
+          commandText: './env sh -c "jq --version"',
+          commandPreview: "jq --version",
+          agentId: "main",
+          sessionKey: "agent:main:main",
+        },
         commandText: './env sh -c "jq --version"',
         commandPreview: "jq --version",
         commandArgv: ["./env", "sh", "-c", "jq --version"],
+        cwd: "/tmp",
+        agentId: "main",
+        sessionKey: "agent:main:main",
       },
     },
     {
@@ -41,12 +53,24 @@ describe("resolveSystemRunApprovalRequestContext", () => {
         },
       },
       expected: {
+        plan: {
+          argv: ["./env", "sh", "-c", "jq --version"],
+          cwd: "/tmp",
+          commandText: './env sh -c "jq --version"',
+          commandPreview: "jq --version",
+          agentId: "main",
+          sessionKey: "agent:main:main",
+        },
         commandText: './env sh -c "jq --version"',
         commandPreview: "jq --version",
+        commandArgv: ["./env", "sh", "-c", "jq --version"],
+        cwd: "/tmp",
+        agentId: "main",
+        sessionKey: "agent:main:main",
       },
     },
   ])("$name", ({ params, expected }) => {
-    expect(resolveSystemRunApprovalRequestContext(params)).toMatchObject(expected);
+    expect(resolveSystemRunApprovalRequestContext(params)).toEqual(expected);
   });
 
   test("falls back to explicit request params for non-node hosts", () => {
@@ -74,7 +98,7 @@ describe("resolveSystemRunApprovalRequestContext", () => {
 });
 
 describe("parsePreparedSystemRunPayload", () => {
-  test("parses legacy prepared payloads via top-level fallback command text", () => {
+  test.each(["commandText", "cmdText"])("rejects retired top-level %s payloads", (field) => {
     expect(
       parsePreparedSystemRunPayload({
         plan: {
@@ -83,17 +107,43 @@ describe("parsePreparedSystemRunPayload", () => {
           agentId: "main",
           sessionKey: "agent:main:main",
         },
-        commandText: 'bash -lc "jq --version"',
+        [field]: 'bash -lc "jq --version"',
+      }),
+    ).toBeNull();
+  });
+
+  test.each(["mutableFileOperand", "policySnapshot"])(
+    "does not reconstruct plans rejected for invalid %s",
+    (field) => {
+      expect(
+        parsePreparedSystemRunPayload({
+          plan: { argv: ["jq", "--version"], commandText: "jq --version", [field]: null },
+          commandText: "jq --version",
+        }),
+      ).toBeNull();
+    },
+  );
+
+  test("parses prepared exec policy metadata", () => {
+    expect(
+      parsePreparedSystemRunPayload({
+        plan: {
+          argv: ["jq", "--version"],
+          cwd: "/tmp",
+          commandText: "jq --version",
+        },
+        execPolicy: { security: "allowlist", ask: "always" },
       }),
     ).toEqual({
       plan: {
-        argv: ["bash", "-lc", "jq --version"],
+        argv: ["jq", "--version"],
         cwd: "/tmp",
-        commandText: 'bash -lc "jq --version"',
+        commandText: "jq --version",
         commandPreview: null,
-        agentId: "main",
-        sessionKey: "agent:main:main",
+        agentId: null,
+        sessionKey: null,
       },
+      execPolicy: { security: "allowlist", ask: "always" },
     });
   });
 

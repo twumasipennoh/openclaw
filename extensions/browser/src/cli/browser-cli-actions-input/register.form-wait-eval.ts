@@ -1,12 +1,28 @@
 import type { Command } from "commander";
-import type { BrowserParentOpts } from "../browser-cli-shared.js";
-import { danger, defaultRuntime } from "../core-api.js";
+import { danger, defaultRuntime } from "openclaw/plugin-sdk/runtime-env";
+import { normalizeOptionalString } from "openclaw/plugin-sdk/string-coerce-runtime";
 import {
-  callBrowserAct,
-  logBrowserActionResult,
-  readFields,
-  resolveBrowserActionContext,
-} from "./shared.js";
+  BROWSER_TAB_REFERENCE_HELP,
+  runBrowserCliCommand,
+  parseBrowserNonNegativeIntegerOption,
+  parseBrowserPositiveIntegerOption,
+  type BrowserParentOpts,
+} from "../browser-cli-shared.js";
+import { runBrowserAction, readFields } from "./shared.js";
+
+function parseBrowserWaitLoadState(value: unknown) {
+  const load = normalizeOptionalString(value);
+  switch (load) {
+    case undefined:
+      return undefined;
+    case "load":
+    case "domcontentloaded":
+    case "networkidle":
+      return load;
+    default:
+      throw new Error(`Invalid --load value: ${load}`);
+  }
+}
 
 export function registerBrowserFormWaitEvalCommands(
   browser: Command,
@@ -17,35 +33,33 @@ export function registerBrowserFormWaitEvalCommands(
     .description("Fill a form with JSON field descriptors")
     .option("--fields <json>", "JSON array of field objects")
     .option("--fields-file <path>", "Read JSON array from a file")
-    .option("--target-id <id>", "CDP target id (or unique prefix)")
+    .option("--target-id <id>", BROWSER_TAB_REFERENCE_HELP)
     .action(async (opts, cmd) => {
-      const { parent, profile } = resolveBrowserActionContext(cmd, parentOpts);
-      try {
+      const parent = parentOpts(cmd);
+      await runBrowserCliCommand(async () => {
         const fields = await readFields({
           fields: opts.fields,
           fieldsFile: opts.fieldsFile,
         });
-        const result = await callBrowserAct<{ result?: unknown }>({
+        await runBrowserAction({
           parent,
-          profile,
           body: {
             kind: "fill",
             fields,
-            targetId: opts.targetId?.trim() || undefined,
+            targetId: normalizeOptionalString(opts.targetId),
           },
+          successMessage: `filled ${fields.length} field(s)`,
         });
-        logBrowserActionResult(parent, result, `filled ${fields.length} field(s)`);
-      } catch (err) {
-        defaultRuntime.error(danger(String(err)));
-        defaultRuntime.exit(1);
-      }
+      });
     });
 
   browser
     .command("wait")
     .description("Wait for time, selector, URL, load state, or JS conditions")
     .argument("[selector]", "CSS selector to wait for (visible)")
-    .option("--time <ms>", "Wait for N milliseconds", (v: string) => Number(v))
+    .option("--time <ms>", "Wait for N milliseconds", (v: string) =>
+      parseBrowserNonNegativeIntegerOption(v, "--time"),
+    )
     .option("--text <value>", "Wait for text to appear")
     .option("--text-gone <value>", "Wait for text to disappear")
     .option("--url <pattern>", "Wait for URL (supports globs like **/dash)")
@@ -54,74 +68,64 @@ export function registerBrowserFormWaitEvalCommands(
     .option(
       "--timeout-ms <ms>",
       "How long to wait for each condition (default: 20000)",
-      (v: string) => Number(v),
+      (v: string) => parseBrowserPositiveIntegerOption(v, "--timeout-ms"),
     )
-    .option("--target-id <id>", "CDP target id (or unique prefix)")
+    .option("--target-id <id>", BROWSER_TAB_REFERENCE_HELP)
     .action(async (selector: string | undefined, opts, cmd) => {
-      const { parent, profile } = resolveBrowserActionContext(cmd, parentOpts);
-      try {
-        const sel = selector?.trim() || undefined;
-        const load =
-          opts.load === "load" || opts.load === "domcontentloaded" || opts.load === "networkidle"
-            ? (opts.load as "load" | "domcontentloaded" | "networkidle")
-            : undefined;
-        const timeoutMs = Number.isFinite(opts.timeoutMs) ? opts.timeoutMs : undefined;
-        const result = await callBrowserAct<{ result?: unknown }>({
+      const parent = parentOpts(cmd);
+      await runBrowserCliCommand(async () => {
+        const load = parseBrowserWaitLoadState(opts.load);
+        await runBrowserAction({
           parent,
-          profile,
           body: {
             kind: "wait",
-            timeMs: Number.isFinite(opts.time) ? opts.time : undefined,
-            text: opts.text?.trim() || undefined,
-            textGone: opts.textGone?.trim() || undefined,
-            selector: sel,
-            url: opts.url?.trim() || undefined,
+            timeMs: opts.time,
+            text: normalizeOptionalString(opts.text),
+            textGone: normalizeOptionalString(opts.textGone),
+            selector: normalizeOptionalString(selector),
+            url: normalizeOptionalString(opts.url),
             loadState: load,
-            fn: opts.fn?.trim() || undefined,
-            targetId: opts.targetId?.trim() || undefined,
-            timeoutMs,
+            fn: normalizeOptionalString(opts.fn),
+            targetId: normalizeOptionalString(opts.targetId),
+            timeoutMs: opts.timeoutMs,
           },
-          timeoutMs,
+          successMessage: "wait complete",
         });
-        logBrowserActionResult(parent, result, "wait complete");
-      } catch (err) {
-        defaultRuntime.error(danger(String(err)));
-        defaultRuntime.exit(1);
-      }
+      });
     });
 
   browser
     .command("evaluate")
-    .description("Evaluate a function against the page or a ref")
-    .option("--fn <code>", "Function source, e.g. (el) => el.textContent")
+    .description("Evaluate JavaScript against the page or a ref")
+    .option(
+      "--fn <code>",
+      "Function source, expression, or statement body, e.g. const text = el.textContent; return text;",
+    )
     .option("--ref <id>", "Ref from snapshot")
-    .option("--target-id <id>", "CDP target id (or unique prefix)")
+    .option(
+      "--timeout-ms <ms>",
+      "How long to allow the evaluate function to run (default: 20000)",
+      (v: string) => parseBrowserPositiveIntegerOption(v, "--timeout-ms"),
+    )
+    .option("--target-id <id>", BROWSER_TAB_REFERENCE_HELP)
     .action(async (opts, cmd) => {
-      const { parent, profile } = resolveBrowserActionContext(cmd, parentOpts);
+      const parent = parentOpts(cmd);
       if (!opts.fn) {
         defaultRuntime.error(danger("Missing --fn"));
         defaultRuntime.exit(1);
         return;
       }
-      try {
-        const result = await callBrowserAct<{ result?: unknown }>({
+      await runBrowserCliCommand(async () => {
+        await runBrowserAction({
           parent,
-          profile,
           body: {
             kind: "evaluate",
             fn: opts.fn,
-            ref: opts.ref?.trim() || undefined,
-            targetId: opts.targetId?.trim() || undefined,
+            ref: normalizeOptionalString(opts.ref),
+            targetId: normalizeOptionalString(opts.targetId),
+            timeoutMs: opts.timeoutMs,
           },
         });
-        if (parent?.json) {
-          defaultRuntime.writeJson(result);
-          return;
-        }
-        defaultRuntime.writeJson(result.result ?? null);
-      } catch (err) {
-        defaultRuntime.error(danger(String(err)));
-        defaultRuntime.exit(1);
-      }
+      });
     });
 }

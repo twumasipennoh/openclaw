@@ -1,50 +1,31 @@
-# Protect the ownership rules themselves.
-/.github/CODEOWNERS @steipete
+# Hard security tier: an independent SecOps review is required for every author.
+# Enable required code-owner reviews and dismiss stale approvals in branch protection.
+# Last matching rule wins. Keep SecOps the sole owner of these paths: listing
+# another team on the same line would allow that team to satisfy the requirement.
 
-# WARNING: GitHub CODEOWNERS uses last-match-wins semantics.
-# If you add overlapping rules below the secops block, include @openclaw/secops
-# on those entries too or you can silently remove required secops review.
-# Security-sensitive code, config, and docs require secops review.
-/SECURITY.md @openclaw/secops
-/.github/dependabot.yml @openclaw/secops
-/.github/codeql/ @openclaw/secops
-/.github/workflows/codeql.yml @openclaw/secops
-/src/security/ @openclaw/secops
-/src/secrets/ @openclaw/secops
-/src/config/*secret*.ts @openclaw/secops
-/src/config/**/*secret*.ts @openclaw/secops
-/src/gateway/*auth*.ts @openclaw/secops
-/src/gateway/**/*auth*.ts @openclaw/secops
-/src/gateway/*secret*.ts @openclaw/secops
-/src/gateway/**/*secret*.ts @openclaw/secops
-/src/gateway/security-path*.ts @openclaw/secops
-/src/gateway/resolve-configured-secret-input-string*.ts @openclaw/secops
-/src/gateway/protocol/**/*secret*.ts @openclaw/secops
-/src/gateway/server-methods/secrets*.ts @openclaw/secops
-/src/agents/*auth*.ts @openclaw/secops
-/src/agents/**/*auth*.ts @openclaw/secops
-/src/agents/auth-profiles*.ts @openclaw/secops
-/src/agents/auth-health*.ts @openclaw/secops
-/src/agents/auth-profiles/ @openclaw/secops
-/src/agents/sandbox.ts @openclaw/secops
-/src/agents/sandbox-*.ts @openclaw/secops
-/src/agents/sandbox/ @openclaw/secops
-/src/infra/secret-file*.ts @openclaw/secops
-/src/cron/stagger.ts @openclaw/secops
-/src/cron/service/jobs.ts @openclaw/secops
-/docs/security/ @openclaw/secops
-/docs/gateway/authentication.md @openclaw/secops
-/docs/gateway/sandbox-vs-tool-policy-vs-elevated.md @openclaw/secops
-/docs/gateway/sandboxing.md @openclaw/secops
-/docs/gateway/secrets-plan-contract.md @openclaw/secops
-/docs/gateway/secrets.md @openclaw/secops
-/docs/gateway/security/ @openclaw/secops
-/docs/cli/approvals.md @openclaw/secops
-/docs/cli/sandbox.md @openclaw/secops
-/docs/cli/security.md @openclaw/secops
-/docs/cli/secrets.md @openclaw/secops
-/docs/reference/secretref-credential-surface.md @openclaw/secops
-/docs/reference/secretref-user-supplied-credentials-matrix.json @openclaw/secops
+# Security policy and ownership determine who can approve protected changes.
+/.github/CODEOWNERS @openclaw/openclaw-secops
+/SECURITY.md @openclaw/openclaw-secops
+
+# CodeQL policy, queries, and execution; vulnerability update and workflow-audit policy.
+/.github/codeql/ @openclaw/openclaw-secops
+/.github/workflows/codeql*.yml @openclaw/openclaw-secops
+/.github/dependabot.yml @openclaw/openclaw-secops
+/.github/zizmor.yml @openclaw/openclaw-secops
+
+# Security-review classification, authorization, publication, and trusted API reads.
+/.github/workflows/security-review.yml @openclaw/openclaw-secops
+/scripts/github/dependency-guard.mjs @openclaw/openclaw-secops
+/scripts/github/security-sensitive-guard.mjs @openclaw/openclaw-secops
+/scripts/github/security-review.mjs @openclaw/openclaw-secops
+/scripts/github/security-review-event.mjs @openclaw/openclaw-secops
+/scripts/github/security-review-rollout.mjs @openclaw/openclaw-secops
+/.github/security-review-policy.yml @openclaw/openclaw-secops
+/.github/actions/setup-security-review/ @openclaw/openclaw-secops
+/scripts/github/security-review-policy.mjs @openclaw/openclaw-secops
+/scripts/github/guard-review.mjs @openclaw/openclaw-secops
+/scripts/github/guard-shared.mjs @openclaw/openclaw-secops
+/scripts/lib/bounded-response.mjs @openclaw/openclaw-secops
 
 # Release workflow and its supporting release-path checks.
 /.github/workflows/openclaw-npm-release.yml @openclaw/openclaw-release-managers

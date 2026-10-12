@@ -1,13 +1,14 @@
-import type { OpenClawConfig } from "openclaw/plugin-sdk/config-runtime";
+import type { PluginRuntime } from "openclaw/plugin-sdk/channel-core";
+import type { StatusReactionTiming } from "openclaw/plugin-sdk/channel-feedback";
 import type {
   DmPolicy,
   GroupPolicy,
+  OpenClawConfig,
   SignalReactionNotificationMode,
-} from "openclaw/plugin-sdk/config-runtime";
+} from "openclaw/plugin-sdk/config-contracts";
 import type { HistoryEntry } from "openclaw/plugin-sdk/reply-history";
 import type { ReplyPayload } from "openclaw/plugin-sdk/reply-runtime";
 import type { RuntimeEnv } from "openclaw/plugin-sdk/runtime-env";
-import type { SignalSender } from "../identity.js";
 
 export type SignalEnvelope = {
   sourceNumber?: string | null;
@@ -15,7 +16,10 @@ export type SignalEnvelope = {
   sourceName?: string | null;
   timestamp?: number | null;
   dataMessage?: SignalDataMessage | null;
-  editMessage?: { dataMessage?: SignalDataMessage | null } | null;
+  editMessage?: {
+    targetSentTimestamp?: number | null;
+    dataMessage?: SignalDataMessage | null;
+  } | null;
   syncMessage?: unknown;
   reactionMessage?: SignalReactionMessage | null;
 };
@@ -64,19 +68,27 @@ export type SignalAttachment = {
   size?: number | null;
 };
 
-export type SignalReactionTarget = {
-  kind: "phone" | "uuid";
-  id: string;
-  display: string;
-};
-
 export type SignalReceivePayload = {
   envelope?: SignalEnvelope | null;
   exception?: { message?: string } | null;
 };
 
+export type SignalNativeReplyContext = {
+  replyToId?: string;
+  author?: string;
+  body?: string;
+  allowImplicitCurrentMessage?: boolean;
+  state?: {
+    hasReplied: boolean;
+  };
+};
+
 export type SignalEventHandlerDeps = {
   runtime: RuntimeEnv;
+  channelRuntime?: PluginRuntime["channel"];
+  statusReactionTiming?: Required<StatusReactionTiming>;
+  abortSignal?: AbortSignal;
+  runTrackedTask?: (task: () => Promise<void>) => void;
   cfg: OpenClawConfig;
   baseUrl: string;
   account?: string;
@@ -105,31 +117,17 @@ export type SignalEventHandlerDeps = {
     maxBytes: number;
   }) => Promise<{ path: string; contentType?: string } | null>;
   deliverReplies: (params: {
+    cfg: OpenClawConfig;
     replies: ReplyPayload[];
     target: string;
     baseUrl: string;
     account?: string;
+    accountUuid?: string;
     accountId?: string;
     runtime: RuntimeEnv;
     maxBytes: number;
     textLimit: number;
+    replyContext?: SignalNativeReplyContext;
+    chatType?: "direct" | "group";
   }) => Promise<void>;
-  resolveSignalReactionTargets: (reaction: SignalReactionMessage) => SignalReactionTarget[];
-  isSignalReactionMessage: (
-    reaction: SignalReactionMessage | null | undefined,
-  ) => reaction is SignalReactionMessage;
-  shouldEmitSignalReactionNotification: (params: {
-    mode?: SignalReactionNotificationMode;
-    account?: string | null;
-    targets?: SignalReactionTarget[];
-    sender?: SignalSender | null;
-    allowlist?: string[];
-  }) => boolean;
-  buildSignalReactionSystemEventText: (params: {
-    emojiLabel: string;
-    actorLabel: string;
-    messageId: string;
-    targetLabel?: string;
-    groupLabel?: string;
-  }) => string;
 };

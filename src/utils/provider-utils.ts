@@ -1,58 +1,12 @@
-import type { OpenClawConfig } from "../config/config.js";
-import { resolveProviderReasoningOutputModeWithPlugin } from "../plugins/provider-runtime.js";
-import type { ProviderRuntimeModel } from "../plugins/types.js";
-
-const BUILTIN_REASONING_OUTPUT_MODES = {
-  "google-generative-ai": "tagged",
-} as const;
-
 /**
- * Utility functions for provider-specific logic and capabilities.
+ * Provider behavior helpers shared by reply runners, embedded agents, and provider plugins.
+ * Keep policy here generic; provider-specific reasoning rules belong in provider runtime hooks.
  */
-
-export function resolveReasoningOutputMode(params: {
-  provider: string | undefined | null;
-  config?: OpenClawConfig;
-  workspaceDir?: string;
-  env?: NodeJS.ProcessEnv;
-  modelId?: string;
-  modelApi?: string | null;
-  model?: ProviderRuntimeModel;
-}): "native" | "tagged" {
-  const provider = params.provider?.trim();
-  if (!provider) {
-    return "native";
-  }
-
-  const normalized = provider.toLowerCase();
-  const pluginMode = resolveProviderReasoningOutputModeWithPlugin({
-    provider,
-    config: params.config,
-    workspaceDir: params.workspaceDir,
-    env: params.env,
-    context: {
-      config: params.config,
-      workspaceDir: params.workspaceDir,
-      env: params.env,
-      provider,
-      modelId: params.modelId,
-      modelApi: params.modelApi,
-      model: params.model,
-    },
-  });
-  if (pluginMode) {
-    return pluginMode;
-  }
-
-  const builtInMode =
-    BUILTIN_REASONING_OUTPUT_MODES[normalized as keyof typeof BUILTIN_REASONING_OUTPUT_MODES];
-  if (builtInMode) {
-    return builtInMode;
-  }
-
-  // Keep a tiny built-in fallback for non-plugin Google surfaces.
-  return "native";
-}
+import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
+import type { OpenClawConfig } from "../config/types.openclaw.js";
+import type { ProviderRuntimePluginHandle } from "../plugins/provider-hook-runtime.js";
+import type { ProviderRuntimeModel } from "../plugins/provider-runtime-model.types.js";
+import { resolveProviderReasoningOutputModeWithPlugin } from "../plugins/provider-runtime.js";
 
 /**
  * Returns true if the provider requires reasoning to be wrapped in tags
@@ -68,17 +22,31 @@ export function isReasoningTagProvider(
     modelId?: string;
     modelApi?: string | null;
     model?: ProviderRuntimeModel;
+    runtimeHandle?: ProviderRuntimePluginHandle;
   },
 ): boolean {
+  const normalizedProvider = normalizeOptionalString(provider);
+  if (!normalizedProvider) {
+    return false;
+  }
+  const { config, workspaceDir, env, runtimeHandle, modelId, modelApi, model } = options ?? {};
+  // Provider hooks own model/API-specific reasoning transport rules.
   return (
-    resolveReasoningOutputMode({
-      provider,
-      config: options?.config,
-      workspaceDir: options?.workspaceDir,
-      env: options?.env,
-      modelId: options?.modelId,
-      modelApi: options?.modelApi,
-      model: options?.model,
+    resolveProviderReasoningOutputModeWithPlugin({
+      provider: normalizedProvider,
+      config,
+      workspaceDir,
+      env,
+      runtimeHandle,
+      context: {
+        config,
+        workspaceDir,
+        env,
+        provider: normalizedProvider,
+        modelId,
+        modelApi,
+        model,
+      },
     }) === "tagged"
   );
 }

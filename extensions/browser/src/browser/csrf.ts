@@ -1,5 +1,12 @@
+/**
+ * Browser mutation CSRF guard.
+ *
+ * Blocks browser-control mutation requests from browser-like cross-site
+ * contexts while allowing CLI, Gateway, and local service clients.
+ */
 import type { NextFunction, Request, Response } from "express";
-import { isLoopbackHost } from "../gateway/net.js";
+import { isLoopbackHost } from "openclaw/plugin-sdk/ssrf-runtime";
+import { normalizeLowercaseStringOrEmpty } from "openclaw/plugin-sdk/string-coerce-runtime";
 
 function firstHeader(value: string | string[] | undefined): string {
   return Array.isArray(value) ? (value[0] ?? "") : (value ?? "");
@@ -11,19 +18,11 @@ function isMutatingMethod(method: string): boolean {
 }
 
 function isLoopbackUrl(value: string): boolean {
-  const v = value.trim();
-  if (!v || v === "null") {
-    return false;
-  }
-  try {
-    const parsed = new URL(v);
-    return isLoopbackHost(parsed.hostname);
-  } catch {
-    return false;
-  }
+  return isLoopbackHost(URL.parse(value.trim())?.hostname ?? "");
 }
 
-export function shouldRejectBrowserMutation(params: {
+/** Return true when a request should be rejected as browser-originated CSRF. */
+function shouldRejectBrowserMutation(params: {
   method: string;
   origin?: string;
   referer?: string;
@@ -35,7 +34,7 @@ export function shouldRejectBrowserMutation(params: {
 
   // Strong signal when present: browser says this is cross-site.
   // Avoid being overly clever with "same-site" since localhost vs 127.0.0.1 may differ.
-  const secFetchSite = (params.secFetchSite ?? "").trim().toLowerCase();
+  const secFetchSite = normalizeLowercaseStringOrEmpty(params.secFetchSite);
   if (secFetchSite === "cross-site") {
     return true;
   }
@@ -54,28 +53,19 @@ export function shouldRejectBrowserMutation(params: {
   return false;
 }
 
+/** Create middleware that rejects unsafe browser-control mutations. */
 export function browserMutationGuardMiddleware(): (
   req: Request,
   res: Response,
   next: NextFunction,
 ) => void {
   return (req: Request, res: Response, next: NextFunction) => {
-    // OPTIONS is used for CORS preflight. Even if cross-origin, the preflight isn't mutating.
-    const method = (req.method || "").trim().toUpperCase();
-    if (method === "OPTIONS") {
-      return next();
-    }
-
-    const origin = firstHeader(req.headers.origin);
-    const referer = firstHeader(req.headers.referer);
-    const secFetchSite = firstHeader(req.headers["sec-fetch-site"]);
-
     if (
       shouldRejectBrowserMutation({
-        method,
-        origin,
-        referer,
-        secFetchSite,
+        method: req.method,
+        origin: firstHeader(req.headers.origin),
+        referer: firstHeader(req.headers.referer),
+        secFetchSite: firstHeader(req.headers["sec-fetch-site"]),
       })
     ) {
       res.status(403).send("Forbidden");

@@ -1,19 +1,190 @@
-import { resolveMainSessionKeyFromConfig } from "../../config/sessions.js";
+// System gateway methods expose device and host identity, heartbeat controls,
+// presence snapshots, and normalized system events.
+import os from "node:os";
 import {
-  loadOrCreateDeviceIdentity,
-  publicKeyRawBase64UrlFromPem,
-} from "../../infra/device-identity.js";
+  normalizeLowercaseStringOrEmpty,
+  normalizeOptionalString,
+} from "@openclaw/normalization-core/string-coerce";
+import {
+  ErrorCodes,
+  errorShape,
+  type SystemInfoResult,
+  validateSystemInfoParams,
+} from "../../../packages/gateway-protocol/src/index.js";
+import { validatePresenceActivityParams } from "../../../packages/gateway-protocol/src/schema/presence.js";
+import {
+  SYSTEM_PRESENCE_CLEAR_LAST_INPUT_TAG,
+  validateSystemEventParams,
+} from "../../../packages/gateway-protocol/src/schema/system-event.js";
+import { listAgentIds } from "../../agents/agent-scope.js";
+import { preparedModelRuntimeConfigsMatch } from "../../agents/prepared-model-runtime.js";
+import { readUtilityModelSetting } from "../../agents/utility-model-setting.js";
+import { resolveUtilityModelRefForAgent } from "../../agents/utility-model.js";
+import { tryResolveLegacyCompatibilityAgentId } from "../../config/legacy.default-agent-owner.js";
+import { resolveGatewayPort, resolveStateDir } from "../../config/paths.js";
+import { resolveSystemMainSessionTarget } from "../../config/sessions.js";
+import { resolveAdvertisedLanHostCore } from "../../infra/advertised-lan-host.js";
+import { loadOrCreateProcessDeviceIdentityAsync } from "../../infra/device-identity-async.js";
+import { publicKeyRawBase64UrlFromPem } from "../../infra/device-identity.js";
+import { tryReadDiskSpace } from "../../infra/disk-space.js";
 import { getLastHeartbeatEvent } from "../../infra/heartbeat-events.js";
-import { setHeartbeatsEnabled } from "../../infra/heartbeat-runner.js";
+import { requestHeartbeat, setHeartbeatsEnabled } from "../../infra/heartbeat-wake.js";
+import { getMachineDisplayName } from "../../infra/machine-name.js";
+import { resolveRuntimeOsLabel } from "../../infra/os-summary.js";
+import { readSystemDisks } from "../../infra/system-disks.js";
+import {
+  resolveSystemEventQueueKey,
+  withSystemEventOwner,
+} from "../../infra/system-event-ownership.js";
 import { enqueueSystemEvent, isSystemEventContextChanged } from "../../infra/system-events.js";
 import { listSystemPresence, updateSystemPresence } from "../../infra/system-presence.js";
-import { ErrorCodes, errorShape } from "../protocol/index.js";
-import { broadcastPresenceSnapshot } from "../server/presence-events.js";
-import type { GatewayRequestHandlers } from "./types.js";
+import { normalizeAgentId, resolveAgentIdFromSessionKey } from "../../routing/session-key.js";
+import { createPresenceRecipientProjection } from "../presence-projection.js";
+import { getGatewayProcessInstanceId } from "../process-instance.js";
+import { readPreparedCatalog } from "../server-model-catalog-auth.js";
+import { readGatewayProcessVitals } from "../server/process-vitals.js";
+import { resolveRequestedSessionAgentId } from "../session-request-agent.js";
+import { getSessionRowProjection } from "../session-row-projection-access.js";
+import { loadGatewaySessionEntryReadOnly } from "../session-utils.js";
+import { readGatewayRequestMutationAuthority } from "./session-mutation-guards.js";
+import type { GatewayRequestContext, GatewayRequestHandlers } from "./types.js";
+import { assertValidParams, defineValidatedGatewayMethod } from "./validation.js";
 
+let advertisedLanHostPromise: Promise<string | null> | null = null;
+let stateDiskSnapshot:
+  | { stateDir: string; expiresAt: number; disk: ReturnType<typeof tryReadDiskSpace> }
+  | undefined;
+// CPU identity belongs to this process; os.cpus() also reads every core's live timings.
+const cpuInfoSnapshot = (() => {
+  const cpus = os.cpus();
+  return { cpuCount: cpus.length, cpuModel: cpus[0]?.model.trim() || undefined };
+})();
+
+function resolveCachedAdvertisedLanHost(): Promise<string | null> {
+  // Route discovery may spawn a platform command. Keep the result process-stable
+  // so each visible Settings page does not repeat that work every ten seconds.
+  advertisedLanHostPromise ??= resolveAdvertisedLanHostCore().catch(() => null);
+  return advertisedLanHostPromise;
+}
+
+async function collectSystemInfo(context: GatewayRequestContext): Promise<SystemInfoResult> {
+  const { cpuCount, cpuModel } = cpuInfoSnapshot;
+  const [oneMinute = 0, fiveMinutes = 0, fifteenMinutes = 0] = os.loadavg();
+  const loadAverage: [number, number, number] = [oneMinute, fiveMinutes, fifteenMinutes];
+  const stateDir = resolveStateDir();
+  // State-volume stats share the mounted-disk cadence; a new state root invalidates immediately.
+  if (
+    !stateDiskSnapshot ||
+    stateDiskSnapshot.stateDir !== stateDir ||
+    Date.now() >= stateDiskSnapshot.expiresAt
+  ) {
+    stateDiskSnapshot = {
+      stateDir,
+      disk: tryReadDiskSpace(stateDir),
+      expiresAt: Date.now() + 30_000,
+    };
+  }
+  const { disk } = stateDiskSnapshot;
+  const config = context.getRuntimeConfig();
+  const port = resolveGatewayPort(config);
+  const [lanAddress, disks] = await Promise.all([
+    resolveCachedAdvertisedLanHost(),
+    readSystemDisks(),
+  ]);
+  const soleAgentId = tryResolveLegacyCompatibilityAgentId(config);
+  const defaultAgentUtilityModel: SystemInfoResult["defaultAgentUtilityModel"] =
+    await (async () => {
+      if (!soleAgentId) {
+        return { status: "unavailable" } as const;
+      }
+      const utilitySetting = readUtilityModelSetting(config, soleAgentId);
+      if (utilitySetting.kind === "disabled") {
+        return { status: "disabled" } as const;
+      }
+      const prepared = await readPreparedCatalog(context, soleAgentId);
+      const current =
+        prepared &&
+        prepared.agentId === soleAgentId &&
+        preparedModelRuntimeConfigsMatch(prepared.config, config) &&
+        prepared.isCurrent();
+      const model =
+        utilitySetting.kind === "explicit"
+          ? utilitySetting.modelRef
+          : current
+            ? resolveUtilityModelRefForAgent({
+                cfg: prepared.config,
+                agentId: soleAgentId,
+                metadataSnapshot: prepared.metadataSnapshot,
+              })
+            : undefined;
+      if (!model) {
+        return { status: "unavailable" } as const;
+      }
+      const { resolveUtilityCompletionRuntimeForAgent } =
+        await import("../../agents/utility-completion.js");
+      const runtime = current
+        ? await resolveUtilityCompletionRuntimeForAgent({
+            cfg: prepared.config,
+            agentId: soleAgentId,
+            agentDir: prepared.agentDir,
+            workspaceDir: prepared.workspaceDir,
+            metadataSnapshot: prepared.metadataSnapshot,
+            preparedAuthStore: prepared.authStore,
+            preparedRuntimeAuthModes: prepared.authModes,
+            preparedRuntimeAuthMaterializations: prepared.authMaterializations,
+            pluginRegistry: prepared.pluginRegistry,
+            snapshot: prepared,
+            isCurrent: prepared.isCurrent,
+          })
+        : undefined;
+      return {
+        status: utilitySetting.kind === "explicit" ? "configured" : "auto",
+        model,
+        ...(runtime ? { runtime } : {}),
+      } as const;
+    })();
+
+  return {
+    machineName: await getMachineDisplayName(),
+    hostname: os.hostname(),
+    platform: os.platform(),
+    release: os.release(),
+    arch: os.arch(),
+    osLabel: resolveRuntimeOsLabel(),
+    ...(lanAddress ? { lanAddress } : {}),
+    port,
+    nodeVersion: process.version,
+    pid: process.pid,
+    processInstanceId: getGatewayProcessInstanceId(),
+    uptimeMs: Math.round(process.uptime() * 1000),
+    cpuCount,
+    ...(cpuModel ? { cpuModel } : {}),
+    ...(loadAverage.some((value) => value !== 0) ? { loadAverage } : {}),
+    memoryTotalBytes: os.totalmem(),
+    memoryFreeBytes: os.freemem(),
+    ...readGatewayProcessVitals(context.getEventLoopHealth),
+    // Keep the existing state-volume reading when native discovery is unavailable;
+    // an empty successful discovery intentionally stays empty.
+    disks:
+      disks ??
+      (disk?.totalBytes != null && disk.totalBytes > 0
+        ? [{ path: stateDir, totalBytes: disk.totalBytes, availableBytes: disk.availableBytes }]
+        : undefined),
+    ...(disk?.totalBytes != null
+      ? {
+          diskTotalBytes: disk.totalBytes,
+          diskAvailableBytes: disk.availableBytes,
+          diskPath: stateDir,
+        }
+      : {}),
+    defaultAgentUtilityModel,
+  };
+}
+
+/** Gateway handlers for identity, host information, heartbeat toggles, and presence events. */
 export const systemHandlers: GatewayRequestHandlers = {
-  "gateway.identity.get": ({ respond }) => {
-    const identity = loadOrCreateDeviceIdentity();
+  "gateway.identity.get": async ({ respond }) => {
+    const identity = await loadOrCreateProcessDeviceIdentityAsync();
     respond(
       true,
       {
@@ -42,69 +213,132 @@ export const systemHandlers: GatewayRequestHandlers = {
     setHeartbeatsEnabled(enabled);
     respond(true, { ok: true, enabled }, undefined);
   },
-  "system-presence": ({ respond }) => {
-    const presence = listSystemPresence();
+  "presence.activity": defineValidatedGatewayMethod(
+    "presence.activity",
+    validatePresenceActivityParams,
+    ({ client, context, respond }) => {
+      context.recordClientActivity?.(client);
+      respond(true, { ok: true }, undefined);
+    },
+  ),
+  "system-presence": async (options) => {
+    const { respond, client, context } = options;
+    const projection = getSessionRowProjection(context);
+    while (projection?.needsMembershipPreparation()) {
+      await projection.prepareMembership();
+      readGatewayRequestMutationAuthority(options).assertCurrent();
+    }
+    const presence = createPresenceRecipientProjection({
+      cfg: context.getRuntimeConfig(),
+      presence: listSystemPresence(),
+      projection,
+    })(client);
     respond(true, presence, undefined);
   },
+  "system.info": async ({ params, respond, context }) => {
+    if (!assertValidParams(params, validateSystemInfoParams, "system.info", respond)) {
+      return;
+    }
+    respond(true, await collectSystemInfo(context), undefined);
+  },
   "system-event": ({ params, respond, context }) => {
-    const text = typeof params.text === "string" ? params.text.trim() : "";
+    if (!assertValidParams(params, validateSystemEventParams, "system-event", respond)) {
+      return;
+    }
+    // `system-event` is operator.admin-only; role policy rejects node connections before dispatch.
+    // Payload classification below selects behavior and is never an authorization boundary.
+    const text = normalizeOptionalString(params.text) ?? "";
     if (!text) {
       respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, "text required"));
       return;
     }
-    const sessionKey = resolveMainSessionKeyFromConfig();
-    const deviceId = typeof params.deviceId === "string" ? params.deviceId : undefined;
-    const instanceId = typeof params.instanceId === "string" ? params.instanceId : undefined;
-    const host = typeof params.host === "string" ? params.host : undefined;
-    const ip = typeof params.ip === "string" ? params.ip : undefined;
-    const mode = typeof params.mode === "string" ? params.mode : undefined;
-    const version = typeof params.version === "string" ? params.version : undefined;
-    const platform = typeof params.platform === "string" ? params.platform : undefined;
-    const deviceFamily = typeof params.deviceFamily === "string" ? params.deviceFamily : undefined;
-    const modelIdentifier =
-      typeof params.modelIdentifier === "string" ? params.modelIdentifier : undefined;
-    const lastInputSeconds =
-      typeof params.lastInputSeconds === "number" && Number.isFinite(params.lastInputSeconds)
-        ? params.lastInputSeconds
-        : undefined;
-    const reason = typeof params.reason === "string" ? params.reason : undefined;
-    const roles =
-      Array.isArray(params.roles) && params.roles.every((t) => typeof t === "string")
-        ? params.roles
-        : undefined;
-    const scopes =
-      Array.isArray(params.scopes) && params.scopes.every((t) => typeof t === "string")
-        ? params.scopes
-        : undefined;
-    const tags =
-      Array.isArray(params.tags) && params.tags.every((t) => typeof t === "string")
-        ? params.tags
-        : undefined;
+    const requestedSessionKey = normalizeOptionalString(params.sessionKey);
+    const cfg = context.getRuntimeConfig();
+    const requestedOwner = requestedSessionKey
+      ? resolveRequestedSessionAgentId(cfg, requestedSessionKey)
+      : undefined;
+    if (requestedOwner && !requestedOwner.ok) {
+      respond(false, undefined, requestedOwner.error);
+      return;
+    }
+    const systemTarget = requestedSessionKey
+      ? { agentId: requestedOwner?.agentId, sessionKey: requestedSessionKey }
+      : resolveSystemMainSessionTarget(cfg);
+    const { agentId: eventOwnerAgentId, sessionKey } = systemTarget;
+    const wake = params.wake === true;
+    const isNodePresenceLine = text.startsWith("Node:");
+    if (wake && isNodePresenceLine) {
+      respond(
+        false,
+        undefined,
+        errorShape(ErrorCodes.INVALID_REQUEST, "wake is not supported for node presence events"),
+      );
+      return;
+    }
+    if (wake && requestedSessionKey) {
+      const requestedAgentId = normalizeAgentId(
+        requestedOwner?.agentId ?? resolveAgentIdFromSessionKey(requestedSessionKey),
+      );
+      const configuredAgentIds = listAgentIds(cfg).map(normalizeAgentId);
+      if (!configuredAgentIds.includes(requestedAgentId)) {
+        respond(
+          false,
+          undefined,
+          errorShape(ErrorCodes.INVALID_REQUEST, `Unknown agent id "${requestedAgentId}"`),
+        );
+        return;
+      }
+      // A targeted wake starts a model run. Require a live persisted session
+      // so malformed keys cannot create phantom work under agent defaults.
+      const { entry: targetSession } = loadGatewaySessionEntryReadOnly(requestedSessionKey, {
+        agentId: requestedAgentId,
+      });
+      if (!targetSession || targetSession.archivedAt !== undefined) {
+        respond(
+          false,
+          undefined,
+          errorShape(
+            ErrorCodes.INVALID_REQUEST,
+            `Unknown or archived session "${requestedSessionKey}"`,
+          ),
+        );
+        return;
+      }
+    }
+    const reason = params.reason;
+    const lastInputSeconds = params.tags?.includes(SYSTEM_PRESENCE_CLEAR_LAST_INPUT_TAG)
+      ? null
+      : params.lastInputSeconds;
     const presenceUpdate = updateSystemPresence({
       text,
-      deviceId,
-      instanceId,
-      host,
-      ip,
-      mode,
-      version,
-      platform,
-      deviceFamily,
-      modelIdentifier,
+      deviceId: params.deviceId,
+      instanceId: params.instanceId,
+      host: params.host,
+      ip: params.ip,
+      mode: params.mode,
+      version: params.version,
+      platform: params.platform,
+      deviceFamily: params.deviceFamily,
+      modelIdentifier: params.modelIdentifier,
       lastInputSeconds,
       reason,
-      roles,
-      scopes,
-      tags,
+      roles: params.roles,
+      scopes: params.scopes,
+      tags: params.tags,
     });
-    const isNodePresenceLine = text.startsWith("Node:");
     if (isNodePresenceLine) {
+      // Node presence heartbeats are noisy; only enqueue user-visible system
+      // events when routing context or meaningful node metadata changes.
       const next = presenceUpdate.next;
       const changed = new Set(presenceUpdate.changedKeys);
       const reasonValue = next.reason ?? reason;
-      const normalizedReason = (reasonValue ?? "").toLowerCase();
+      const normalizedReason = normalizeLowercaseStringOrEmpty(reasonValue);
       const ignoreReason =
-        normalizedReason.startsWith("periodic") || normalizedReason === "heartbeat";
+        normalizedReason.startsWith("periodic") ||
+        normalizedReason === "heartbeat" ||
+        normalizedReason === "connect" ||
+        normalizedReason === "launch" ||
+        normalizedReason === "instances-refresh";
       const hostChanged = changed.has("host");
       const ipChanged = changed.has("ip");
       const versionChanged = changed.has("version");
@@ -112,38 +346,65 @@ export const systemHandlers: GatewayRequestHandlers = {
       const reasonChanged = changed.has("reason") && !ignoreReason;
       const hasChanges = hostChanged || ipChanged || versionChanged || modeChanged || reasonChanged;
       if (hasChanges) {
-        const contextChanged = isSystemEventContextChanged(sessionKey, presenceUpdate.key);
+        const contextChanged = isSystemEventContextChanged(
+          resolveSystemEventQueueKey(sessionKey, eventOwnerAgentId),
+          presenceUpdate.key,
+        );
         const parts: string[] = [];
+        // Re-state node identity only when the line would otherwise lose
+        // routing context or the host/IP changed.
         if (contextChanged || hostChanged || ipChanged) {
-          const hostLabel = next.host?.trim() || "Unknown";
-          const ipLabel = next.ip?.trim();
+          const hostLabel = normalizeOptionalString(next.host) ?? "Unknown";
+          const ipLabel = normalizeOptionalString(next.ip);
           parts.push(`Node: ${hostLabel}${ipLabel ? ` (${ipLabel})` : ""}`);
         }
         if (versionChanged) {
-          parts.push(`app ${next.version?.trim() || "unknown"}`);
+          parts.push(`app ${normalizeOptionalString(next.version) ?? "unknown"}`);
         }
         if (modeChanged) {
-          parts.push(`mode ${next.mode?.trim() || "unknown"}`);
+          parts.push(`mode ${normalizeOptionalString(next.mode) ?? "unknown"}`);
         }
         if (reasonChanged) {
-          parts.push(`reason ${reasonValue?.trim() || "event"}`);
+          parts.push(`reason ${normalizeOptionalString(reasonValue) ?? "event"}`);
         }
         const deltaText = parts.join(" · ");
         if (deltaText) {
-          enqueueSystemEvent(deltaText, {
+          const eventOptions = {
             sessionKey,
             contextKey: presenceUpdate.key,
-          });
+          };
+          enqueueSystemEvent(
+            deltaText,
+            eventOwnerAgentId
+              ? withSystemEventOwner(eventOptions, eventOwnerAgentId)
+              : eventOptions,
+          );
         }
       }
     } else {
-      enqueueSystemEvent(text, { sessionKey });
+      const eventOptions = { sessionKey };
+      enqueueSystemEvent(
+        text,
+        eventOwnerAgentId ? withSystemEventOwner(eventOptions, eventOwnerAgentId) : eventOptions,
+      );
+      if (wake) {
+        // Targeted admin events may need a proactive response. Carry the exact
+        // session through the wake so its delivery context, not main, wins.
+        requestHeartbeat({
+          source: "notifications-event",
+          intent: "immediate",
+          // The dispatcher recognizes "wake" as a payload-bearing run, so an
+          // empty monitor scratch cannot suppress this queued system event.
+          reason: "wake",
+          ...(!requestedSessionKey && eventOwnerAgentId ? { agentId: eventOwnerAgentId } : {}),
+          sessionKey,
+          heartbeat: { target: "last" },
+        });
+      }
     }
-    broadcastPresenceSnapshot({
-      broadcast: context.broadcast,
-      incrementPresenceVersion: context.incrementPresenceVersion,
-      getHealthVersion: context.getHealthVersion,
-    });
+    // Presence changes are observable even when noisy node heartbeat text is
+    // suppressed from the transcript-style system event queue.
+    context.publishPresence();
     respond(true, { ok: true }, undefined);
   },
 };

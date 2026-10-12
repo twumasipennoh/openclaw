@@ -1,10 +1,27 @@
-import type { SystemRunApprovalPlan } from "./exec-approvals.js";
-import { normalizeSystemRunApprovalPlan } from "./system-run-approval-binding.js";
+import { isRecord } from "@openclaw/normalization-core/record-coerce";
+import type {
+  AllowAlwaysPattern,
+  ExecAsk,
+  ExecSecurity,
+  SystemRunApprovalPlan,
+} from "./exec-approvals.js";
+import { normalizeSystemRunApprovalPlan } from "./system-run-approval-plan.js";
 import { formatExecCommand, resolveSystemRunCommandRequest } from "./system-run-command.js";
 import { normalizeNonEmptyString, normalizeStringArray } from "./system-run-normalize.js";
 
+// System-run approval context normalizes prepared node-run payloads before exec policy.
+export type PreparedRunExecPolicy = {
+  security: ExecSecurity;
+  ask: ExecAsk;
+};
+
 type PreparedRunPayload = {
   plan: SystemRunApprovalPlan;
+  execPolicy?: PreparedRunExecPolicy;
+  allowAlwaysCoverage?: {
+    complete: boolean;
+    patterns: AllowAlwaysPattern[];
+  };
 };
 
 type SystemRunApprovalRequestContext = {
@@ -48,36 +65,55 @@ function normalizeCommandPreview(
   return preview;
 }
 
-export function parsePreparedSystemRunPayload(payload: unknown): PreparedRunPayload | null {
-  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+function normalizePreparedRunExecPolicy(raw: unknown): PreparedRunExecPolicy | undefined {
+  if (!isRecord(raw)) {
+    return undefined;
+  }
+  const { security, ask } = raw;
+  if (
+    (security === "deny" || security === "allowlist" || security === "full") &&
+    (ask === "off" || ask === "on-miss" || ask === "always")
+  ) {
+    return { security, ask };
+  }
+  return undefined;
+}
+
+function normalizeAllowAlwaysCoverage(raw: unknown): PreparedRunPayload["allowAlwaysCoverage"] {
+  if (!isRecord(raw) || !Array.isArray(raw.patterns)) {
+    return undefined;
+  }
+  const patterns = raw.patterns.flatMap((entry): AllowAlwaysPattern[] => {
+    if (!isRecord(entry)) {
+      return [];
+    }
+    const pattern = normalizeNonEmptyString(entry.pattern);
+    if (!pattern) {
+      return [];
+    }
+    const argPattern = normalizeNonEmptyString(entry.argPattern);
+    return [{ pattern, ...(argPattern ? { argPattern } : {}) }];
+  });
+  return {
+    complete: raw.complete === true,
+    patterns,
+  };
+}
+
+export function parsePreparedSystemRunPayload(raw: unknown): PreparedRunPayload | null {
+  if (!isRecord(raw)) {
     return null;
   }
-  const raw = payload as { plan?: unknown; commandText?: unknown; cmdText?: unknown };
+  const execPolicy = normalizePreparedRunExecPolicy(raw.execPolicy);
+  const allowAlwaysCoverage = normalizeAllowAlwaysCoverage(raw.allowAlwaysCoverage);
   const plan = normalizeSystemRunApprovalPlan(raw.plan);
-  if (plan) {
-    return { plan };
-  }
-  if (!raw.plan || typeof raw.plan !== "object" || Array.isArray(raw.plan)) {
-    return null;
-  }
-  const legacyPlan = raw.plan as Record<string, unknown>;
-  const argv = normalizeStringArray(legacyPlan.argv);
-  const commandText =
-    normalizeNonEmptyString(legacyPlan.rawCommand) ??
-    normalizeNonEmptyString(raw.commandText) ??
-    normalizeNonEmptyString(raw.cmdText);
-  if (argv.length === 0 || !commandText) {
+  if (!plan) {
     return null;
   }
   return {
-    plan: {
-      argv,
-      cwd: normalizeNonEmptyString(legacyPlan.cwd),
-      commandText,
-      commandPreview: normalizeNonEmptyString(legacyPlan.commandPreview),
-      agentId: normalizeNonEmptyString(legacyPlan.agentId),
-      sessionKey: normalizeNonEmptyString(legacyPlan.sessionKey),
-    },
+    plan,
+    ...(execPolicy ? { execPolicy } : {}),
+    ...(allowAlwaysCoverage ? { allowAlwaysCoverage } : {}),
   };
 }
 
@@ -113,6 +149,7 @@ export function resolveSystemRunApprovalRequestContext(params: {
   };
 }
 
+/** Build the runtime approval context from already-normalized command inputs. */
 export function resolveSystemRunApprovalRuntimeContext(params: {
   plan?: unknown;
   command?: unknown;

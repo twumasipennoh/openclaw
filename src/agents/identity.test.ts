@@ -1,3 +1,7 @@
+/**
+ * Regression coverage for identity-driven acknowledgement reactions.
+ * Confirms account, channel, global, identity, and explicit-empty precedence.
+ */
 import { describe, expect, it } from "vitest";
 import type { OpenClawConfig } from "../config/config.js";
 import { resolveAckReaction } from "./identity.js";
@@ -6,7 +10,7 @@ describe("resolveAckReaction", () => {
   it("prefers account-level overrides", () => {
     const cfg: OpenClawConfig = {
       messages: { ackReaction: "👀" },
-      agents: { list: [{ id: "main", identity: { emoji: "✅" } }] },
+      agents: { entries: { main: { identity: { emoji: "✅" } } } },
       channels: {
         slack: {
           ackReaction: "eyes",
@@ -25,7 +29,7 @@ describe("resolveAckReaction", () => {
   it("falls back to channel-level overrides", () => {
     const cfg: OpenClawConfig = {
       messages: { ackReaction: "👀" },
-      agents: { list: [{ id: "main", identity: { emoji: "✅" } }] },
+      agents: { entries: { main: { identity: { emoji: "✅" } } } },
       channels: {
         slack: {
           ackReaction: "eyes",
@@ -44,7 +48,7 @@ describe("resolveAckReaction", () => {
   it("uses the global ackReaction when channel overrides are missing", () => {
     const cfg: OpenClawConfig = {
       messages: { ackReaction: "✅" },
-      agents: { list: [{ id: "main", identity: { emoji: "😺" } }] },
+      agents: { entries: { main: { identity: { emoji: "😺" } } } },
     };
 
     expect(resolveAckReaction(cfg, "main", { channel: "discord" })).toBe("✅");
@@ -52,7 +56,7 @@ describe("resolveAckReaction", () => {
 
   it("falls back to the agent identity emoji when global config is unset", () => {
     const cfg: OpenClawConfig = {
-      agents: { list: [{ id: "main", identity: { emoji: "🔥" } }] },
+      agents: { entries: { main: { identity: { emoji: "🔥" } } } },
     };
 
     expect(resolveAckReaction(cfg, "main", { channel: "discord" })).toBe("🔥");

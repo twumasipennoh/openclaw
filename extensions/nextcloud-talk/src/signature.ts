@@ -1,4 +1,5 @@
 import { createHmac, randomBytes } from "node:crypto";
+import { safeEqualSecret } from "openclaw/plugin-sdk/security-runtime";
 import type { NextcloudTalkWebhookHeaders } from "./types.js";
 
 const SIGNATURE_HEADER = "x-nextcloud-talk-signature";
@@ -24,24 +25,14 @@ export function verifyNextcloudTalkSignature(params: {
     .update(random + body)
     .digest("hex");
 
-  if (signature.length !== expected.length) {
-    return false;
-  }
-  let result = 0;
-  for (let i = 0; i < signature.length; i++) {
-    result |= signature.charCodeAt(i) ^ expected.charCodeAt(i);
-  }
-  return result === 0;
+  return safeEqualSecret(signature, expected);
 }
 
-/**
- * Extract webhook headers from an incoming request.
- */
 export function extractNextcloudTalkHeaders(
   headers: Record<string, string | string[] | undefined>,
 ): NextcloudTalkWebhookHeaders | null {
   const getHeader = (name: string): string | undefined => {
-    const value = headers[name] ?? headers[name.toLowerCase()];
+    const value = headers[name];
     return Array.isArray(value) ? value[0] : value;
   };
 

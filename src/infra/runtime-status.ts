@@ -1,3 +1,5 @@
+import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
+
 type RuntimeStatusFormatInput = {
   status?: string;
   pid?: number;
@@ -17,11 +19,17 @@ export function formatRuntimeStatusWithDetails({
     fullDetails.push(`pid ${pid}`);
   }
   const normalizedState = state?.trim();
-  if (normalizedState && normalizedState.toLowerCase() !== runtimeStatus.toLowerCase()) {
+  if (
+    normalizedState &&
+    // State often mirrors status from different process managers; suppressing
+    // case-only duplicates keeps restart/status output readable.
+    normalizeLowercaseStringOrEmpty(normalizedState) !==
+      normalizeLowercaseStringOrEmpty(runtimeStatus)
+  ) {
     fullDetails.push(`state ${normalizedState}`);
   }
   for (const detail of details) {
-    const normalizedDetail = detail.trim();
+    const normalizedDetail = detail.replace(/\s+/g, " ").trim();
     if (normalizedDetail) {
       fullDetails.push(normalizedDetail);
     }

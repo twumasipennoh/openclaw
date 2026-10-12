@@ -1,10 +1,9 @@
 import crypto from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { createMockIncomingRequest } from "openclaw/plugin-sdk/test-env";
 import { describe, expect, it, vi } from "vitest";
-import { createMockIncomingRequest } from "../../../test/helpers/mock-incoming-request.js";
+import { createRuntimeSpies } from "../../test-support/runtime-spies.js";
 import { createLineNodeWebhookHandler } from "./webhook-node.js";
-import { readLineWebhookRequestBody } from "./webhook-node.js";
-import { createLineWebhookMiddleware, startLineWebhook } from "./webhook.js";
 
 const sign = (body: string, secret: string) =>
   crypto.createHmac("SHA256", secret).update(body).digest("base64");
@@ -30,24 +29,22 @@ function createRes() {
 
 const SECRET = "secret";
 
-function createMiddlewareRes() {
-  const res = {
-    status: vi.fn(),
-    json: vi.fn(),
-    headersSent: false,
-    // oxlint-disable-next-line typescript/no-explicit-any
-  } as any;
-  res.status.mockReturnValue(res);
-  res.json.mockReturnValue(res);
-  return res;
+function firstMockCall(
+  mock: { mock: { calls: Array<readonly unknown[]> } },
+  label: string,
+): readonly unknown[] {
+  const call = mock.mock.calls[0];
+  if (!call) {
+    throw new Error(`expected ${label} call`);
+  }
+  return call;
 }
 
 function createPostWebhookTestHarness(rawBody: string, secret = "secret") {
-  const bot = { handleWebhook: vi.fn(async () => {}) };
-  const runtime = { log: vi.fn(), error: vi.fn(), exit: vi.fn() };
+  const bot = { handleWebhook: vi.fn(async () => "durable" as const) };
+  const runtime = createRuntimeSpies();
   const handler = createLineNodeWebhookHandler({
-    channelSecret: secret,
-    bot,
+    getTargets: () => [{ channelSecret: secret, bot }],
     runtime,
     readBody: async () => rawBody,
   });
@@ -68,77 +65,123 @@ const runSignedPost = async (params: {
     params.res,
   );
 
-async function invokeWebhook(params: {
-  body: unknown;
-  headers?: Record<string, string>;
-  onEvents?: ReturnType<typeof vi.fn>;
-  autoSign?: boolean;
-}) {
-  const onEventsMock = params.onEvents ?? vi.fn(async () => {});
-  const middleware = createLineWebhookMiddleware({
-    channelSecret: SECRET,
-    onEvents: onEventsMock as never,
-  });
-
-  const headers = { ...params.headers };
-  const autoSign = params.autoSign ?? true;
-  if (autoSign && !headers["x-line-signature"]) {
-    if (typeof params.body === "string") {
-      headers["x-line-signature"] = sign(params.body, SECRET);
-    } else if (Buffer.isBuffer(params.body)) {
-      headers["x-line-signature"] = sign(params.body.toString("utf-8"), SECRET);
-    }
+const parseResponseBody = (body: unknown) => {
+  if (typeof body !== "string") {
+    return body;
   }
+  try {
+    return JSON.parse(body) as unknown;
+  } catch {
+    return body;
+  }
+};
 
-  const req = {
-    headers,
-    body: params.body,
-    // oxlint-disable-next-line typescript/no-explicit-any
-  } as any;
-  const res = createMiddlewareRes();
-  // oxlint-disable-next-line typescript/no-explicit-any
-  await middleware(req, res, {} as any);
-  return { res, onEvents: onEventsMock };
-}
-
-async function expectSignedRawBodyWins(params: { rawBody: string | Buffer; signedUserId: string }) {
-  const onEvents = vi.fn(async () => {});
-  const reqBody = {
-    events: [{ type: "message", source: { userId: "tampered-user" } }],
-  };
-  const middleware = createLineWebhookMiddleware({
-    channelSecret: SECRET,
-    onEvents,
+async function invokeNodePostContract(params: {
+  failWith?: unknown;
+  rawBody: string;
+  signed: boolean;
+  parsedBody?: unknown;
+}) {
+  const dispatched = vi.fn(async () => {
+    if (params.failWith) {
+      // oxlint-disable-next-line typescript/only-throw-error -- Webhook boundaries must report non-Error throws from downstream dispatchers.
+      throw params.failWith;
+    }
+    return "durable" as const;
   });
-  const rawBodyText =
-    typeof params.rawBody === "string" ? params.rawBody : params.rawBody.toString("utf-8");
-  const req = {
-    headers: { "x-line-signature": sign(rawBodyText, SECRET) },
-    rawBody: params.rawBody,
-    body: reqBody,
-    // oxlint-disable-next-line typescript/no-explicit-any
-  } as any;
-  const res = createMiddlewareRes();
-
-  // oxlint-disable-next-line typescript/no-explicit-any
-  await middleware(req, res, {} as any);
-
-  expect(res.status).toHaveBeenCalledWith(200);
-  expect(onEvents).toHaveBeenCalledTimes(1);
-  const processedBody = (
-    onEvents.mock.calls[0] as unknown as [{ events?: Array<{ source?: { userId?: string } }> }]
-  )?.[0];
-  expect(processedBody?.events?.[0]?.source?.userId).toBe(params.signedUserId);
-  expect(processedBody?.events?.[0]?.source?.userId).not.toBe("tampered-user");
+  const runtime = createRuntimeSpies();
+  const handler = createLineNodeWebhookHandler({
+    getTargets: () => [{ channelSecret: SECRET, bot: { handleWebhook: dispatched } }],
+    runtime,
+  });
+  const { res, headers } = createRes();
+  const req = Object.assign(createMockIncomingRequest([params.rawBody]), {
+    method: "POST",
+    headers: params.signed ? { "x-line-signature": sign(params.rawBody, SECRET) } : {},
+    body: params.parsedBody,
+  });
+  await handler(req, res);
+  return {
+    body: parseResponseBody(res.body),
+    contentType: headers["content-type"],
+    dispatched,
+    runtimeError: runtime.error,
+    status: res.statusCode,
+  };
 }
+
+describe("LINE webhook POST contract", () => {
+  it("rejects verification-shaped requests without a signature", async () => {
+    const result = await invokeNodePostContract({
+      rawBody: JSON.stringify({ events: [] }),
+      signed: false,
+    });
+
+    expect(result.status).toBe(400);
+    expect(result.body).toEqual({ error: "Missing X-Line-Signature header" });
+    expect(result.contentType).toBe("application/json");
+    expect(result.dispatched).not.toHaveBeenCalled();
+  });
+
+  it("accepts signed verification-shaped requests without dispatching events", async () => {
+    const result = await invokeNodePostContract({
+      rawBody: JSON.stringify({ events: [] }),
+      signed: true,
+    });
+
+    expect(result.status).toBe(200);
+    expect(result.body).toEqual({ status: "ok" });
+    expect(result.contentType).toBe("application/json");
+    expect(result.dispatched).not.toHaveBeenCalled();
+  });
+
+  it("rejects missing signature when events are non-empty", async () => {
+    const result = await invokeNodePostContract({
+      rawBody: JSON.stringify({ events: [{ type: "message" }] }),
+      signed: false,
+    });
+
+    expect(result.status).toBe(400);
+    expect(result.body).toEqual({ error: "Missing X-Line-Signature header" });
+    expect(result.dispatched).not.toHaveBeenCalled();
+  });
+
+  it("returns 500 when durable admission fails", async () => {
+    const result = await invokeNodePostContract({
+      failWith: new Error("persist failed"),
+      rawBody: JSON.stringify({ events: [{ type: "message" }] }),
+      signed: true,
+    });
+
+    expect(result.status).toBe(500);
+    expect(result.body).toEqual({ error: "Internal server error" });
+    expect(result.runtimeError).toHaveBeenCalledTimes(1);
+  });
+
+  it("reports non-Error admission failures without object Object", async () => {
+    const result = await invokeNodePostContract({
+      failWith: { code: "LINE_ADMISSION_REJECTED", retryAfterMs: 250 },
+      rawBody: JSON.stringify({ events: [{ type: "message" }] }),
+      signed: true,
+    });
+
+    expect(result.status).toBe(500);
+    expect(result.body).toEqual({ error: "Internal server error" });
+    expect(result.runtimeError).toHaveBeenCalledTimes(1);
+    const runtimeMessage = String(firstMockCall(result.runtimeError, "runtime error")[0]);
+    expect(runtimeMessage).toContain("line webhook error:");
+    expect(runtimeMessage).toContain("LINE_ADMISSION_REJECTED");
+    expect(runtimeMessage).toContain("retryAfterMs");
+    expect(runtimeMessage).not.toContain("[object Object]");
+  });
+});
 
 describe("createLineNodeWebhookHandler", () => {
   it("returns 200 for GET", async () => {
-    const bot = { handleWebhook: vi.fn(async () => {}) };
-    const runtime = { log: vi.fn(), error: vi.fn(), exit: vi.fn() };
+    const bot = { handleWebhook: vi.fn(async () => "durable" as const) };
+    const runtime = createRuntimeSpies();
     const handler = createLineNodeWebhookHandler({
-      channelSecret: "secret",
-      bot,
+      getTargets: () => [{ channelSecret: "secret", bot }],
       runtime,
       readBody: async () => "",
     });
@@ -151,11 +194,10 @@ describe("createLineNodeWebhookHandler", () => {
   });
 
   it("returns 204 for HEAD", async () => {
-    const bot = { handleWebhook: vi.fn(async () => {}) };
-    const runtime = { log: vi.fn(), error: vi.fn(), exit: vi.fn() };
+    const bot = { handleWebhook: vi.fn(async () => "durable" as const) };
+    const runtime = createRuntimeSpies();
     const handler = createLineNodeWebhookHandler({
-      channelSecret: "secret",
-      bot,
+      getTargets: () => [{ channelSecret: "secret", bot }],
       runtime,
       readBody: async () => "",
     });
@@ -165,32 +207,6 @@ describe("createLineNodeWebhookHandler", () => {
 
     expect(res.statusCode).toBe(204);
     expect(res.body).toBeUndefined();
-  });
-
-  it("rejects verification-shaped requests without a signature", async () => {
-    const rawBody = JSON.stringify({ events: [] });
-    const { bot, handler } = createPostWebhookTestHarness(rawBody);
-
-    const { res, headers } = createRes();
-    await handler({ method: "POST", headers: {} } as unknown as IncomingMessage, res);
-
-    expect(res.statusCode).toBe(400);
-    expect(headers["content-type"]).toBe("application/json");
-    expect(res.body).toBe(JSON.stringify({ error: "Missing X-Line-Signature header" }));
-    expect(bot.handleWebhook).not.toHaveBeenCalled();
-  });
-
-  it("accepts signed verification-shaped requests without dispatching events", async () => {
-    const rawBody = JSON.stringify({ events: [] });
-    const { bot, handler, secret } = createPostWebhookTestHarness(rawBody);
-
-    const { res, headers } = createRes();
-    await runSignedPost({ handler, rawBody, secret, res });
-
-    expect(res.statusCode).toBe(200);
-    expect(headers["content-type"]).toBe("application/json");
-    expect(res.body).toBe(JSON.stringify({ status: "ok" }));
-    expect(bot.handleWebhook).not.toHaveBeenCalled();
   });
 
   it("returns 405 for non-GET/HEAD/POST methods", async () => {
@@ -204,24 +220,12 @@ describe("createLineNodeWebhookHandler", () => {
     expect(bot.handleWebhook).not.toHaveBeenCalled();
   });
 
-  it("rejects missing signature when events are non-empty", async () => {
-    const rawBody = JSON.stringify({ events: [{ type: "message" }] });
-    const { bot, handler } = createPostWebhookTestHarness(rawBody);
-
-    const { res } = createRes();
-    await handler({ method: "POST", headers: {} } as unknown as IncomingMessage, res);
-
-    expect(res.statusCode).toBe(400);
-    expect(bot.handleWebhook).not.toHaveBeenCalled();
-  });
-
   it("rejects unsigned POST requests before reading the body", async () => {
-    const bot = { handleWebhook: vi.fn(async () => {}) };
-    const runtime = { log: vi.fn(), error: vi.fn(), exit: vi.fn() };
+    const bot = { handleWebhook: vi.fn(async () => "durable" as const) };
+    const runtime = createRuntimeSpies();
     const readBody = vi.fn(async () => JSON.stringify({ events: [{ type: "message" }] }));
     const handler = createLineNodeWebhookHandler({
-      channelSecret: "secret",
-      bot,
+      getTargets: () => [{ channelSecret: "secret", bot }],
       runtime,
       readBody,
     });
@@ -236,16 +240,15 @@ describe("createLineNodeWebhookHandler", () => {
 
   it("uses strict pre-auth limits for signed POST requests", async () => {
     const rawBody = JSON.stringify({ events: [{ type: "message" }] });
-    const bot = { handleWebhook: vi.fn(async () => {}) };
-    const runtime = { log: vi.fn(), error: vi.fn(), exit: vi.fn() };
+    const bot = { handleWebhook: vi.fn(async () => "durable" as const) };
+    const runtime = createRuntimeSpies();
     const readBody = vi.fn(async (_req: IncomingMessage, maxBytes: number, timeoutMs?: number) => {
       expect(maxBytes).toBe(64 * 1024);
       expect(timeoutMs).toBe(5_000);
       return rawBody;
     });
     const handler = createLineNodeWebhookHandler({
-      channelSecret: "secret",
-      bot,
+      getTargets: () => [{ channelSecret: "secret", bot }],
       runtime,
       readBody,
       maxBodyBytes: 1024 * 1024,
@@ -259,8 +262,8 @@ describe("createLineNodeWebhookHandler", () => {
     expect(bot.handleWebhook).toHaveBeenCalledTimes(1);
   });
 
-  it("rejects invalid signature", async () => {
-    const rawBody = JSON.stringify({ events: [{ type: "message" }] });
+  it("rejects invalid signatures before parsing the body", async () => {
+    const rawBody = "not json";
     const { bot, handler } = createPostWebhookTestHarness(rawBody);
 
     const { res } = createRes();
@@ -273,251 +276,60 @@ describe("createLineNodeWebhookHandler", () => {
     expect(bot.handleWebhook).not.toHaveBeenCalled();
   });
 
-  it("accepts valid signature and dispatches events", async () => {
-    const rawBody = JSON.stringify({ events: [{ type: "message" }] });
-    const { bot, handler, secret } = createPostWebhookTestHarness(rawBody);
+  it("dispatches signed request bytes instead of a pre-parsed body", async () => {
+    const result = await invokeNodePostContract({
+      rawBody: JSON.stringify({
+        events: [{ type: "message", source: { userId: "signed-user" } }],
+      }),
+      signed: true,
+      parsedBody: { events: [{ type: "message", source: { userId: "tampered-user" } }] },
+    });
 
-    const { res } = createRes();
-    await runSignedPost({ handler, rawBody, secret, res });
-
-    expect(res.statusCode).toBe(200);
-    expect(bot.handleWebhook).toHaveBeenCalledWith(
-      expect.objectContaining({ events: expect.any(Array) }),
-    );
+    expect(result.status).toBe(200);
+    expect(result.body).toEqual({ status: "ok" });
+    expect(result.dispatched).toHaveBeenCalledExactlyOnceWith({
+      events: [{ type: "message", source: { userId: "signed-user" } }],
+    });
   });
 
-  it("releases authenticated requests before event processing completes", async () => {
+  it("waits for durable admission before acknowledging signed event requests", async () => {
     const rawBody = JSON.stringify({ events: [{ type: "message" }] });
-    let releaseAuthenticated!: () => void;
+    const admitted = Promise.withResolvers<void>();
+    const delivery = Promise.withResolvers<"durable">();
     const bot = {
-      handleWebhook: vi.fn(
-        async () =>
-          await new Promise<void>((resolve) => {
-            releaseAuthenticated = resolve;
-          }),
-      ),
+      handleWebhook: vi.fn(async () => {
+        admitted.resolve();
+        return delivery.promise;
+      }),
     };
-    const onRequestAuthenticated = vi.fn();
-    const runtime = { log: vi.fn(), error: vi.fn(), exit: vi.fn() };
+    const runtime = createRuntimeSpies();
     const handler = createLineNodeWebhookHandler({
-      channelSecret: SECRET,
-      bot,
+      getTargets: () => [{ channelSecret: SECRET, bot }],
       runtime,
       readBody: async () => rawBody,
-      onRequestAuthenticated,
     });
 
     const { res } = createRes();
     const request = runSignedPost({ handler, rawBody, secret: SECRET, res });
 
-    await vi.waitFor(() => {
-      expect(onRequestAuthenticated).toHaveBeenCalledTimes(1);
-      expect(bot.handleWebhook).toHaveBeenCalledTimes(1);
-    });
-
+    await admitted.promise;
+    expect(bot.handleWebhook).toHaveBeenCalledTimes(1);
     expect(res.headersSent).toBe(false);
-    releaseAuthenticated();
+    delivery.resolve("durable");
     await request;
-
     expect(res.statusCode).toBe(200);
+    expect(res.headersSent).toBe(true);
   });
 
-  it("returns 500 when event processing fails and does not acknowledge with 200", async () => {
-    const rawBody = JSON.stringify({ events: [{ type: "message" }] });
-    const { secret } = createPostWebhookTestHarness(rawBody);
-    const failingBot = {
-      handleWebhook: vi.fn(async () => {
-        throw new Error("transient failure");
-      }),
-    };
-    const runtime = { log: vi.fn(), error: vi.fn(), exit: vi.fn() };
-    const failingHandler = createLineNodeWebhookHandler({
-      channelSecret: secret,
-      bot: failingBot,
-      runtime,
-      readBody: async () => rawBody,
+  it("rejects invalid signed JSON even when a pre-parsed body is valid", async () => {
+    const result = await invokeNodePostContract({
+      rawBody: "not json",
+      signed: true,
+      parsedBody: { events: [{ type: "message" }] },
     });
 
-    const { res } = createRes();
-    await runSignedPost({ handler: failingHandler, rawBody, secret, res });
-
-    expect(res.statusCode).toBe(500);
-    expect(res.body).toBe(JSON.stringify({ error: "Internal server error" }));
-    expect(failingBot.handleWebhook).toHaveBeenCalledTimes(1);
-    expect(runtime.error).toHaveBeenCalledTimes(1);
-  });
-
-  it("returns 400 for invalid JSON payload even when signature is valid", async () => {
-    const rawBody = "not json";
-    const { bot, handler, secret } = createPostWebhookTestHarness(rawBody);
-
-    const { res } = createRes();
-    await runSignedPost({ handler, rawBody, secret, res });
-
-    expect(res.statusCode).toBe(400);
-    expect(bot.handleWebhook).not.toHaveBeenCalled();
-  });
-});
-
-describe("readLineWebhookRequestBody", () => {
-  it("reads body within limit", async () => {
-    const req = createMockIncomingRequest(['{"events":[{"type":"message"}]}']);
-    const body = await readLineWebhookRequestBody(req, 1024);
-    expect(body).toContain('"events"');
-  });
-
-  it("rejects oversized body", async () => {
-    const req = createMockIncomingRequest(["x".repeat(2048)]);
-    await expect(readLineWebhookRequestBody(req, 128)).rejects.toThrow("PayloadTooLarge");
-  });
-});
-
-describe("createLineWebhookMiddleware", () => {
-  it.each([
-    ["raw string body", JSON.stringify({ events: [{ type: "message" }] })],
-    ["raw buffer body", Buffer.from(JSON.stringify({ events: [{ type: "follow" }] }), "utf-8")],
-  ])("parses JSON from %s", async (_label, body) => {
-    const { res, onEvents } = await invokeWebhook({ body });
-    expect(res.status).toHaveBeenCalledWith(200);
-    expect(onEvents).toHaveBeenCalledWith(expect.objectContaining({ events: expect.any(Array) }));
-  });
-
-  it("rejects invalid JSON payloads", async () => {
-    const { res, onEvents } = await invokeWebhook({ body: "not json" });
-    expect(res.status).toHaveBeenCalledWith(400);
-    expect(onEvents).not.toHaveBeenCalled();
-  });
-
-  it("rejects webhooks with invalid signatures", async () => {
-    const { res, onEvents } = await invokeWebhook({
-      body: JSON.stringify({ events: [{ type: "message" }] }),
-      headers: { "x-line-signature": "invalid-signature" },
-    });
-    expect(res.status).toHaveBeenCalledWith(401);
-    expect(onEvents).not.toHaveBeenCalled();
-  });
-
-  it("rejects verification-shaped requests without a signature", async () => {
-    const { res, onEvents } = await invokeWebhook({
-      body: JSON.stringify({ events: [] }),
-      headers: {},
-      autoSign: false,
-    });
-    expect(res.status).toHaveBeenCalledWith(400);
-    expect(res.json).toHaveBeenCalledWith({ error: "Missing X-Line-Signature header" });
-    expect(onEvents).not.toHaveBeenCalled();
-  });
-
-  it("accepts signed verification-shaped requests without dispatching events", async () => {
-    const { res, onEvents } = await invokeWebhook({
-      body: JSON.stringify({ events: [] }),
-    });
-    expect(res.status).toHaveBeenCalledWith(200);
-    expect(res.json).toHaveBeenCalledWith({ status: "ok" });
-    expect(onEvents).not.toHaveBeenCalled();
-  });
-
-  it("rejects oversized signed payloads before JSON parsing", async () => {
-    const largeBody = JSON.stringify({ events: [], payload: "x".repeat(70 * 1024) });
-    const { res, onEvents } = await invokeWebhook({ body: largeBody });
-    expect(res.status).toHaveBeenCalledWith(413);
-    expect(res.json).toHaveBeenCalledWith({ error: "Payload too large" });
-    expect(onEvents).not.toHaveBeenCalled();
-  });
-
-  it("rejects missing signature when events are non-empty", async () => {
-    const { res, onEvents } = await invokeWebhook({
-      body: JSON.stringify({ events: [{ type: "message" }] }),
-      headers: {},
-      autoSign: false,
-    });
-    expect(res.status).toHaveBeenCalledWith(400);
-    expect(res.json).toHaveBeenCalledWith({ error: "Missing X-Line-Signature header" });
-    expect(onEvents).not.toHaveBeenCalled();
-  });
-
-  it("rejects signed requests when raw body is missing", async () => {
-    const { res, onEvents } = await invokeWebhook({
-      body: { events: [{ type: "message" }] },
-      headers: { "x-line-signature": "signed" },
-    });
-    expect(res.status).toHaveBeenCalledWith(400);
-    expect(res.json).toHaveBeenCalledWith({
-      error: "Missing raw request body for signature verification",
-    });
-    expect(onEvents).not.toHaveBeenCalled();
-  });
-
-  it("uses the signed raw body instead of a pre-parsed req.body object", async () => {
-    await expectSignedRawBodyWins({
-      rawBody: JSON.stringify({
-        events: [{ type: "message", source: { userId: "signed-user" } }],
-      }),
-      signedUserId: "signed-user",
-    });
-  });
-
-  it("uses signed raw buffer body instead of a pre-parsed req.body object", async () => {
-    await expectSignedRawBodyWins({
-      rawBody: Buffer.from(
-        JSON.stringify({
-          events: [{ type: "message", source: { userId: "signed-buffer-user" } }],
-        }),
-        "utf-8",
-      ),
-      signedUserId: "signed-buffer-user",
-    });
-  });
-
-  it("rejects invalid signed raw JSON even when req.body is a valid object", async () => {
-    const onEvents = vi.fn(async () => {});
-    const rawBody = "not-json";
-    const middleware = createLineWebhookMiddleware({
-      channelSecret: SECRET,
-      onEvents,
-    });
-
-    const req = {
-      headers: { "x-line-signature": sign(rawBody, SECRET) },
-      rawBody,
-      body: { events: [{ type: "message" }] },
-      // oxlint-disable-next-line typescript/no-explicit-any
-    } as any;
-    const res = createMiddlewareRes();
-
-    // oxlint-disable-next-line typescript/no-explicit-any
-    await middleware(req, res, {} as any);
-
-    expect(res.status).toHaveBeenCalledWith(400);
-    expect(res.json).toHaveBeenCalledWith({ error: "Invalid webhook payload" });
-    expect(onEvents).not.toHaveBeenCalled();
-  });
-
-  it("returns 500 when event processing fails and does not acknowledge with 200", async () => {
-    const onEvents = vi.fn(async () => {
-      throw new Error("boom");
-    });
-    const runtime = { log: vi.fn(), error: vi.fn(), exit: vi.fn() };
-    const rawBody = JSON.stringify({ events: [{ type: "message" }] });
-    const middleware = createLineWebhookMiddleware({
-      channelSecret: SECRET,
-      onEvents,
-      runtime,
-    });
-
-    const req = {
-      headers: { "x-line-signature": sign(rawBody, SECRET) },
-      body: rawBody,
-      // oxlint-disable-next-line typescript/no-explicit-any
-    } as any;
-    const res = createMiddlewareRes();
-
-    // oxlint-disable-next-line typescript/no-explicit-any
-    await middleware(req, res, {} as any);
-
-    expect(res.status).toHaveBeenCalledWith(500);
-    expect(res.status).not.toHaveBeenCalledWith(200);
-    expect(res.json).toHaveBeenCalledWith({ error: "Internal server error" });
-    expect(runtime.error).toHaveBeenCalled();
+    expect(result.status).toBe(400);
+    expect(result.body).toEqual({ error: "Invalid webhook payload" });
+    expect(result.dispatched).not.toHaveBeenCalled();
   });
 });

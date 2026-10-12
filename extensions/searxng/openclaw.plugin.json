@@ -1,5 +1,9 @@
 {
   "id": "searxng",
+  "categories": ["web"],
+  "activation": {
+    "onStartup": false
+  },
   "uiHints": {
     "webSearch.baseUrl": {
       "label": "SearXNG Base URL",
@@ -17,6 +21,14 @@
   "contracts": {
     "webSearchProviders": ["searxng"]
   },
+  "configGroups": [
+    {
+      "id": "web-search",
+      "title": "Web search",
+      "order": 10,
+      "properties": ["webSearch"]
+    }
+  ],
   "configSchema": {
     "type": "object",
     "additionalProperties": false,

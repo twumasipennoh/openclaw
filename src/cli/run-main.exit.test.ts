@@ -1,187 +1,219 @@
+// Register fixture mocks before modules that consume them.
+// oxfmt-ignore
+import {
+  installRunMainTestHooks,
+  cliArgs,
+  runCli,
+  tryRouteCliMock,
+  loadDotEnvMock,
+  closeActiveMemorySearchManagersMock,
+  hasMemoryRuntimeMock,
+  listRegisteredAgentHarnessesMock,
+  disposeRegisteredAgentHarnessesMock,
+  hasProviderTransportDispatcherPoolMock,
+  stopManagedProviderLocalServicesMock,
+  closeProviderTransportDispatcherPoolMock,
+  getActiveMcpLoopbackRuntimeMock,
+  closeMcpLoopbackServerMock,
+  buildProgramMock,
+  registerSubCliByNameMock,
+  restoreRuntimeTerminalStateMock,
+  enableConsoleCaptureMock,
+  startProxyMock,
+  stopProxyMock,
+  flushExitAfterOneShotOutputMock,
+  requestExitAfterOneShotOutputMock,
+  maybeRunCliInContainerMock,
+} from "./run-main.test-support.js";
 import process from "node:process";
 import { CommanderError } from "commander";
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import { runCli } from "./run-main.js";
-
-const tryRouteCliMock = vi.hoisted(() => vi.fn());
-const loadDotEnvMock = vi.hoisted(() => vi.fn());
-const normalizeEnvMock = vi.hoisted(() => vi.fn());
-const ensurePathMock = vi.hoisted(() => vi.fn());
-const assertRuntimeMock = vi.hoisted(() => vi.fn());
-const closeActiveMemorySearchManagersMock = vi.hoisted(() => vi.fn(async () => {}));
-const hasMemoryRuntimeMock = vi.hoisted(() => vi.fn(() => false));
-const ensureTaskRegistryReadyMock = vi.hoisted(() => vi.fn());
-const startTaskRegistryMaintenanceMock = vi.hoisted(() => vi.fn());
-const outputRootHelpMock = vi.hoisted(() => vi.fn());
-const outputPrecomputedRootHelpTextMock = vi.hoisted(() => vi.fn(() => false));
-const buildProgramMock = vi.hoisted(() => vi.fn());
-const getProgramContextMock = vi.hoisted(() => vi.fn(() => null));
-const registerCoreCliByNameMock = vi.hoisted(() => vi.fn());
-const registerSubCliByNameMock = vi.hoisted(() => vi.fn());
-const maybeRunCliInContainerMock = vi.hoisted(() =>
-  vi.fn<
-    (argv: string[]) => { handled: true; exitCode: number } | { handled: false; argv: string[] }
-  >((argv: string[]) => ({ handled: false, argv })),
-);
-
-vi.mock("./route.js", () => ({
-  tryRouteCli: tryRouteCliMock,
-}));
-
-vi.mock("./container-target.js", () => ({
-  maybeRunCliInContainer: maybeRunCliInContainerMock,
-  parseCliContainerArgs: (argv: string[]) => ({ ok: true, container: null, argv }),
-}));
-
-vi.mock("./dotenv.js", () => ({
-  loadCliDotEnv: loadDotEnvMock,
-}));
-
-vi.mock("../infra/env.js", () => ({
-  normalizeEnv: normalizeEnvMock,
-}));
-
-vi.mock("../infra/path-env.js", () => ({
-  ensureOpenClawCliOnPath: ensurePathMock,
-}));
-
-vi.mock("../infra/runtime-guard.js", () => ({
-  assertSupportedRuntime: assertRuntimeMock,
-}));
-
-vi.mock("../plugins/memory-runtime.js", () => ({
-  closeActiveMemorySearchManagers: closeActiveMemorySearchManagersMock,
-}));
-
-vi.mock("../plugins/memory-state.js", () => ({
-  hasMemoryRuntime: hasMemoryRuntimeMock,
-}));
-
-vi.mock("../tasks/task-registry.js", () => ({
-  ensureTaskRegistryReady: ensureTaskRegistryReadyMock,
-}));
-
-vi.mock("../tasks/task-registry.maintenance.js", () => ({
-  startTaskRegistryMaintenance: startTaskRegistryMaintenanceMock,
-}));
-
-vi.mock("./program/root-help.js", () => ({
-  outputRootHelp: outputRootHelpMock,
-}));
-
-vi.mock("./root-help-metadata.js", () => ({
-  outputPrecomputedRootHelpText: outputPrecomputedRootHelpTextMock,
-}));
-
-vi.mock("./program.js", () => ({
-  buildProgram: buildProgramMock,
-}));
-
-vi.mock("./program/program-context.js", () => ({
-  getProgramContext: getProgramContextMock,
-}));
-
-vi.mock("./program/command-registry.js", () => ({
-  registerCoreCliByName: registerCoreCliByNameMock,
-}));
-
-vi.mock("./program/register.subclis.js", () => ({
-  registerSubCliByName: registerSubCliByNameMock,
-}));
+import { describe, expect, it, vi } from "vitest";
+import { loggingState } from "../logging/state.js";
+import { registerRunMainProxyExitTests } from "./run-main.proxy-exit.test-support.js";
 
 describe("runCli exit behavior", () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-    hasMemoryRuntimeMock.mockReturnValue(false);
-    outputPrecomputedRootHelpTextMock.mockReturnValue(false);
-    getProgramContextMock.mockReturnValue(null);
-  });
+  installRunMainTestHooks();
 
-  it("does not force process.exit after successful routed command", async () => {
+  it("completes asynchronous teardown before returning to the outer entrypoint", async () => {
+    const order: string[] = [];
+    listRegisteredAgentHarnessesMock.mockReturnValueOnce([{ harness: { id: "copilot" } }]);
+    hasProviderTransportDispatcherPoolMock.mockReturnValueOnce(true);
+    disposeRegisteredAgentHarnessesMock.mockImplementationOnce(async () => {
+      order.push("harnesses");
+    });
+    stopManagedProviderLocalServicesMock.mockImplementationOnce(async () => {
+      await Promise.resolve();
+      order.push("provider-local-services");
+    });
+    closeProviderTransportDispatcherPoolMock.mockImplementationOnce(async () => {
+      order.push("provider-transport-dispatchers");
+    });
+    getActiveMcpLoopbackRuntimeMock.mockReturnValueOnce({ port: 1234 });
+    closeMcpLoopbackServerMock.mockImplementationOnce(async () => {
+      order.push("mcp-loopback");
+    });
+    hasMemoryRuntimeMock.mockReturnValueOnce(true);
+    closeActiveMemorySearchManagersMock.mockImplementationOnce(async () => {
+      order.push("memory");
+    });
     tryRouteCliMock.mockResolvedValueOnce(true);
-    const exitSpy = vi.spyOn(process, "exit").mockImplementation(((code?: number) => {
-      throw new Error(`unexpected process.exit(${String(code)})`);
-    }) as typeof process.exit);
 
-    await runCli(["node", "openclaw", "status"]);
+    await runCli(cliArgs("models", "status", "--probe"));
 
-    expect(maybeRunCliInContainerMock).toHaveBeenCalledWith(["node", "openclaw", "status"]);
-    expect(tryRouteCliMock).toHaveBeenCalledWith(["node", "openclaw", "status"]);
-    expect(closeActiveMemorySearchManagersMock).not.toHaveBeenCalled();
-    expect(ensureTaskRegistryReadyMock).not.toHaveBeenCalled();
-    expect(startTaskRegistryMaintenanceMock).not.toHaveBeenCalled();
-    expect(exitSpy).not.toHaveBeenCalled();
-    exitSpy.mockRestore();
+    expect(order).toEqual([
+      "harnesses",
+      "provider-local-services",
+      "provider-transport-dispatchers",
+      "mcp-loopback",
+      "memory",
+    ]);
+    expect(flushExitAfterOneShotOutputMock).not.toHaveBeenCalled();
   });
 
-  it("renders root help without building the full program", async () => {
-    const exitSpy = vi.spyOn(process, "exit").mockImplementation(((code?: number) => {
-      throw new Error(`unexpected process.exit(${String(code)})`);
-    }) as typeof process.exit);
-
-    await runCli(["node", "openclaw", "--help"]);
-
-    expect(maybeRunCliInContainerMock).toHaveBeenCalledWith(["node", "openclaw", "--help"]);
-    expect(tryRouteCliMock).not.toHaveBeenCalled();
-    expect(outputPrecomputedRootHelpTextMock).toHaveBeenCalledTimes(1);
-    expect(outputRootHelpMock).toHaveBeenCalledTimes(1);
-    expect(buildProgramMock).not.toHaveBeenCalled();
-    expect(closeActiveMemorySearchManagersMock).not.toHaveBeenCalled();
-    expect(exitSpy).not.toHaveBeenCalled();
-    exitSpy.mockRestore();
-  });
-
-  it("closes memory managers when a runtime was registered", async () => {
-    tryRouteCliMock.mockResolvedValueOnce(true);
-    hasMemoryRuntimeMock.mockReturnValue(true);
-
-    await runCli(["node", "openclaw", "status"]);
-
-    expect(closeActiveMemorySearchManagersMock).toHaveBeenCalledTimes(1);
+  registerRunMainProxyExitTests({
+    runCli: (argv) => runCli(argv),
+    startProxyMock,
+    stopProxyMock,
+    tryRouteCliMock,
   });
 
   it("returns after a handled container-target invocation", async () => {
-    maybeRunCliInContainerMock.mockReturnValueOnce({ handled: true, exitCode: 0 });
+    const previousExitCode = process.exitCode;
+    maybeRunCliInContainerMock.mockReturnValueOnce({ handled: true, exitCode: 7 });
 
-    await runCli(["node", "openclaw", "--container", "demo", "status"]);
+    await runCli(cliArgs("--container", "demo", "status"));
 
-    expect(maybeRunCliInContainerMock).toHaveBeenCalledWith([
-      "node",
-      "openclaw",
-      "--container",
-      "demo",
-      "status",
-    ]);
+    expect(maybeRunCliInContainerMock).toHaveBeenCalledWith(
+      cliArgs("--container", "demo", "status"),
+    );
+    expect(enableConsoleCaptureMock).toHaveBeenCalledTimes(1);
+    const captureOrder = enableConsoleCaptureMock.mock.invocationCallOrder[0] ?? 0;
+    const containerOrder = maybeRunCliInContainerMock.mock.invocationCallOrder[0] ?? 0;
+    expect(captureOrder).toBeGreaterThan(0);
+    expect(containerOrder).toBeGreaterThan(captureOrder);
     expect(loadDotEnvMock).not.toHaveBeenCalled();
     expect(tryRouteCliMock).not.toHaveBeenCalled();
     expect(closeActiveMemorySearchManagersMock).not.toHaveBeenCalled();
-  });
-
-  it("propagates a handled container-target exit code", async () => {
-    const exitCode = process.exitCode;
-    maybeRunCliInContainerMock.mockReturnValueOnce({ handled: true, exitCode: 7 });
-
-    await runCli(["node", "openclaw", "--container", "demo", "status"]);
-
     expect(process.exitCode).toBe(7);
-    process.exitCode = exitCode;
+    process.exitCode = previousExitCode;
   });
 
   it("swallows Commander parse exits after recording the exit code", async () => {
     const exitCode = process.exitCode;
-    buildProgramMock.mockReturnValueOnce({
+    const program = {
       commands: [{ name: () => "status" }],
       parseAsync: vi
         .fn()
         .mockRejectedValueOnce(
           new CommanderError(1, "commander.excessArguments", "too many arguments for 'status'"),
         ),
-    });
+    };
+    buildProgramMock.mockReturnValueOnce(program);
 
-    await expect(runCli(["node", "openclaw", "status"])).resolves.toBeUndefined();
+    await expect(runCli(cliArgs("status"))).resolves.toBeUndefined();
 
-    expect(registerSubCliByNameMock).toHaveBeenCalledWith(expect.anything(), "status");
+    expect(registerSubCliByNameMock.mock.calls).toEqual([[program, "status", cliArgs("status")]]);
     expect(process.exitCode).toBe(1);
     process.exitCode = exitCode;
+  });
+
+  it("requests a flushed one-shot exit after Commander renders help", async () => {
+    const exitCode = process.exitCode;
+    const program = {
+      commands: [{ name: () => "security" }],
+      parseAsync: vi
+        .fn()
+        .mockRejectedValueOnce(new CommanderError(0, "commander.helpDisplayed", "help displayed")),
+    };
+    buildProgramMock.mockReturnValueOnce(program);
+
+    await runCli(cliArgs("security", "--help"));
+
+    expect(requestExitAfterOneShotOutputMock).toHaveBeenCalledOnce();
+    expect(flushExitAfterOneShotOutputMock).not.toHaveBeenCalled();
+    expect(process.exitCode).toBe(0);
+    process.exitCode = exitCode;
+  });
+
+  it.each([false, true])(
+    "restores terminal state before uncaught CLI exits (machine output: %s)",
+    async (machineOutput) => {
+      buildProgramMock.mockReturnValueOnce({
+        commands: [{ name: () => "status" }],
+        parseAsync: vi.fn().mockResolvedValueOnce(undefined),
+      });
+
+      const processOnSpy = vi.spyOn(process, "on");
+      const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      const exitSpy = vi.spyOn(process, "exit").mockImplementation(((code?: number) => {
+        throw new Error(`process.exit(${String(code)})`);
+      }) as typeof process.exit);
+
+      await runCli(cliArgs("status"));
+
+      const handler = processOnSpy.mock.calls.find(([event]) => event === "uncaughtException")?.[1];
+      if (typeof handler !== "function") {
+        throw new Error("uncaughtException handler was not registered");
+      }
+
+      try {
+        loggingState.forceConsoleToStderr = machineOutput;
+        expect(() => handler(new Error("boom"))).toThrow("process.exit(1)");
+        expect(consoleErrorSpy).toHaveBeenCalledWith(
+          "[openclaw] OpenClaw hit an unexpected runtime error.",
+        );
+        expect(consoleErrorSpy).toHaveBeenCalledWith("[openclaw] For help, run `openclaw doctor`.");
+        expect(restoreRuntimeTerminalStateMock).toHaveBeenCalledWith("uncaught exception", {
+          resumeStdinIfPaused: false,
+        });
+      } finally {
+        loggingState.forceConsoleToStderr = false;
+        if (typeof handler === "function") {
+          process.off("uncaughtException", handler);
+        }
+        consoleErrorSpy.mockRestore();
+        exitSpy.mockRestore();
+        processOnSpy.mockRestore();
+      }
+    },
+  );
+
+  it("does not exit for transient uncaught CLI exceptions", async () => {
+    buildProgramMock.mockReturnValueOnce({
+      commands: [{ name: () => "status" }],
+      parseAsync: vi.fn().mockResolvedValueOnce(undefined),
+    });
+
+    const processOnSpy = vi.spyOn(process, "on");
+    const consoleWarnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const exitSpy = vi.spyOn(process, "exit").mockImplementation(((code?: number) => {
+      throw new Error(`process.exit(${String(code)})`);
+    }) as typeof process.exit);
+
+    await runCli(cliArgs("status"));
+
+    const handler = processOnSpy.mock.calls.find(([event]) => event === "uncaughtException")?.[1];
+    if (typeof handler !== "function") {
+      throw new Error("uncaughtException handler was not registered");
+    }
+
+    try {
+      const hostUnreachable = Object.assign(new Error("connect EHOSTUNREACH 149.154.167.220:443"), {
+        code: "EHOSTUNREACH",
+      });
+      expect(handler(hostUnreachable)).toBeUndefined();
+      expect(consoleWarnSpy.mock.calls).toEqual([
+        ["[openclaw] Non-fatal uncaught exception (continuing):", hostUnreachable.stack],
+      ]);
+      expect(restoreRuntimeTerminalStateMock).not.toHaveBeenCalled();
+      expect(exitSpy).not.toHaveBeenCalled();
+    } finally {
+      if (typeof handler === "function") {
+        process.off("uncaughtException", handler);
+      }
+      consoleWarnSpy.mockRestore();
+      exitSpy.mockRestore();
+      processOnSpy.mockRestore();
+    }
   });
 });

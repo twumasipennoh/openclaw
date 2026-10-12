@@ -1,40 +1,40 @@
-import type { MSTeamsConfig } from "../runtime-api.js";
-import {
-  hasConfiguredSecretInput,
-  normalizeResolvedSecretInputString,
-  normalizeSecretInputString,
-} from "./secret-input.js";
+import { isFutureDateTimestampMs } from "openclaw/plugin-sdk/number-runtime";
+import { loadMSTeamsDelegatedTokens, saveMSTeamsDelegatedTokens } from "./delegated-state.js";
+import { refreshMSTeamsDelegatedTokens } from "./oauth.token.js";
 
-export type MSTeamsCredentials = {
-  appId: string;
-  appPassword: string;
+export {
+  hasConfiguredMSTeamsCredentials,
+  resolveMSTeamsCredentials,
+  type MSTeamsCredentials,
+  type MSTeamsFederatedCredentials,
+} from "./token-config.js";
+
+export async function resolveDelegatedAccessToken(params: {
   tenantId: string;
-};
-
-export function hasConfiguredMSTeamsCredentials(cfg?: MSTeamsConfig): boolean {
-  return Boolean(
-    normalizeSecretInputString(cfg?.appId) &&
-    hasConfiguredSecretInput(cfg?.appPassword) &&
-    normalizeSecretInputString(cfg?.tenantId),
-  );
-}
-
-export function resolveMSTeamsCredentials(cfg?: MSTeamsConfig): MSTeamsCredentials | undefined {
-  const appId =
-    normalizeSecretInputString(cfg?.appId) ||
-    normalizeSecretInputString(process.env.MSTEAMS_APP_ID);
-  const appPassword =
-    normalizeResolvedSecretInputString({
-      value: cfg?.appPassword,
-      path: "channels.msteams.appPassword",
-    }) || normalizeSecretInputString(process.env.MSTEAMS_APP_PASSWORD);
-  const tenantId =
-    normalizeSecretInputString(cfg?.tenantId) ||
-    normalizeSecretInputString(process.env.MSTEAMS_TENANT_ID);
-
-  if (!appId || !appPassword || !tenantId) {
+  clientId: string;
+  clientSecret: string;
+}): Promise<string | undefined> {
+  const tokens = await loadMSTeamsDelegatedTokens();
+  if (!tokens) {
     return undefined;
   }
 
-  return { appId, appPassword, tenantId };
+  // Token still valid (5-min buffer already baked into expiresAt)
+  if (isFutureDateTimestampMs(tokens.expiresAt)) {
+    return tokens.accessToken;
+  }
+
+  try {
+    const refreshed = await refreshMSTeamsDelegatedTokens({
+      tenantId: params.tenantId,
+      clientId: params.clientId,
+      clientSecret: params.clientSecret,
+      refreshToken: tokens.refreshToken,
+      scopes: tokens.scopes,
+    });
+    await saveMSTeamsDelegatedTokens(refreshed);
+    return refreshed.accessToken;
+  } catch {
+    return undefined;
+  }
 }

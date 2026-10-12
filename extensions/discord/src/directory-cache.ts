@@ -1,52 +1,49 @@
-import { DEFAULT_ACCOUNT_ID, normalizeAccountId } from "openclaw/plugin-sdk/routing";
+import { normalizeAccountId } from "openclaw/plugin-sdk/routing";
+import {
+  normalizeLowercaseStringOrEmpty,
+  normalizeOptionalString,
+  normalizeOptionalStringifiedId,
+} from "openclaw/plugin-sdk/string-coerce-runtime";
+import { discordDirectoryCacheState } from "./directory-cache-state.js";
 
 const DISCORD_DIRECTORY_CACHE_MAX_ENTRIES = 4000;
 const DISCORD_DISCRIMINATOR_SUFFIX = /#\d{4}$/;
 
-const DIRECTORY_HANDLE_CACHE = new Map<string, Map<string, string>>();
-
-function normalizeAccountCacheKey(accountId?: string | null): string {
-  const normalized = normalizeAccountId(accountId ?? DEFAULT_ACCOUNT_ID);
-  return normalized || DEFAULT_ACCOUNT_ID;
-}
-
-function normalizeSnowflake(value: string | number | bigint): string | null {
-  const text = String(value ?? "").trim();
+export function normalizeDiscordSnowflake(value: string | number | bigint): string | null {
+  const text = normalizeOptionalStringifiedId(value) ?? "";
   if (!/^\d+$/.test(text)) {
     return null;
   }
   return text;
 }
 
-function normalizeHandleKey(raw: string): string | null {
-  let handle = raw.trim();
+export function normalizeDiscordHandleKey(raw: string): string | null {
+  let handle = normalizeOptionalString(raw) ?? "";
   if (!handle) {
     return null;
   }
   if (handle.startsWith("@")) {
-    handle = handle.slice(1).trim();
+    handle = normalizeOptionalString(handle.slice(1)) ?? "";
   }
   if (!handle || /\s/.test(handle)) {
     return null;
   }
-  return handle.toLowerCase();
+  return normalizeLowercaseStringOrEmpty(handle);
 }
 
 function ensureAccountCache(accountId?: string | null): Map<string, string> {
-  const cacheKey = normalizeAccountCacheKey(accountId);
-  const existing = DIRECTORY_HANDLE_CACHE.get(cacheKey);
+  const cacheKey = normalizeAccountId(accountId);
+  const existing = discordDirectoryCacheState.handlesByAccount.get(cacheKey);
   if (existing) {
     return existing;
   }
   const created = new Map<string, string>();
-  DIRECTORY_HANDLE_CACHE.set(cacheKey, created);
+  discordDirectoryCacheState.handlesByAccount.set(cacheKey, created);
   return created;
 }
 
 function setCacheEntry(cache: Map<string, string>, key: string, userId: string): void {
-  if (cache.has(key)) {
-    cache.delete(key);
-  }
+  cache.delete(key);
   cache.set(key, userId);
   if (cache.size <= DISCORD_DIRECTORY_CACHE_MAX_ENTRIES) {
     return;
@@ -62,7 +59,7 @@ export function rememberDiscordDirectoryUser(params: {
   userId: string | number | bigint;
   handles: Array<string | null | undefined>;
 }): void {
-  const userId = normalizeSnowflake(params.userId);
+  const userId = normalizeDiscordSnowflake(params.userId);
   if (!userId) {
     return;
   }
@@ -71,7 +68,7 @@ export function rememberDiscordDirectoryUser(params: {
     if (typeof candidate !== "string") {
       continue;
     }
-    const handle = normalizeHandleKey(candidate);
+    const handle = normalizeDiscordHandleKey(candidate);
     if (!handle) {
       continue;
     }
@@ -87,11 +84,13 @@ export function resolveDiscordDirectoryUserId(params: {
   accountId?: string | null;
   handle: string;
 }): string | undefined {
-  const cache = DIRECTORY_HANDLE_CACHE.get(normalizeAccountCacheKey(params.accountId));
+  const cache = discordDirectoryCacheState.handlesByAccount.get(
+    normalizeAccountId(params.accountId),
+  );
   if (!cache) {
     return undefined;
   }
-  const handle = normalizeHandleKey(params.handle);
+  const handle = normalizeDiscordHandleKey(params.handle);
   if (!handle) {
     return undefined;
   }
@@ -104,8 +103,4 @@ export function resolveDiscordDirectoryUserId(params: {
     return undefined;
   }
   return cache.get(withoutDiscriminator);
-}
-
-export function __resetDiscordDirectoryCacheForTest(): void {
-  DIRECTORY_HANDLE_CACHE.clear();
 }

@@ -1,19 +1,32 @@
-import { type SelectItem, SelectList, type SettingItem, SettingsList } from "@mariozechner/pi-tui";
+import { type SettingItem, SettingsList } from "@earendil-works/pi-tui";
+import { modelKey } from "../../agents/model-ref-shared.js";
 import {
   filterableSelectListTheme,
   searchableSelectListTheme,
-  selectListTheme,
   settingsListTheme,
 } from "../theme/theme.js";
+import type { TuiModelChoice } from "../tui-backend.js";
 import { FilterableSelectList, type FilterableSelectItem } from "./filterable-select-list.js";
-import { SearchableSelectList } from "./searchable-select-list.js";
+import { SearchableSelectList, type SearchableSelectItem } from "./searchable-select-list.js";
 
-export function createSelectList(items: SelectItem[], maxVisible = 7) {
-  return new SelectList(items, maxVisible, selectListTheme);
+export function createSearchableSelectList(items: SearchableSelectItem[], maxVisible = 7) {
+  return new SearchableSelectList(items, maxVisible, searchableSelectListTheme);
 }
 
-export function createSearchableSelectList(items: SelectItem[], maxVisible = 7) {
-  return new SearchableSelectList(items, maxVisible, searchableSelectListTheme);
+export function modelSelectItems(models: readonly TuiModelChoice[]): SearchableSelectItem[] {
+  return models.map((model) => {
+    const ref = modelKey(model.provider, model.id);
+    return {
+      value: ref,
+      label: ref,
+      description: [
+        model.name !== model.id ? model.name : "",
+        model.available === false ? (model.unavailableReason ?? "unavailable") : "",
+      ]
+        .filter(Boolean)
+        .join(" · "),
+    };
+  });
 }
 
 export function createFilterableSelectList(items: FilterableSelectItem[], maxVisible = 7) {

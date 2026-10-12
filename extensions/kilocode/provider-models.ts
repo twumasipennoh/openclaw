@@ -1,13 +1,32 @@
-import type { KilocodeModelCatalogEntry } from "openclaw/plugin-sdk/provider-model-shared";
+import {
+  buildLiveModelProviderConfig,
+  readLiveModelCatalogStringField,
+} from "openclaw/plugin-sdk/provider-catalog-live-runtime";
+import { buildManifestModelProviderConfig } from "openclaw/plugin-sdk/provider-catalog-shared";
 import type { ModelDefinitionConfig } from "openclaw/plugin-sdk/provider-model-shared";
-import { createSubsystemLogger } from "openclaw/plugin-sdk/runtime-env";
+import { ssrfPolicyFromHttpBaseUrlAllowedHostname } from "openclaw/plugin-sdk/ssrf-runtime";
+import {
+  asPositiveSafeInteger,
+  isRecord,
+  normalizeLowercaseStringOrEmpty,
+} from "openclaw/plugin-sdk/string-coerce-runtime";
+import manifest from "./openclaw.plugin.json" with { type: "json" };
 
-const log = createSubsystemLogger("kilocode-models");
-
-export const KILOCODE_BASE_URL = "https://api.kilo.ai/api/gateway/";
-export const KILOCODE_DEFAULT_MODEL_ID = "kilo/auto";
+const KILOCODE_MANIFEST_CATALOG = manifest.modelCatalog.providers.kilocode;
+const KILOCODE_DEFAULT_MODEL = buildManifestModelProviderConfig({
+  providerId: "kilocode",
+  catalog: KILOCODE_MANIFEST_CATALOG,
+}).models[0]!;
+export const KILOCODE_BASE_URL = KILOCODE_MANIFEST_CATALOG.baseUrl;
+export const KILOCODE_DEFAULT_MODEL_ID = KILOCODE_DEFAULT_MODEL.id;
 export const KILOCODE_DEFAULT_MODEL_REF = `kilocode/${KILOCODE_DEFAULT_MODEL_ID}`;
-export const KILOCODE_DEFAULT_MODEL_NAME = "Kilo Auto";
+export const KILOCODE_DEFAULT_MODEL_NAME = KILOCODE_DEFAULT_MODEL.name;
+
+type KilocodeModelCatalogEntry = Pick<
+  ModelDefinitionConfig,
+  "id" | "name" | "reasoning" | "input"
+> &
+  Partial<Pick<ModelDefinitionConfig, "contextWindow" | "maxTokens">>;
 
 export const KILOCODE_MODEL_CATALOG: KilocodeModelCatalogEntry[] = [
   {
@@ -18,14 +37,9 @@ export const KILOCODE_MODEL_CATALOG: KilocodeModelCatalogEntry[] = [
   },
 ];
 
-export const KILOCODE_DEFAULT_CONTEXT_WINDOW = 1000000;
-export const KILOCODE_DEFAULT_MAX_TOKENS = 128000;
-export const KILOCODE_DEFAULT_COST = {
-  input: 0,
-  output: 0,
-  cacheRead: 0,
-  cacheWrite: 0,
-};
+export const KILOCODE_DEFAULT_CONTEXT_WINDOW = KILOCODE_DEFAULT_MODEL.contextWindow;
+export const KILOCODE_DEFAULT_MAX_TOKENS = KILOCODE_DEFAULT_MODEL.maxTokens;
+export const KILOCODE_DEFAULT_COST = KILOCODE_DEFAULT_MODEL.cost;
 
 export const KILOCODE_MODELS_URL = `${KILOCODE_BASE_URL}models`;
 
@@ -34,12 +48,8 @@ const DISCOVERY_TIMEOUT_MS = 5000;
 interface GatewayModelPricing {
   prompt: string;
   completion: string;
-  image?: string;
-  request?: string;
   input_cache_read?: string;
   input_cache_write?: string;
-  web_search?: string;
-  internal_reasoning?: string;
 }
 
 interface GatewayModelEntry {
@@ -51,25 +61,16 @@ interface GatewayModelEntry {
     output_modalities?: string[];
   };
   top_provider?: {
+    context_length?: number | null;
     max_completion_tokens?: number | null;
   };
   pricing: GatewayModelPricing;
   supported_parameters?: string[];
 }
 
-interface GatewayModelsResponse {
-  data: GatewayModelEntry[];
-}
-
-function toPricePerMillion(perToken: string | undefined): number {
-  if (!perToken) {
-    return 0;
-  }
+function toPricePerMillion(perToken: string | undefined, fallback = 0): number {
   const num = Number(perToken);
-  if (!Number.isFinite(num) || num < 0) {
-    return 0;
-  }
-  return num * 1_000_000;
+  return Number.isFinite(num) && num >= 0 ? num * 1_000_000 : fallback;
 }
 
 function parseModality(entry: GatewayModelEntry): Array<"text" | "image"> {
@@ -77,7 +78,9 @@ function parseModality(entry: GatewayModelEntry): Array<"text" | "image"> {
   if (!Array.isArray(modalities)) {
     return ["text"];
   }
-  const hasImage = modalities.some((m) => typeof m === "string" && m.toLowerCase() === "image");
+  const hasImage = modalities.some(
+    (m) => typeof m === "string" && normalizeLowercaseStringOrEmpty(m) === "image",
+  );
   return hasImage ? ["text", "image"] : ["text"];
 }
 
@@ -90,19 +93,26 @@ function parseReasoning(entry: GatewayModelEntry): boolean {
 }
 
 function toModelDefinition(entry: GatewayModelEntry): ModelDefinitionConfig {
+  const fallbackCost = entry.id === KILOCODE_DEFAULT_MODEL_ID ? KILOCODE_DEFAULT_COST : undefined;
   return {
     id: entry.id,
     name: entry.name || entry.id,
     reasoning: parseReasoning(entry),
     input: parseModality(entry),
     cost: {
-      input: toPricePerMillion(entry.pricing.prompt),
-      output: toPricePerMillion(entry.pricing.completion),
+      input: toPricePerMillion(entry.pricing.prompt, fallbackCost?.input),
+      output: toPricePerMillion(entry.pricing.completion, fallbackCost?.output),
       cacheRead: toPricePerMillion(entry.pricing.input_cache_read),
       cacheWrite: toPricePerMillion(entry.pricing.input_cache_write),
     },
-    contextWindow: entry.context_length || KILOCODE_DEFAULT_CONTEXT_WINDOW,
-    maxTokens: entry.top_provider?.max_completion_tokens ?? KILOCODE_DEFAULT_MAX_TOKENS,
+    // The primary provider window bounds real requests; the catalog-wide value can be larger.
+    contextWindow:
+      asPositiveSafeInteger(entry.top_provider?.context_length) ??
+      asPositiveSafeInteger(entry.context_length) ??
+      KILOCODE_DEFAULT_CONTEXT_WINDOW,
+    maxTokens:
+      asPositiveSafeInteger(entry.top_provider?.max_completion_tokens) ??
+      KILOCODE_DEFAULT_MAX_TOKENS,
   };
 }
 
@@ -118,69 +128,75 @@ function buildStaticCatalog(): ModelDefinitionConfig[] {
   }));
 }
 
-export async function discoverKilocodeModels(): Promise<ModelDefinitionConfig[]> {
-  if (process.env.NODE_ENV === "test" || process.env.VITEST) {
-    return buildStaticCatalog();
+function asGatewayModelEntry(value: unknown): GatewayModelEntry {
+  if (!isRecord(value)) {
+    throw new Error("Kilocode model list: malformed JSON response");
   }
+  const entry = value as Partial<GatewayModelEntry>;
+  if (typeof entry.id !== "string" || !isRecord(entry.pricing)) {
+    throw new Error("Kilocode model list: malformed JSON response");
+  }
+  return entry as GatewayModelEntry;
+}
 
-  try {
-    const response = await fetch(KILOCODE_MODELS_URL, {
-      headers: { Accept: "application/json" },
-      signal: AbortSignal.timeout(DISCOVERY_TIMEOUT_MS),
-    });
+function readGatewayModelRows(body: unknown): readonly unknown[] {
+  const data = (body as { data?: unknown } | undefined)?.data;
+  if (!Array.isArray(data)) {
+    throw new Error("Kilocode model list: malformed JSON response");
+  }
+  return data;
+}
 
-    if (!response.ok) {
-      log.warn(`Failed to discover models: HTTP ${response.status}, using static catalog`);
-      return buildStaticCatalog();
-    }
-
-    const data = (await response.json()) as GatewayModelsResponse;
-    if (!Array.isArray(data.data) || data.data.length === 0) {
-      log.warn("No models found from gateway API, using static catalog");
-      return buildStaticCatalog();
-    }
-
-    const models: ModelDefinitionConfig[] = [];
-    const discoveredIds = new Set<string>();
-
-    for (const entry of data.data) {
-      if (!entry || typeof entry !== "object") {
+function projectKilocodeModels(rows: readonly unknown[]): ModelDefinitionConfig[] {
+  const models: ModelDefinitionConfig[] = [];
+  const discoveredIds = new Set<string>();
+  for (const rawEntry of rows) {
+    const id = readLiveModelCatalogStringField(rawEntry, "id");
+    try {
+      const entry = asGatewayModelEntry(rawEntry);
+      if (
+        !id ||
+        discoveredIds.has(id) ||
+        entry.architecture?.output_modalities?.includes("image")
+      ) {
         continue;
       }
-      const id = typeof entry.id === "string" ? entry.id.trim() : "";
-      if (!id || discoveredIds.has(id)) {
-        continue;
-      }
-      try {
-        models.push(toModelDefinition(entry));
-        discoveredIds.add(id);
-      } catch (e) {
-        log.warn(`Skipping malformed model entry "${id}": ${String(e)}`);
-      }
+      models.push(toModelDefinition(entry));
+      discoveredIds.add(id);
+    } catch {
+      // A malformed row must not hide a later valid row with the same id.
     }
-
-    const staticModels = buildStaticCatalog();
-    for (const staticModel of staticModels) {
-      if (!discoveredIds.has(staticModel.id)) {
-        models.unshift(staticModel);
-      }
-    }
-
-    return models.length > 0 ? models : buildStaticCatalog();
-  } catch (error) {
-    log.warn(`Discovery failed: ${String(error)}, using static catalog`);
-    return buildStaticCatalog();
   }
+  for (const staticModel of models.length > 0 ? buildStaticCatalog() : []) {
+    if (!discoveredIds.has(staticModel.id)) {
+      models.unshift(staticModel);
+    }
+  }
+  return models;
+}
+
+export async function discoverKilocodeModels(
+  options: { discoveryMode?: "strict" } = {},
+): Promise<ModelDefinitionConfig[]> {
+  const provider = await buildLiveModelProviderConfig({
+    ...options,
+    providerId: "kilocode",
+    endpoint: KILOCODE_MODELS_URL,
+    providerConfig: { baseUrl: KILOCODE_BASE_URL, api: "openai-completions" },
+    models: buildStaticCatalog(),
+    timeoutMs: DISCOVERY_TIMEOUT_MS,
+    ttlMs: 0,
+    readRows: readGatewayModelRows,
+    policy: ssrfPolicyFromHttpBaseUrlAllowedHostname(KILOCODE_BASE_URL),
+    auditContext: "kilocode.model_discovery",
+    projectRows: projectKilocodeModels,
+  });
+  return provider.models;
 }
 
 export function buildKilocodeModelDefinition(): ModelDefinitionConfig {
   return {
-    id: KILOCODE_DEFAULT_MODEL_ID,
-    name: KILOCODE_DEFAULT_MODEL_NAME,
-    reasoning: true,
-    input: ["text", "image"],
-    cost: KILOCODE_DEFAULT_COST,
-    contextWindow: KILOCODE_DEFAULT_CONTEXT_WINDOW,
-    maxTokens: KILOCODE_DEFAULT_MAX_TOKENS,
+    ...KILOCODE_DEFAULT_MODEL,
+    input: [...KILOCODE_DEFAULT_MODEL.input],
   };
 }

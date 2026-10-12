@@ -1,10 +1,14 @@
+import { asPositiveFiniteNumber } from "@openclaw/normalization-core/number-coercion";
+import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import {
   resolveGatewayDiscoveryEndpoint,
   type GatewayBonjourBeacon,
   type GatewayDiscoveryResolvedEndpoint,
 } from "./bonjour-discovery.js";
 
-export type GatewayDiscoveryTarget = {
+// Gateway discovery targets turn Bonjour beacons into display, websocket, and
+// SSH connection hints without assuming every beacon has all fields.
+type GatewayDiscoveryTarget = {
   title: string;
   domain: string;
   endpoint: GatewayDiscoveryResolvedEndpoint | null;
@@ -13,25 +17,20 @@ export type GatewayDiscoveryTarget = {
   sshTarget: string | null;
 };
 
-function pickSshPort(beacon: GatewayBonjourBeacon): number | null {
-  return typeof beacon.sshPort === "number" && Number.isFinite(beacon.sshPort) && beacon.sshPort > 0
-    ? beacon.sshPort
-    : null;
-}
-
 export function buildGatewayDiscoveryTarget(
   beacon: GatewayBonjourBeacon,
   opts?: { sshUser?: string | null },
 ): GatewayDiscoveryTarget {
   const endpoint = resolveGatewayDiscoveryEndpoint(beacon);
-  const sshPort = pickSshPort(beacon);
-  const sshUser = opts?.sshUser?.trim() ?? "";
+  const sshPort = asPositiveFiniteNumber(beacon.sshPort) ?? null;
+  const sshUser = normalizeOptionalString(opts?.sshUser) ?? "";
   const baseSshTarget = endpoint ? (sshUser ? `${sshUser}@${endpoint.host}` : endpoint.host) : null;
   const sshTarget =
     baseSshTarget && sshPort && sshPort !== 22 ? `${baseSshTarget}:${sshPort}` : baseSshTarget;
   return {
-    title: (beacon.displayName || beacon.instanceName || "Gateway").trim(),
-    domain: (beacon.domain || "local.").trim(),
+    title:
+      normalizeOptionalString(beacon.displayName || beacon.instanceName || "Gateway") ?? "Gateway",
+    domain: normalizeOptionalString(beacon.domain || "local.") ?? "local.",
     endpoint,
     wsUrl: endpoint?.wsUrl ?? null,
     sshPort,

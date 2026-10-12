@@ -1,51 +1,44 @@
+// Gateway HTTP session kill handler.
+// Stops subagent runs through the admin-scoped HTTP control surface.
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { killSubagentRunAdmin } from "../agents/subagents/registry/subagent-control.js";
+import { getRuntimeConfig } from "../config/io.js";
 import {
-  killControlledSubagentRun,
-  killSubagentRunAdmin,
-  resolveSubagentController,
-} from "../agents/subagent-control.js";
-import { getLatestSubagentRunByChildSessionKey } from "../agents/subagent-registry.js";
-import { loadConfig } from "../config/config.js";
-import type { AuthRateLimiter } from "./auth-rate-limit.js";
-import { isLocalDirectRequest, type ResolvedGatewayAuth } from "./auth.js";
-import { sendJson, sendMethodNotAllowed } from "./http-common.js";
+  sendInvalidRequest,
+  sendJson,
+  sendMethodNotAllowed,
+  sendMissingScopeForbidden,
+} from "./http-common.js";
+import type { GatewayHttpRequestAuthOptions } from "./http-request-authority.js";
 import {
   authorizeGatewayHttpRequestOrReply,
   resolveTrustedHttpOperatorScopes,
 } from "./http-utils.js";
-import { authorizeOperatorScopesForMethod } from "./method-scopes.js";
+import { ADMIN_SCOPE, authorizeOperatorScopesForRequiredScope } from "./method-scopes.js";
+import { resolveRequestedSessionAgentId } from "./session-request-agent.js";
 import { loadSessionEntry } from "./session-utils.js";
-
-const REQUESTER_SESSION_KEY_HEADER = "x-openclaw-requester-session-key";
-
-function resolveSessionKeyFromPath(pathname: string): string | null {
-  const match = pathname.match(/^\/sessions\/([^/]+)\/kill$/);
-  if (!match) {
-    return null;
-  }
-  try {
-    const decoded = decodeURIComponent(match[1] ?? "").trim();
-    return decoded || null;
-  } catch {
-    return null;
-  }
-}
 
 export async function handleSessionKillHttpRequest(
   req: IncomingMessage,
   res: ServerResponse,
-  opts: {
-    auth: ResolvedGatewayAuth;
-    trustedProxies?: string[];
-    allowRealIpFallback?: boolean;
-    rateLimiter?: AuthRateLimiter;
-  },
+  opts: GatewayHttpRequestAuthOptions,
 ): Promise<boolean> {
-  const cfg = loadConfig();
-  const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
-  const sessionKey = resolveSessionKeyFromPath(url.pathname);
-  if (!sessionKey) {
+  const cfg = opts.cfg ?? getRuntimeConfig();
+  const url = new URL(req.url ?? "/", "http://localhost");
+  const match = url.pathname.match(/^\/sessions\/([^/]+)\/kill$/);
+  if (!match) {
     return false;
+  }
+  let sessionKey: string;
+  try {
+    sessionKey = decodeURIComponent(match[1] ?? "").trim();
+  } catch {
+    sendInvalidRequest(res, "invalid session key");
+    return true;
+  }
+  if (!sessionKey) {
+    sendInvalidRequest(res, "invalid session key");
+    return true;
   }
 
   if (req.method !== "POST") {
@@ -54,49 +47,38 @@ export async function handleSessionKillHttpRequest(
   }
 
   const requestAuth = await authorizeGatewayHttpRequestOrReply({
+    ...opts,
     req,
     res,
-    auth: opts.auth,
+    cfg,
     trustedProxies: opts.trustedProxies ?? cfg.gateway?.trustedProxies,
     allowRealIpFallback: opts.allowRealIpFallback ?? cfg.gateway?.allowRealIpFallback,
-    rateLimiter: opts.rateLimiter,
   });
   if (!requestAuth) {
     return true;
   }
 
-  const trustedProxies = opts.trustedProxies ?? cfg.gateway?.trustedProxies;
-  const allowRealIpFallback = opts.allowRealIpFallback ?? cfg.gateway?.allowRealIpFallback;
-  const requesterSessionKey = req.headers[REQUESTER_SESSION_KEY_HEADER]?.toString().trim();
-  const allowLocalAdminKill = isLocalDirectRequest(req, trustedProxies, allowRealIpFallback);
   const requestedScopes = resolveTrustedHttpOperatorScopes(req, requestAuth);
-
-  if (!requesterSessionKey && !allowLocalAdminKill) {
-    sendJson(res, 403, {
-      ok: false,
-      error: {
-        type: "forbidden",
-        message: "Session kills require a local admin request or requester session ownership.",
-      },
-    });
-    return true;
-  }
-
-  const requiredOperatorMethod =
-    requesterSessionKey && !allowLocalAdminKill ? "sessions.abort" : "sessions.delete";
-  const scopeAuth = authorizeOperatorScopesForMethod(requiredOperatorMethod, requestedScopes);
+  // Run kills stay admin-only: sessions.delete is dynamic (write may delete
+  // archived sessions via RPC), but this endpoint terminates live runs.
+  const scopeAuth = authorizeOperatorScopesForRequiredScope(ADMIN_SCOPE, requestedScopes);
   if (!scopeAuth.allowed) {
-    sendJson(res, 403, {
-      ok: false,
-      error: {
-        type: "forbidden",
-        message: `missing scope: ${scopeAuth.missingScope}`,
-      },
-    });
+    sendMissingScopeForbidden(res, scopeAuth.missingScope);
     return true;
   }
 
-  const { entry, canonicalKey } = loadSessionEntry(sessionKey);
+  const requestedAgent = resolveRequestedSessionAgentId(
+    cfg,
+    sessionKey,
+    url.searchParams.get("agentId") ?? undefined,
+  );
+  if (!requestedAgent.ok) {
+    sendInvalidRequest(res, requestedAgent.error.message);
+    return true;
+  }
+  const { entry, canonicalKey } = loadSessionEntry(sessionKey, {
+    agentId: requestedAgent.agentId,
+  });
   if (!entry) {
     sendJson(res, 404, {
       ok: false,
@@ -108,38 +90,26 @@ export async function handleSessionKillHttpRequest(
     return true;
   }
 
-  let killed = false;
-  if (!allowLocalAdminKill && requesterSessionKey) {
-    const runEntry = getLatestSubagentRunByChildSessionKey(canonicalKey);
-    if (runEntry) {
-      const result = await killControlledSubagentRun({
-        cfg,
-        controller: resolveSubagentController({ cfg, agentSessionKey: requesterSessionKey }),
-        entry: runEntry,
-      });
-      if (result.status === "forbidden") {
-        sendJson(res, 403, {
-          ok: false,
-          error: {
-            type: "forbidden",
-            message: result.error,
-          },
-        });
-        return true;
-      }
-      killed = result.status === "ok";
-    }
-  } else {
-    const result = await killSubagentRunAdmin({
+  const result = await killSubagentRunAdmin(
+    {
       cfg,
       sessionKey: canonicalKey,
+      agentId: requestedAgent.agentId,
+    },
+    { assertCurrent: requestAuth.assertCurrent },
+  );
+
+  if (result.found && result.error) {
+    sendJson(res, 503, {
+      ok: false,
+      error: { type: "unavailable", message: result.error },
     });
-    killed = result.killed;
+    return true;
   }
 
   sendJson(res, 200, {
     ok: true,
-    killed,
+    killed: result.killed,
   });
   return true;
 }

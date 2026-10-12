@@ -16,8 +16,6 @@ public final class TalkSystemSpeechSynthesizer: NSObject {
     private var currentToken = UUID()
     private var watchdog: Task<Void, Never>?
 
-    public var isSpeaking: Bool { self.synth.isSpeaking }
-
     override private init() {
         super.init()
         self.synth.delegate = self
@@ -35,10 +33,12 @@ public final class TalkSystemSpeechSynthesizer: NSObject {
     public func speak(
         text: String,
         language: String? = nil,
-        onStart: (() -> Void)? = nil
-    ) async throws {
+        onStart: (() -> Void)? = nil) async throws
+    {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
+        // A cancelled caller must not retire the utterance already playing.
+        guard !Task.isCancelled else { throw SpeakError.canceled }
 
         self.stop()
         let token = UUID()
@@ -51,8 +51,9 @@ public final class TalkSystemSpeechSynthesizer: NSObject {
         }
         self.currentUtterance = utterance
 
-        let watchdogTimeout = Self.watchdogTimeoutSeconds(text: trimmed, language: language ?? utterance.voice?.language)
-        self.watchdog?.cancel()
+        let watchdogTimeout = Self.watchdogTimeoutSeconds(
+            text: trimmed,
+            language: language ?? utterance.voice?.language)
         self.watchdog = Task { @MainActor [weak self] in
             guard let self else { return }
             try? await Task.sleep(nanoseconds: UInt64(watchdogTimeout * 1_000_000_000))
@@ -74,6 +75,9 @@ public final class TalkSystemSpeechSynthesizer: NSObject {
             }
         }, onCancel: {
             Task { @MainActor in
+                // A replacement may start before this actor hop runs. Cancellation
+                // must stop only the utterance owned by the canceled call.
+                guard self.currentToken == token else { return }
                 self.stop()
             }
         })
@@ -131,11 +135,7 @@ public final class TalkSystemSpeechSynthesizer: NSObject {
         self.didStartCallback = nil
         let cont = self.speakContinuation
         self.speakContinuation = nil
-        if let error {
-            cont?.resume(throwing: error)
-        } else {
-            cont?.resume(returning: ())
-        }
+        if let cont { ThrowingContinuationSupport.resumeVoid(cont, error: error) }
     }
 }
 

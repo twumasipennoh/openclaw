@@ -1,31 +1,13 @@
-import HOST_ENV_SECURITY_POLICY_JSON from "./host-env-security-policy.json" with { type: "json" };
-import { markOpenClawExecEnv } from "./openclaw-exec-env.js";
+// Filters host environment variables before passing them to runtimes.
+import { AsyncLocalStorage } from "node:async_hooks";
+import { sortUniqueStrings } from "@openclaw/normalization-core/string-normalization";
+import { HOST_ENV_SECURITY_POLICY } from "./host-env-security-policy.js";
+import { markOpenClawExecEnv, SUBAGENT_EXEC_ENV_VAR } from "./openclaw-exec-env.js";
 
 const PORTABLE_ENV_VAR_KEY = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const WINDOWS_COMPAT_OVERRIDE_ENV_VAR_KEY = /^[A-Za-z_][A-Za-z0-9_()]*$/;
 
-type HostEnvSecurityPolicy = {
-  blockedKeys: string[];
-  blockedOverrideKeys?: string[];
-  blockedOverridePrefixes?: string[];
-  blockedPrefixes: string[];
-};
-
-const HOST_ENV_SECURITY_POLICY = HOST_ENV_SECURITY_POLICY_JSON as HostEnvSecurityPolicy;
-
-export const HOST_DANGEROUS_ENV_KEY_VALUES: readonly string[] = Object.freeze(
-  HOST_ENV_SECURITY_POLICY.blockedKeys.map((key) => key.toUpperCase()),
-);
-export const HOST_DANGEROUS_ENV_PREFIXES: readonly string[] = Object.freeze(
-  HOST_ENV_SECURITY_POLICY.blockedPrefixes.map((prefix) => prefix.toUpperCase()),
-);
-export const HOST_DANGEROUS_OVERRIDE_ENV_KEY_VALUES: readonly string[] = Object.freeze(
-  (HOST_ENV_SECURITY_POLICY.blockedOverrideKeys ?? []).map((key) => key.toUpperCase()),
-);
-export const HOST_DANGEROUS_OVERRIDE_ENV_PREFIXES: readonly string[] = Object.freeze(
-  (HOST_ENV_SECURITY_POLICY.blockedOverridePrefixes ?? []).map((prefix) => prefix.toUpperCase()),
-);
-export const HOST_SHELL_WRAPPER_ALLOWED_OVERRIDE_ENV_KEY_VALUES: readonly string[] = Object.freeze([
+const HOST_SHELL_WRAPPER_ALLOWED_OVERRIDE_ENV_KEYS = new Set([
   "TERM",
   "LANG",
   "LC_ALL",
@@ -34,22 +16,58 @@ export const HOST_SHELL_WRAPPER_ALLOWED_OVERRIDE_ENV_KEY_VALUES: readonly string
   "COLORTERM",
   "NO_COLOR",
   "FORCE_COLOR",
+  SUBAGENT_EXEC_ENV_VAR,
 ]);
-export const HOST_DANGEROUS_ENV_KEYS = new Set<string>(HOST_DANGEROUS_ENV_KEY_VALUES);
-export const HOST_DANGEROUS_OVERRIDE_ENV_KEYS = new Set<string>(
-  HOST_DANGEROUS_OVERRIDE_ENV_KEY_VALUES,
-);
-export const HOST_SHELL_WRAPPER_ALLOWED_OVERRIDE_ENV_KEYS = new Set<string>(
-  HOST_SHELL_WRAPPER_ALLOWED_OVERRIDE_ENV_KEY_VALUES,
-);
+const HOST_DANGEROUS_ENV_KEYS = new Set(HOST_ENV_SECURITY_POLICY.blockedKeys);
+const HOST_DANGEROUS_INHERITED_ENV_KEYS = new Set(HOST_ENV_SECURITY_POLICY.blockedInheritedKeys);
+const HOST_DANGEROUS_OVERRIDE_ENV_KEYS = new Set(HOST_ENV_SECURITY_POLICY.blockedOverrideKeys);
+const CARGO_TARGET_EXECUTABLE_OVERRIDE_ENV_KEY = /^CARGO_TARGET_[A-Z0-9_]+_(?:LINKER|RUNNER)$/;
+const GIT_ALLOW_PROTOCOL_ENV_KEY = "GIT_ALLOW_PROTOCOL";
+const GIT_PROTOCOL_FROM_USER_ENV_KEY = "GIT_PROTOCOL_FROM_USER";
+const GIT_PROTOCOL_FROM_USER_DISABLED_VALUE = "0";
+const GIT_DEFAULT_ALWAYS_ALLOWED_PROTOCOLS = new Set(["git", "http", "https", "ssh"]);
+const scopedBlockedInheritedEnvKeys = new AsyncLocalStorage<ReadonlySet<string>>();
 
-export type HostExecEnvSanitizationResult = {
+/** Run a bounded operation without forwarding selected inherited env vars to host exec. */
+export function withHostExecInheritedEnvOmitted<T>(keys: Iterable<string>, run: () => T): T {
+  const normalized = new Set(scopedBlockedInheritedEnvKeys.getStore() ?? []);
+  for (const key of keys) {
+    const trimmed = key.trim();
+    if (trimmed) {
+      normalized.add(trimmed.toUpperCase());
+    }
+  }
+  return scopedBlockedInheritedEnvKeys.run(normalized, run);
+}
+
+function isScopedBlockedHostExecEnvVarName(rawKey: string): boolean {
+  const key = normalizeEnvVarKey(rawKey);
+  return key ? (scopedBlockedInheritedEnvKeys.getStore()?.has(key.toUpperCase()) ?? false) : false;
+}
+
+function isNoPagerOverride(key: string, value: string): boolean {
+  return (
+    (key.toUpperCase() === "GIT_PAGER" || key.toUpperCase() === "PAGER") &&
+    (value === "" || value === "cat")
+  );
+}
+
+function isShellWrapperAllowedOverrideEnvVarName(rawKey: string): boolean {
+  const key = normalizeEnvVarKey(rawKey, { portable: true });
+  if (!key) {
+    return false;
+  }
+  const upper = key.toUpperCase();
+  return HOST_SHELL_WRAPPER_ALLOWED_OVERRIDE_ENV_KEYS.has(upper) || upper.startsWith("LC_");
+}
+
+type HostExecEnvSanitizationResult = {
   env: Record<string, string>;
   rejectedOverrideBlockedKeys: string[];
   rejectedOverrideInvalidKeys: string[];
 };
 
-export type HostExecEnvOverrideDiagnostics = {
+type HostExecEnvOverrideDiagnostics = {
   rejectedOverrideBlockedKeys: string[];
   rejectedOverrideInvalidKeys: string[];
 };
@@ -70,37 +88,35 @@ export function normalizeEnvVarKey(
 
 export function normalizeHostOverrideEnvVarKey(rawKey: string): string | null {
   const key = normalizeEnvVarKey(rawKey);
-  if (!key) {
-    return null;
-  }
-  if (PORTABLE_ENV_VAR_KEY.test(key) || WINDOWS_COMPAT_OVERRIDE_ENV_VAR_KEY.test(key)) {
-    return key;
-  }
-  return null;
+  return key && WINDOWS_COMPAT_OVERRIDE_ENV_VAR_KEY.test(key) ? key : null;
 }
 
 export function isDangerousHostEnvVarName(rawKey: string): boolean {
-  const key = normalizeEnvVarKey(rawKey);
-  if (!key) {
-    return false;
-  }
-  const upper = key.toUpperCase();
-  if (HOST_DANGEROUS_ENV_KEYS.has(upper)) {
-    return true;
-  }
-  return HOST_DANGEROUS_ENV_PREFIXES.some((prefix) => upper.startsWith(prefix));
+  const upper = normalizeEnvVarKey(rawKey)?.toUpperCase();
+  return (
+    upper !== undefined &&
+    (HOST_DANGEROUS_ENV_KEYS.has(upper) ||
+      HOST_ENV_SECURITY_POLICY.blockedPrefixes.some((prefix) => upper.startsWith(prefix)))
+  );
+}
+
+export function isDangerousHostInheritedEnvVarName(rawKey: string): boolean {
+  const upper = normalizeEnvVarKey(rawKey)?.toUpperCase();
+  return (
+    upper !== undefined &&
+    (HOST_DANGEROUS_INHERITED_ENV_KEYS.has(upper) ||
+      HOST_ENV_SECURITY_POLICY.blockedInheritedPrefixes.some((prefix) => upper.startsWith(prefix)))
+  );
 }
 
 export function isDangerousHostEnvOverrideVarName(rawKey: string): boolean {
-  const key = normalizeEnvVarKey(rawKey);
-  if (!key) {
-    return false;
-  }
-  const upper = key.toUpperCase();
-  if (HOST_DANGEROUS_OVERRIDE_ENV_KEYS.has(upper)) {
-    return true;
-  }
-  return HOST_DANGEROUS_OVERRIDE_ENV_PREFIXES.some((prefix) => upper.startsWith(prefix));
+  const upper = normalizeEnvVarKey(rawKey)?.toUpperCase();
+  return (
+    upper !== undefined &&
+    (HOST_DANGEROUS_OVERRIDE_ENV_KEYS.has(upper) ||
+      CARGO_TARGET_EXECUTABLE_OVERRIDE_ENV_KEY.test(upper) ||
+      HOST_ENV_SECURITY_POLICY.blockedOverridePrefixes.some((prefix) => upper.startsWith(prefix)))
+  );
 }
 
 function listNormalizedEnvEntries(
@@ -121,8 +137,42 @@ function listNormalizedEnvEntries(
   return entries;
 }
 
-function sortUnique(values: Iterable<string>): string[] {
-  return Array.from(new Set(values)).toSorted((a, b) => a.localeCompare(b));
+function isPermissiveGitProtocolFromUserValue(value: string): boolean {
+  const normalized = value.trim().toLowerCase();
+  return (
+    normalized === "true" ||
+    normalized === "yes" ||
+    normalized === "on" ||
+    (/^[+-]?\d+$/.test(normalized) && !/^[+-]?0+$/.test(normalized))
+  );
+}
+
+function sanitizeInheritedGitAllowProtocolValue(value: string): string {
+  return value
+    .trim()
+    .split(":")
+    .filter((protocol) => GIT_DEFAULT_ALWAYS_ALLOWED_PROTOCOLS.has(protocol))
+    .join(":");
+}
+
+function sanitizeHostInheritedEnvEntry(key: string, value: string): [string, string] | null {
+  // Preserve inherited Git allowlists without widening malformed or unsafe entries by deletion.
+  // Protocols outside Git's safe default set are removed instead of being passed through.
+  if (key.toUpperCase() === GIT_ALLOW_PROTOCOL_ENV_KEY) {
+    return [key, sanitizeInheritedGitAllowProtocolValue(value)];
+  }
+  // Preserve non-permissive Git boolean values. Permissive values must become explicit `0`
+  // because Git's unset default still permits protocols with policy `user`.
+  if (key.toUpperCase() === GIT_PROTOCOL_FROM_USER_ENV_KEY) {
+    return [
+      key,
+      isPermissiveGitProtocolFromUserValue(value) ? GIT_PROTOCOL_FROM_USER_DISABLED_VALUE : value,
+    ];
+  }
+  if (isDangerousHostInheritedEnvVarName(key)) {
+    return null;
+  }
+  return [key, value];
 }
 
 function sanitizeHostEnvOverridesWithDiagnostics(params?: {
@@ -158,10 +208,20 @@ function sanitizeHostEnvOverridesWithDiagnostics(params?: {
       continue;
     }
     const upper = normalized.toUpperCase();
+    if (isScopedBlockedHostExecEnvVarName(upper)) {
+      rejectedBlocked.push(upper);
+      continue;
+    }
     // PATH is part of the security boundary (command resolution + safe-bin checks). Never allow
     // request-scoped PATH overrides from agents/gateways.
     if (blockPathOverrides && upper === "PATH") {
       rejectedBlocked.push(upper);
+      continue;
+    }
+    // Git treats exact cat/empty as no pager. Never forward cat: generic PAGER consumers
+    // can resolve it through PATH/cwd. Empty carries no executable override. Do not trim values.
+    if (isNoPagerOverride(upper, value)) {
+      acceptedOverrides[normalized] = "";
       continue;
     }
     if (isDangerousHostEnvVarName(upper) || isDangerousHostEnvOverrideVarName(upper)) {
@@ -173,8 +233,8 @@ function sanitizeHostEnvOverridesWithDiagnostics(params?: {
 
   return {
     acceptedOverrides,
-    rejectedOverrideBlockedKeys: sortUnique(rejectedBlocked),
-    rejectedOverrideInvalidKeys: sortUnique(rejectedInvalid),
+    rejectedOverrideBlockedKeys: sortUniqueStrings(rejectedBlocked),
+    rejectedOverrideInvalidKeys: sortUniqueStrings(rejectedInvalid),
   };
 }
 
@@ -187,10 +247,15 @@ export function sanitizeHostExecEnvWithDiagnostics(params?: {
 
   const merged: Record<string, string> = {};
   for (const [key, value] of listNormalizedEnvEntries(baseEnv)) {
-    if (isDangerousHostEnvVarName(key)) {
+    if (isScopedBlockedHostExecEnvVarName(key)) {
       continue;
     }
-    merged[key] = value;
+    const sanitizedEntry = sanitizeHostInheritedEnvEntry(key, value);
+    if (!sanitizedEntry) {
+      continue;
+    }
+    const [sanitizedKey, sanitizedValue] = sanitizedEntry;
+    merged[sanitizedKey] = sanitizedValue;
   }
 
   const overrideResult = sanitizeHostEnvOverridesWithDiagnostics({
@@ -242,7 +307,11 @@ export function sanitizeSystemRunEnvOverrides(params?: {
   }
   const filtered: Record<string, string> = {};
   for (const [key, value] of listNormalizedEnvEntries(overrides, { portable: true })) {
-    if (!HOST_SHELL_WRAPPER_ALLOWED_OVERRIDE_ENV_KEYS.has(key.toUpperCase())) {
+    if (isNoPagerOverride(key, value) && !isScopedBlockedHostExecEnvVarName(key)) {
+      filtered[key] = "";
+      continue;
+    }
+    if (!isShellWrapperAllowedOverrideEnvVarName(key)) {
       continue;
     }
     filtered[key] = value;

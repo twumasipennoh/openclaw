@@ -1,122 +1,171 @@
-import { describe, expect, it } from "vitest";
-import { resolveControlCommandGate } from "../../runtime-api.js";
+import "./monitor-helpers.test-support.js";
+import "./monitor-onchar.test-support.js";
+import { createPluginRuntimeMock } from "openclaw/plugin-sdk/channel-test-helpers";
+import { beforeEach, describe, expect, it } from "vitest";
+import { setMattermostRuntime } from "../runtime.js";
 import type { ResolvedMattermostAccount } from "./accounts.js";
 import {
   authorizeMattermostCommandInvocation,
-  resolveMattermostEffectiveAllowFromLists,
+  resolveMattermostMonitorInboundAccess,
 } from "./monitor-auth.js";
 
-const accountFixture: ResolvedMattermostAccount = {
-  accountId: "default",
-  enabled: true,
-  botToken: "bot-token",
-  baseUrl: "https://chat.example.com",
-  botTokenSource: "config",
-  baseUrlSource: "config",
-  config: {},
-};
-
-function authorizeGroupCommand(senderId: string) {
-  return authorizeMattermostCommandInvocation({
-    account: {
-      ...accountFixture,
-      config: {
-        groupPolicy: "allowlist",
-        allowFrom: ["trusted-user"],
-      },
-    },
-    cfg: {
-      commands: {
-        useAccessGroups: true,
-      },
-    },
-    senderId,
-    senderName: senderId,
-    channelId: "chan-1",
-    channelInfo: {
-      id: "chan-1",
-      type: "O",
-      name: "general",
-      display_name: "General",
-    },
-    storeAllowFrom: [],
-    allowTextCommands: true,
-    hasControlCommand: true,
-  });
+function account(config: ResolvedMattermostAccount["config"]): ResolvedMattermostAccount {
+  return {
+    accountId: "default",
+    enabled: true,
+    botToken: "bot-token",
+    baseUrl: "https://chat.example.com",
+    botTokenSource: "config",
+    baseUrlSource: "config",
+    streamingMode: "partial",
+    config,
+  };
 }
+const channelInfo = { id: "chan-1", type: "O", name: "general", display_name: "General" };
+const command = {
+  cfg: {},
+  channelId: "chan-1",
+  channelInfo,
+  storeAllowFrom: [],
+  allowTextCommands: true,
+  hasControlCommand: true,
+};
+const inbound = {
+  cfg: {},
+  senderId: "trusted-user",
+  senderName: "Trusted User",
+  channelId: "chan-1",
+  groupPolicy: "allowlist",
+  storeAllowFrom: ["user:attacker"],
+  allowTextCommands: false,
+  hasControlCommand: false,
+} as const;
 
 describe("mattermost monitor authz", () => {
-  it("keeps DM allowlist merged with pairing-store entries", () => {
-    const resolved = resolveMattermostEffectiveAllowFromLists({
-      dmPolicy: "pairing",
-      allowFrom: ["@trusted-user"],
-      groupAllowFrom: ["@group-owner"],
-      storeAllowFrom: ["user:attacker"],
-    });
+  beforeEach(() => setMattermostRuntime(createPluginRuntimeMock()));
 
-    expect(resolved.effectiveAllowFrom).toEqual(["trusted-user", "attacker"]);
-  });
+  it.each([
+    {
+      kind: "direct",
+      config: { allowFrom: ["@trusted-user"], groupAllowFrom: ["@group-owner"] },
+      expected: ["trusted-user", "attacker"],
+    },
+    {
+      kind: "channel",
+      config: { allowFrom: ["@trusted-user"], groupAllowFrom: ["@group-owner"] },
+      expected: ["group-owner"],
+    },
+    { kind: "channel", config: { allowFrom: ["@trusted-user"] }, expected: ["trusted-user"] },
+  ] as const)(
+    "isolates $kind admission from unrelated pairing and group entries: $expected",
+    async ({ kind, config, expected }) => {
+      const resolved = await resolveMattermostMonitorInboundAccess({
+        ...inbound,
+        storeAllowFrom: [...inbound.storeAllowFrom],
+        kind,
+        account: account({
+          allowFrom: [...config.allowFrom],
+          ...(config.groupAllowFrom ? { groupAllowFrom: [...config.groupAllowFrom] } : {}),
+        }),
+      });
+      expect(
+        kind === "direct"
+          ? resolved.senderAccess.effectiveAllowFrom
+          : resolved.senderAccess.effectiveGroupAllowFrom,
+      ).toEqual(expected);
+    },
+  );
 
-  it("uses explicit groupAllowFrom without pairing-store inheritance", () => {
-    const resolved = resolveMattermostEffectiveAllowFromLists({
-      dmPolicy: "pairing",
-      allowFrom: ["@trusted-user"],
-      groupAllowFrom: ["@group-owner"],
-      storeAllowFrom: ["user:attacker"],
-    });
-
-    expect(resolved.effectiveGroupAllowFrom).toEqual(["group-owner"]);
-  });
-
-  it("does not inherit pairing-store entries into group allowlist", () => {
-    const resolved = resolveMattermostEffectiveAllowFromLists({
-      dmPolicy: "pairing",
-      allowFrom: ["@trusted-user"],
-      storeAllowFrom: ["user:attacker"],
-    });
-
-    expect(resolved.effectiveAllowFrom).toEqual(["trusted-user", "attacker"]);
-    expect(resolved.effectiveGroupAllowFrom).toEqual(["trusted-user"]);
-  });
-
-  it("does not auto-authorize DM commands in open mode without allowlists", () => {
-    const resolved = resolveMattermostEffectiveAllowFromLists({
-      dmPolicy: "open",
-      allowFrom: [],
-      groupAllowFrom: [],
+  it("does not auto-authorize DM commands in open mode without allowlists", async () => {
+    const access = await resolveMattermostMonitorInboundAccess({
+      ...inbound,
+      kind: "direct",
+      account: account({ dmPolicy: "open" }),
       storeAllowFrom: [],
-    });
-
-    const commandGate = resolveControlCommandGate({
-      useAccessGroups: true,
-      authorizers: [
-        { configured: resolved.effectiveAllowFrom.length > 0, allowed: false },
-        { configured: resolved.effectiveGroupAllowFrom.length > 0, allowed: false },
-      ],
       allowTextCommands: true,
       hasControlCommand: true,
     });
-
-    expect(commandGate.commandAuthorized).toBe(false);
+    expect(access.ingress.decision).toBe("block");
+    expect(access.commandAccess.authorized).toBe(false);
   });
 
-  it("denies group control commands when the sender is outside the allowlist", () => {
-    const decision = authorizeGroupCommand("attacker");
+  it.each([
+    {
+      senderId: "attacker",
+      result: { ok: false, denyReason: "unauthorized", commandAuthorized: false },
+    },
+    { senderId: "trusted-user", result: { ok: true, commandAuthorized: true } },
+  ])("authorizes group commands by sender: $senderId", async ({ senderId, result }) => {
+    expect(
+      await authorizeMattermostCommandInvocation({
+        ...command,
+        account: account({ groupPolicy: "allowlist", allowFrom: ["trusted-user"] }),
+        senderId,
+        senderName: senderId,
+      }),
+    ).toMatchObject(result);
+  });
 
-    expect(decision).toMatchObject({
+  it("denies commands without trusted channel type", async () => {
+    const unknownChannel = { id: "dm-1", name: "", display_name: "" };
+    expect(
+      await authorizeMattermostCommandInvocation({
+        ...command,
+        channelId: "dm-1",
+        channelInfo: unknownChannel,
+        account: account({
+          dmPolicy: "allowlist",
+          groupPolicy: "open",
+          allowFrom: ["trusted-user"],
+        }),
+        senderId: "new-user",
+        senderName: "New User",
+      }),
+    ).toMatchObject({
       ok: false,
-      denyReason: "unauthorized",
-      kind: "channel",
+      denyReason: "unknown-channel",
+      commandAuthorized: false,
     });
   });
 
-  it("authorizes group control commands for allowlisted senders", () => {
-    const decision = authorizeGroupCommand("trusted-user");
-
-    expect(decision).toMatchObject({
+  it("authorizes group senders through static access groups", async () => {
+    const groupChannel = { ...channelInfo, type: "g" };
+    expect(
+      await authorizeMattermostCommandInvocation({
+        ...command,
+        channelInfo: groupChannel,
+        senderId: "trusted-user",
+        senderName: "Trusted User",
+        account: account({ groupPolicy: "allowlist", groupAllowFrom: ["accessGroup:oncall"] }),
+        cfg: {
+          accessGroups: {
+            oncall: {
+              type: "message.senders",
+              members: { mattermost: ["mattermost:trusted-user"] },
+            },
+          },
+        },
+      }),
+    ).toMatchObject({
       ok: true,
       commandAuthorized: true,
-      kind: "channel",
+      kind: "group",
+      chatType: "group",
     });
+  });
+
+  it("fails direct reaction access without pairing admission", async () => {
+    const access = await resolveMattermostMonitorInboundAccess({
+      ...inbound,
+      kind: "direct",
+      account: account({ dmPolicy: "pairing" }),
+      senderId: "new-user",
+      senderName: "New User",
+      storeAllowFrom: [],
+      eventKind: "reaction",
+      mayPair: false,
+    });
+    expect(access.ingress.decision).toBe("block");
+    expect(access.ingress.reasonCode).toBe("event_pairing_not_allowed");
   });
 });

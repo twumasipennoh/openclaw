@@ -1,23 +1,39 @@
+import type { OpenClawPluginService } from "openclaw/plugin-sdk/plugin-entry";
 import {
   startLazyPluginServiceModule,
   type LazyPluginServiceHandle,
-  type OpenClawPluginService,
-} from "openclaw/plugin-sdk/browser-node-runtime";
+} from "openclaw/plugin-sdk/plugin-runtime";
+import { isTruthyEnvValue } from "openclaw/plugin-sdk/runtime-env";
 
-type BrowserControlHandle = LazyPluginServiceHandle | null;
+const EAGER_BROWSER_CONTROL_SERVICE_ENV = "OPENCLAW_EAGER_BROWSER_CONTROL_SERVER";
+const UNSAFE_BROWSER_CONTROL_OVERRIDE_SPECIFIER = /^(?:data|http|https|node):/i;
 
-export function createBrowserPluginService(): OpenClawPluginService {
-  let handle: BrowserControlHandle = null;
+function validateBrowserControlOverrideSpecifier(specifier: string): string {
+  const trimmed = specifier.trim();
+  if (UNSAFE_BROWSER_CONTROL_OVERRIDE_SPECIFIER.test(trimmed)) {
+    throw new Error(`Refusing unsafe browser control override specifier: ${trimmed}`);
+  }
+  return trimmed;
+}
+
+export function createBrowserPluginService(params: {
+  stopOnDemand: () => Promise<void>;
+}): OpenClawPluginService {
+  let handle: LazyPluginServiceHandle | null = null;
 
   return {
     id: "browser-control",
     start: async () => {
+      if (!isTruthyEnvValue(process.env[EAGER_BROWSER_CONTROL_SERVICE_ENV])) {
+        return;
+      }
       if (handle) {
         return;
       }
       handle = await startLazyPluginServiceModule({
         skipEnvVar: "OPENCLAW_SKIP_BROWSER_CONTROL_SERVER",
         overrideEnvVar: "OPENCLAW_BROWSER_CONTROL_MODULE",
+        validateOverrideSpecifier: validateBrowserControlOverrideSpecifier,
         // Keep the default module import static so compiled builds still bundle it.
         loadDefaultModule: async () => await import("./server.js"),
         startExportNames: [
@@ -29,11 +45,14 @@ export function createBrowserPluginService(): OpenClawPluginService {
     },
     stop: async () => {
       const current = handle;
-      handle = null;
-      if (!current) {
+      if (current) {
+        await current.stop();
+        if (handle === current) {
+          handle = null;
+        }
         return;
       }
-      await current.stop().catch(() => {});
+      await params.stopOnDemand();
     },
   };
 }

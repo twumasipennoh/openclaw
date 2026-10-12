@@ -1,206 +1,342 @@
-import fs from "node:fs/promises";
-import { z } from "zod";
-import { writeJsonAtomic } from "../../infra/json-files.js";
-import { safeParseJsonWithSchema } from "../../utils/zod-parse.js";
-import { acquireSessionWriteLock } from "../session-write-lock.js";
-import { SANDBOX_BROWSER_REGISTRY_PATH, SANDBOX_REGISTRY_PATH } from "./constants.js";
+/**
+ * Persistent sandbox registry storage.
+ *
+ * Tracks runtime and browser containers in the shared state DB.
+ */
+import { createHash } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
+import { withFileLock } from "../../infra/file-lock.js";
+import { executeSqliteQuerySync, getNodeSqliteKysely } from "../../infra/kysely-sync.js";
+import { createSqliteWorkerWriteAdmission } from "../../infra/sqlite-worker-store.js";
+import {
+  executeExistingOpenClawStateRead,
+  withExistingOpenClawStateDatabaseReadOnly,
+} from "../../state/openclaw-state-db-readonly.js";
+import { tableExists } from "../../state/openclaw-state-db-schema-helpers.js";
+import type { DB as OpenClawStateKyselyDatabase } from "../../state/openclaw-state-db.generated.js";
+import { runOpenClawStateWriteTransaction } from "../../state/openclaw-state-db.js";
+import { resolveOpenClawStateSqlitePath } from "../../state/openclaw-state-db.paths.js";
+import { captureOpenClawStateWorkerContext } from "../../state/openclaw-state-worker-context.js";
+import type { WorkspaceStateGuard } from "../workspace-state-store.worker-contract.js";
+import {
+  assertSandboxRegistryReservationCurrent,
+  containerEntryToRow,
+  insertSandboxRegistryRowInDatabase,
+  type SandboxRegistryWrite,
+  readSandboxRegistryEntryInDatabase,
+  readSandboxRegistryRowInDatabase,
+  rowToBrowserEntry,
+  rowToContainerEntry,
+} from "./registry.kernel.js";
+import type {
+  SandboxBrowserRegistry,
+  SandboxBrowserRegistryEntry,
+  SandboxRegistry,
+  SandboxRegistryEntry,
+} from "./registry.types.js";
 
-export type SandboxRegistryEntry = {
-  containerName: string;
-  backendId?: string;
-  runtimeLabel?: string;
-  sessionKey: string;
-  createdAtMs: number;
-  lastUsedAtMs: number;
-  image: string;
-  configLabelKind?: string;
-  configHash?: string;
-};
+export type { SandboxRegistryEntry, SandboxBrowserRegistryEntry } from "./registry.types.js";
 
-type SandboxRegistry = {
-  entries: SandboxRegistryEntry[];
-};
+type SandboxRegistryKind = "container" | "browser";
+type SandboxRegistryDatabase = Pick<OpenClawStateKyselyDatabase, "sandbox_registry_entries">;
 
-export type SandboxBrowserRegistryEntry = {
-  containerName: string;
-  sessionKey: string;
-  createdAtMs: number;
-  lastUsedAtMs: number;
-  image: string;
-  configHash?: string;
-  cdpPort: number;
-  noVncPort?: number;
-};
-
-type SandboxBrowserRegistry = {
-  entries: SandboxBrowserRegistryEntry[];
-};
-
-type RegistryReadMode = "strict" | "fallback";
-
-type RegistryEntry = {
-  containerName: string;
-};
-
-type RegistryFile<T extends RegistryEntry> = {
-  entries: T[];
-};
-
-type UpsertEntry = RegistryEntry & {
-  backendId?: string;
-  runtimeLabel?: string;
-  createdAtMs: number;
-  image: string;
-  configLabelKind?: string;
-  configHash?: string;
-};
-
-const RegistryEntrySchema = z
-  .object({
-    containerName: z.string(),
-  })
-  .passthrough();
-
-const RegistryFileSchema = z.object({
-  entries: z.array(RegistryEntrySchema),
-});
-
-function normalizeSandboxRegistryEntry(entry: SandboxRegistryEntry): SandboxRegistryEntry {
-  return {
-    ...entry,
-    backendId: entry.backendId?.trim() || "docker",
-    runtimeLabel: entry.runtimeLabel?.trim() || entry.containerName,
-    configLabelKind: entry.configLabelKind?.trim() || "Image",
-  };
+function getSandboxRegistryKysely(db: import("node:sqlite").DatabaseSync) {
+  return getNodeSqliteKysely<SandboxRegistryDatabase>(db);
 }
 
-async function withRegistryLock<T>(registryPath: string, fn: () => Promise<T>): Promise<T> {
-  const lock = await acquireSessionWriteLock({ sessionFile: registryPath, allowReentrant: false });
-  try {
-    return await fn();
-  } finally {
-    await lock.release();
-  }
-}
-
-async function readRegistryFromFile<T extends RegistryEntry>(
-  registryPath: string,
-  mode: RegistryReadMode,
-): Promise<RegistryFile<T>> {
-  try {
-    const raw = await fs.readFile(registryPath, "utf-8");
-    const parsed = safeParseJsonWithSchema(RegistryFileSchema, raw) as RegistryFile<T> | null;
-    if (parsed) {
-      return parsed;
-    }
-    if (mode === "fallback") {
-      return { entries: [] };
-    }
-    throw new Error(`Invalid sandbox registry format: ${registryPath}`);
-  } catch (error) {
-    const code = (error as { code?: string } | null)?.code;
-    if (code === "ENOENT") {
-      return { entries: [] };
-    }
-    if (mode === "fallback") {
-      return { entries: [] };
-    }
-    if (error instanceof Error) {
-      throw error;
-    }
-    throw new Error(`Failed to read sandbox registry file: ${registryPath}`, { cause: error });
-  }
-}
-
-async function writeRegistryFile<T extends RegistryEntry>(
-  registryPath: string,
-  registry: RegistryFile<T>,
+async function writeRegistry(
+  write: SandboxRegistryWrite,
+  guard?: WorkspaceStateGuard,
+  assertCallerCurrent?: () => void,
 ): Promise<void> {
-  await writeJsonAtomic(registryPath, registry, { trailingNewline: true });
-}
-
-export async function readRegistry(): Promise<SandboxRegistry> {
-  const registry = await readRegistryFromFile<SandboxRegistryEntry>(
-    SANDBOX_REGISTRY_PATH,
-    "fallback",
-  );
-  return {
-    entries: registry.entries.map((entry) => normalizeSandboxRegistryEntry(entry)),
+  guard?.assertHost?.();
+  guard?.beforeLegacyApply?.();
+  const context = captureOpenClawStateWorkerContext();
+  const input = structuredClone(write);
+  const assertCurrent = () => {
+    guard?.assertHost?.();
+    context.admission.assertCurrent();
+    context.maintenanceScope?.assertAdmission();
+    assertCallerCurrent?.();
   };
-}
-
-function upsertEntry<T extends UpsertEntry>(entries: T[], entry: T): T[] {
-  const existing = entries.find((item) => item.containerName === entry.containerName);
-  const next = entries.filter((item) => item.containerName !== entry.containerName);
-  next.push({
-    ...entry,
-    backendId: entry.backendId ?? existing?.backendId,
-    runtimeLabel: entry.runtimeLabel ?? existing?.runtimeLabel,
-    createdAtMs: existing?.createdAtMs ?? entry.createdAtMs,
-    image: existing?.image ?? entry.image,
-    configLabelKind: entry.configLabelKind ?? existing?.configLabelKind,
-    configHash: entry.configHash ?? existing?.configHash,
-  });
-  return next;
-}
-
-function removeEntry<T extends RegistryEntry>(entries: T[], containerName: string): T[] {
-  return entries.filter((entry) => entry.containerName !== containerName);
-}
-
-async function withRegistryMutation<T extends RegistryEntry>(
-  registryPath: string,
-  mutate: (entries: T[]) => T[] | null,
-): Promise<void> {
-  await withRegistryLock(registryPath, async () => {
-    const registry = await readRegistryFromFile<T>(registryPath, "strict");
-    const next = mutate(registry.entries);
-    if (next === null) {
-      return;
-    }
-    await writeRegistryFile(registryPath, { entries: next });
-  });
-}
-
-export async function updateRegistry(entry: SandboxRegistryEntry) {
-  await withRegistryMutation<SandboxRegistryEntry>(SANDBOX_REGISTRY_PATH, (entries) =>
-    upsertEntry(entries, entry),
-  );
-}
-
-export async function removeRegistryEntry(containerName: string) {
-  await withRegistryMutation<SandboxRegistryEntry>(SANDBOX_REGISTRY_PATH, (entries) => {
-    const next = removeEntry(entries, containerName);
-    if (next.length === entries.length) {
-      return null;
-    }
-    return next;
-  });
-}
-
-export async function readBrowserRegistry(): Promise<SandboxBrowserRegistry> {
-  return await readRegistryFromFile<SandboxBrowserRegistryEntry>(
-    SANDBOX_BROWSER_REGISTRY_PATH,
-    "fallback",
-  );
-}
-
-export async function updateBrowserRegistry(entry: SandboxBrowserRegistryEntry) {
-  await withRegistryMutation<SandboxBrowserRegistryEntry>(
-    SANDBOX_BROWSER_REGISTRY_PATH,
-    (entries) => upsertEntry(entries, entry),
-  );
-}
-
-export async function removeBrowserRegistryEntry(containerName: string) {
-  await withRegistryMutation<SandboxBrowserRegistryEntry>(
-    SANDBOX_BROWSER_REGISTRY_PATH,
-    (entries) => {
-      const next = removeEntry(entries, containerName);
-      if (next.length === entries.length) {
-        return null;
-      }
-      return next;
+  const { runOpenClawStateWorkerOperation } =
+    await import("../../state/openclaw-state-worker-store.js");
+  // Reservation checks stay outside grants; the worker checks its authoritative rows.
+  guard?.beforeLegacyApply?.();
+  return runOpenClawStateWorkerOperation(
+    context,
+    (scope) => scope.execute({ type: "sandboxRegistry.write", input }),
+    {
+      assertCurrent,
+      createAdmission: createSqliteWorkerWriteAdmission(assertCurrent, [
+        context.admission.databasePath,
+      ]),
     },
   );
+}
+
+/** Reads all registered sandbox runtime containers from SQLite. */
+export async function readRegistry(): Promise<SandboxRegistry> {
+  const reply = await executeExistingOpenClawStateRead({}, { type: "sandboxRegistry.list" });
+  if (!reply) {
+    return { entries: [] };
+  }
+  if (!reply.ok || reply.type !== "sandboxRegistry.list") {
+    throw new Error("Unexpected sandbox registry list result");
+  }
+  return { entries: reply.entries };
+}
+
+/** Reads one registered sandbox runtime container by container name. */
+export async function readRegistryEntry(
+  containerName: string,
+): Promise<SandboxRegistryEntry | null> {
+  const reply = await executeExistingOpenClawStateRead(
+    {},
+    { type: "sandboxRegistry.get", containerName },
+  );
+  if (!reply) {
+    return null;
+  }
+  if (!reply.ok || reply.type !== "sandboxRegistry.get") {
+    throw new Error("Unexpected sandbox registry lookup result");
+  }
+  return reply.entry;
+}
+
+/** Reads registered runtime IDs for one backend-owned sandbox scope, newest first. */
+export async function readRegisteredSandboxRuntimeIds(params: {
+  backendId: string;
+  scopeKey: string;
+}): Promise<string[]> {
+  const reply = await executeExistingOpenClawStateRead(
+    {},
+    { type: "sandboxRegistry.runtimeIds", ...params },
+  );
+  if (!reply) {
+    return [];
+  }
+  if (!reply.ok || reply.type !== "sandboxRegistry.runtimeIds") {
+    throw new Error("Unexpected sandbox runtime ID result");
+  }
+  return reply.runtimeIds;
+}
+
+/** Creates or updates one sandbox runtime registry entry, preserving immutable creation fields. */
+export async function updateRegistry(entry: SandboxRegistryEntry, guard?: WorkspaceStateGuard) {
+  await writeRegistry({ operation: "update", entry }, guard);
+}
+
+/** Removes one sandbox runtime registry entry by container name. */
+export async function removeRegistryEntry(
+  containerName: string,
+  options: { preserveRemovalIntent?: boolean; guard?: WorkspaceStateGuard } = {},
+) {
+  await writeRegistry(
+    {
+      operation: "remove",
+      containerName,
+      preserveRemovalIntent: options.preserveRemovalIntent,
+    },
+    options.guard,
+  );
+}
+
+/** Atomically select one generation for a backend/scope before provider allocation. */
+export function reserveSandboxRegistryEntry(candidate: SandboxRegistryEntry): SandboxRegistryEntry {
+  return runOpenClawStateWriteTransaction(({ db }) => {
+    const stateDb = getSandboxRegistryKysely(db);
+    const rows = executeSqliteQuerySync(
+      db,
+      stateDb
+        .selectFrom("sandbox_registry_entries")
+        .selectAll()
+        .where("registry_kind", "=", "container")
+        .where("backend_id", "=", candidate.backendId ?? "docker")
+        .where("session_key", "=", candidate.sessionKey)
+        .orderBy("last_used_at_ms", "desc")
+        .orderBy("container_name", "asc"),
+    ).rows;
+    const existing = rows.map(rowToContainerEntry).find((entry) => entry !== null);
+    if (existing) {
+      assertSandboxRegistryReservationCurrent(existing, candidate);
+      if (!existing.runtimeState || !existing.workspaceDir) {
+        existing.runtimeState ??= "pending";
+        existing.workspaceDir ??= candidate.workspaceDir;
+        insertSandboxRegistryRowInDatabase(db, containerEntryToRow(existing));
+      }
+      return existing;
+    }
+    if (readSandboxRegistryRowInDatabase(db, "container", candidate.containerName)) {
+      throw new Error(`Sandbox runtime ID "${candidate.containerName}" is already registered.`);
+    }
+    const entry = { ...candidate, runtimeState: "pending" as const };
+    insertSandboxRegistryRowInDatabase(db, containerEntryToRow(entry));
+    return entry;
+  });
+}
+
+/** Validate the exact generation; retained handles cannot outlive removal intent. */
+export function assertSandboxRegistryEntryCurrent(entry: SandboxRegistryEntry): void {
+  const current =
+    withExistingOpenClawStateDatabaseReadOnly(({ db }) =>
+      readSandboxRegistryEntryInDatabase(db, entry.containerName),
+    ) ?? null;
+  assertSandboxRegistryReservationCurrent(current, entry);
+  if (
+    current.createdAtMs !== entry.createdAtMs ||
+    current.workspaceDir !== entry.workspaceDir ||
+    current.configHash !== entry.configHash ||
+    !isDeepStrictEqual(current.backendTarget, entry.backendTarget)
+  ) {
+    throw new Error("Sandbox runtime generation changed");
+  }
+}
+
+/** Publish only a still-current reservation, or forget a provider-confirmed terminal generation. */
+export async function completeSandboxRegistryReservation(
+  entry: SandboxRegistryEntry,
+  retired = false,
+  guard?: WorkspaceStateGuard,
+): Promise<void> {
+  await writeRegistry({ operation: "complete", entry, retired }, guard);
+}
+
+/** Serialize provider operations across Gateway/CLI; only dead owners permit lock recovery. */
+export async function withSandboxRegistryEntryLock<T>(
+  entry: SandboxRegistryEntry,
+  operation: () => Promise<T>,
+): Promise<T> {
+  const key = createHash("sha256").update(entry.containerName).digest("hex");
+  return await withFileLock(
+    `${resolveOpenClawStateSqlitePath()}.sandbox-${key}`,
+    {
+      // Cover provider warmup (10 minutes), inspection, and cleanup contention.
+      retries: { retries: 9000, factor: 1, minTimeout: 100, maxTimeout: 100 },
+      stale: 0,
+      staleRecovery: "remove-if-definitely-stale",
+    },
+    operation,
+  );
+}
+
+/** Persist removal intent before waiting for provisioning, and retain failed cleanup for retry. */
+export async function removeSandboxRegistryRuntime(
+  entry: SandboxRegistryEntry,
+  removeRuntime: (entry: SandboxRegistryEntry) => Promise<void>,
+  options: {
+    reserveRuntime?: boolean;
+    shouldRemove?: (current: SandboxRegistryEntry) => boolean;
+    guard?: WorkspaceStateGuard;
+  } = {},
+): Promise<void> {
+  const assertCurrent = () => {
+    options.guard?.assertHost?.();
+    options.guard?.beforeLegacyApply?.();
+  };
+  assertCurrent();
+  const selected = runOpenClawStateWriteTransaction(({ db }) => {
+    const row = readSandboxRegistryRowInDatabase(db, "container", entry.containerName);
+    const current = row ? rowToContainerEntry(row) : null;
+    if (
+      !current ||
+      current.backendId !== entry.backendId ||
+      current.sessionKey !== entry.sessionKey ||
+      (options.shouldRemove && !options.shouldRemove(current))
+    ) {
+      return null;
+    }
+    if (!current.runtimeState && !options.reserveRuntime) {
+      return current;
+    }
+    const next: SandboxRegistryEntry = {
+      ...current,
+      runtimeState:
+        current.runtimeState === "pending" || current.runtimeState === "removing-pending"
+          ? "removing-pending"
+          : "removing",
+    };
+    insertSandboxRegistryRowInDatabase(db, containerEntryToRow(next, current));
+    return next;
+  });
+  if (!selected) {
+    return;
+  }
+  if (!selected.runtimeState) {
+    assertCurrent();
+    await removeRuntime(selected);
+    await removeRegistryEntry(selected.containerName, { guard: options.guard });
+    return;
+  }
+  const removing = selected;
+  await withSandboxRegistryEntryLock(removing, async () => {
+    assertCurrent();
+    const current = await readRegistryEntry(removing.containerName);
+    assertCurrent();
+    if (
+      !current ||
+      (current.runtimeState !== "removing" && current.runtimeState !== "removing-pending") ||
+      current.backendId !== removing.backendId ||
+      current.sessionKey !== removing.sessionKey ||
+      (options.shouldRemove && !options.shouldRemove(current))
+    ) {
+      return;
+    }
+    await removeRuntime(current);
+    await removeRegistryEntry(current.containerName, { guard: options.guard });
+  });
+}
+
+/** Reads all registered browser sandbox containers from SQLite. */
+export async function readBrowserRegistry(): Promise<SandboxBrowserRegistry> {
+  const reply = await executeExistingOpenClawStateRead({}, { type: "sandboxRegistry.browsers" });
+  if (!reply) {
+    return { entries: [] };
+  }
+  if (!reply.ok || reply.type !== "sandboxRegistry.browsers") {
+    throw new Error("Unexpected sandbox browser registry result");
+  }
+  return { entries: reply.entries };
+}
+
+/** Validate the exact browser workspace owner before local reconciliation effects. */
+export function assertSandboxBrowserRegistryEntryCurrent(entry: SandboxBrowserRegistryEntry): void {
+  const current = withExistingOpenClawStateDatabaseReadOnly(({ db }) => {
+    if (!tableExists(db, "sandbox_registry_entries")) {
+      return null;
+    }
+    const row = readSandboxRegistryRowInDatabase(db, "browser", entry.containerName);
+    return row ? rowToBrowserEntry(row) : null;
+  });
+  if (
+    !current ||
+    current.sessionKey !== entry.sessionKey ||
+    current.createdAtMs !== entry.createdAtMs ||
+    current.workspaceDir !== entry.workspaceDir ||
+    current.configHash !== entry.configHash
+  ) {
+    throw new Error("Sandbox browser workspace owner changed");
+  }
+}
+
+/** Creates or updates one browser sandbox registry entry, preserving immutable creation fields. */
+export async function updateBrowserRegistry(
+  entry: SandboxBrowserRegistryEntry,
+  assertCurrent?: () => void,
+) {
+  await writeRegistry({ operation: "updateBrowser", entry }, undefined, assertCurrent);
+}
+
+/** Forget only the inspected allocation, under the caller's still-live settlement lease. */
+export async function removeSandboxRegistryGeneration(
+  kind: SandboxRegistryKind,
+  entry: SandboxRegistryEntry | SandboxBrowserRegistryEntry,
+  assertCurrent?: () => void,
+): Promise<void> {
+  await writeRegistry({ operation: "removeGeneration", kind, entry }, undefined, assertCurrent);
+}
+
+/** Removes one browser sandbox registry entry by container name. */
+export async function removeBrowserRegistryEntry(containerName: string) {
+  await writeRegistry({ operation: "removeBrowser", containerName });
 }

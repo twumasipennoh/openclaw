@@ -1,3 +1,5 @@
+import { resolveAllowlistMatchByCandidates } from "openclaw/plugin-sdk/allow-from";
+import type { ChannelThreadingToolContext } from "openclaw/plugin-sdk/channel-contract";
 import { parseDiscordTarget } from "./target-parsing.js";
 
 export function normalizeDiscordMessagingTarget(raw: string): string | undefined {
@@ -6,13 +8,29 @@ export function normalizeDiscordMessagingTarget(raw: string): string | undefined
   return target?.normalized;
 }
 
+export function matchesDiscordToolContextTarget(params: {
+  target: string;
+  toolContext: Pick<ChannelThreadingToolContext, "currentChannelId" | "currentMessagingTarget">;
+}): boolean {
+  const target = normalizeDiscordMessagingTarget(params.target);
+  if (!target) {
+    return false;
+  }
+  return [params.toolContext.currentChannelId, params.toolContext.currentMessagingTarget].some(
+    (currentTarget) =>
+      currentTarget !== undefined && normalizeDiscordMessagingTarget(currentTarget) === target,
+  );
+}
+
 /**
  * Normalize a Discord outbound target for delivery. Bare numeric IDs are
  * prefixed with "channel:" to avoid the ambiguous-target error in
- * parseDiscordTarget. All other formats pass through unchanged.
+ * parseDiscordTarget, unless the ID is explicitly configured as an allowed DM
+ * sender. All other formats pass through unchanged.
  */
 export function normalizeDiscordOutboundTarget(
   to?: string,
+  allowFrom?: readonly string[],
 ): { ok: true; to: string } | { ok: false; error: Error } {
   const trimmed = to?.trim();
   if (!trimmed) {
@@ -24,24 +42,49 @@ export function normalizeDiscordOutboundTarget(
     };
   }
   if (/^\d+$/.test(trimmed)) {
+    if (allowFromContainsDiscordUserId(allowFrom, trimmed)) {
+      return { ok: true, to: `user:${trimmed}` };
+    }
     return { ok: true, to: `channel:${trimmed}` };
   }
   return { ok: true, to: trimmed };
 }
 
-export function looksLikeDiscordTargetId(raw: string): boolean {
-  const trimmed = raw.trim();
-  if (!trimmed) {
+export function allowFromContainsDiscordUserId(
+  allowFrom: readonly string[] | undefined,
+  userId: string,
+): boolean {
+  const normalizedUserId = userId.trim();
+  if (!normalizedUserId) {
     return false;
   }
-  if (/^<@!?\d+>$/.test(trimmed)) {
-    return true;
+  const normalizedAllowFrom = (allowFrom ?? [])
+    .map(normalizeAllowFromDiscordUserId)
+    .filter((entry): entry is string => Boolean(entry));
+  return resolveAllowlistMatchByCandidates({
+    allowList: normalizedAllowFrom,
+    candidates: [{ value: normalizedUserId, source: "id" }],
+  }).allowed;
+}
+
+function normalizeAllowFromDiscordUserId(entry: string): string | undefined {
+  const trimmed = entry.trim().toLowerCase();
+  if (!trimmed || trimmed === "*") {
+    return undefined;
   }
-  if (/^(user|channel|discord):/i.test(trimmed)) {
-    return true;
+  const mentionMatch = /^<@!?(\d+)>$/.exec(trimmed);
+  if (mentionMatch) {
+    return mentionMatch[1];
   }
-  if (/^\d{6,}$/.test(trimmed)) {
-    return true;
-  }
-  return false;
+  // Accept both current and legacy allowFrom forms for Discord user IDs.
+  return /^(?:(?:discord:)?user:|discord:)?(\d+)$/.exec(trimmed)?.[1];
+}
+
+export function looksLikeDiscordTargetId(raw: string): boolean {
+  const trimmed = raw.trim();
+  return (
+    /^<@!?\d+>$/.test(trimmed) ||
+    /^(?:(?:user|channel|discord):\d+|discord:(?:user|channel):\d+)$/i.test(trimmed) ||
+    /^\d{6,}$/.test(trimmed)
+  );
 }

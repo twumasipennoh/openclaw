@@ -1,499 +1,262 @@
-// IHttpServerAdapter is re-exported via the public barrel (`export * from './http'`)
-// but tsgo cannot resolve the chain. Use the dist subpath directly (type-only import).
-import type { IHttpServerAdapter } from "@microsoft/teams.apps/dist/http/index.js";
-import { formatUnknownError } from "./errors.js";
-import type { MSTeamsAdapter } from "./messenger.js";
-import type { MSTeamsCredentials } from "./token.js";
-import { buildUserAgent } from "./user-agent.js";
+import { createLazyRuntimeModule } from "openclaw/plugin-sdk/lazy-runtime";
+import { readSecretFile } from "openclaw/plugin-sdk/secret-file";
+import type { MSTeamsCloudName } from "../runtime-api.js";
+import type { MSTeamsAccessTokenProvider } from "./attachments/types.js";
+import { normalizeBotFrameworkServiceUrl } from "./bot-framework-service-url.js";
+import { resolveMSTeamsPrivateQaRuntime } from "./qa/private-runtime.js";
+import { MSTEAMS_REQUEST_TIMEOUT_MS } from "./request-timeout.js";
+import { msteamsConnectorHandoffInterceptor } from "./send-handoff.js";
+import type { MSTeamsCredentials, MSTeamsFederatedCredentials } from "./token.js";
+import { buildOpenClawUserAgentFragment } from "./user-agent.js";
 
-/**
- * Resolved Teams SDK modules loaded lazily to avoid importing when the
- * provider is disabled.
- */
-export type MSTeamsTeamsSdk = {
-  App: typeof import("@microsoft/teams.apps").App;
-  Client: typeof import("@microsoft/teams.api").Client;
-};
+type MSTeamsHttpServerAdapter =
+  import("@microsoft/teams.apps/dist/http/adapter.js").IHttpServerAdapter;
 
-/**
- * A Teams SDK App instance used for token management and proactive messaging.
- */
-export type MSTeamsApp = InstanceType<MSTeamsTeamsSdk["App"]>;
+// Borrow route inference without the SDK method's nominal `this: App<TPlugin>` binding.
+type MSTeamsRoutes = import("@microsoft/teams.apps/dist/routes/index.js").IRoutes;
 
-/**
- * Token provider compatible with the existing codebase, wrapping the Teams
- * SDK App's token methods.
- */
-export type MSTeamsTokenProvider = {
-  getAccessToken: (scope: string) => Promise<string>;
-};
+export type MSTeamsCardActionResponse =
+  import("@microsoft/teams.api/dist/models/adaptive-card/adaptive-card-action-response.js").AdaptiveCardActionResponse;
 
-type MSTeamsBotIdentity = {
-  id?: string;
-  name?: string;
-};
+type SigninEventCtx = import("@microsoft/teams.apps/dist/contexts/index.js").IActivitySignInContext;
 
-type MSTeamsSendContext = {
-  sendActivity: (textOrActivity: string | object) => Promise<unknown>;
-  updateActivity: (activityUpdate: object) => Promise<{ id?: string } | void>;
-  deleteActivity: (activityId: string) => Promise<void>;
-};
+type MSTeamsAppOn = <Name extends keyof MSTeamsRoutes>(
+  name: Name,
+  cb: Exclude<MSTeamsRoutes[Name], undefined>,
+) => MSTeamsApp;
 
-type MSTeamsProcessContext = MSTeamsSendContext & {
-  activity: Record<string, unknown> | undefined;
-  sendActivities: (
-    activities: Array<{ type: string } & Record<string, unknown>>,
-  ) => Promise<unknown[]>;
-};
-
-export async function loadMSTeamsSdk(): Promise<MSTeamsTeamsSdk> {
-  const [appsModule, apiModule] = await Promise.all([
-    import("@microsoft/teams.apps"),
-    import("@microsoft/teams.api"),
-  ]);
-  return {
-    App: appsModule.App,
-    Client: apiModule.Client,
+/** Teams SDK surface consumed by the plugin, with SDK-owned route and token contracts. */
+export type MSTeamsApp = {
+  send(conversationId: string, activity: unknown): Promise<{ id?: string }>;
+  /** The SDK owns the threaded conversation ID and reply quoting. */
+  reply(conversationId: string, messageId: string, activity: unknown): Promise<{ id?: string }>;
+  on: MSTeamsAppOn;
+  event(name: "signin", cb: (ctx: SigninEventCtx) => void | Promise<void>): MSTeamsApp;
+  process: import("@microsoft/teams.apps").App["process"];
+  initialize(): Promise<void>;
+  tokenProvider: Pick<import("@microsoft/teams.api").ITokenProvider, "getAppToken">;
+  credentials?: Pick<import("@microsoft/teams.api").Credentials, "tenantId">;
+  cloud?: {
+    botScope?: string;
+    graphScope?: string;
   };
+  api: {
+    serviceUrl?: string;
+    teams: {
+      getById(teamId: string): Promise<{ aadGroupId?: string }>;
+    };
+    conversations: {
+      activities(conversationId: string): {
+        create(activity: unknown): Promise<{ id?: string }>;
+        update(activityId: string, activity: unknown): Promise<unknown>;
+        delete(activityId: string): Promise<unknown>;
+      };
+    };
+  };
+};
+
+type AzureAccessToken = {
+  token?: string;
+} | null;
+
+type AzureTokenCredential = {
+  getToken: (scope: string | string[]) => Promise<AzureAccessToken>;
+};
+
+type AzureIdentityModule = {
+  ClientCertificateCredential: new (
+    tenantId: string,
+    clientId: string,
+    options: { certificate: string },
+  ) => AzureTokenCredential;
+};
+
+const AZURE_IDENTITY_MODULE = "@azure/identity";
+
+const loadAzureIdentity = createLazyRuntimeModule(
+  () => import(AZURE_IDENTITY_MODULE) as Promise<AzureIdentityModule>,
+);
+
+const loadSdkModules = createLazyRuntimeModule(() =>
+  Promise.all([import("@microsoft/teams.apps"), import("@microsoft/teams.api")]).then(
+    ([apps, api]) => ({
+      App: apps.App,
+      ExpressAdapter: apps.ExpressAdapter,
+      cloudFromName: api.cloudFromName,
+    }),
+  ),
+);
+
+/** Keep the SDK off disabled-channel startup paths. */
+export async function createMSTeamsExpressAdapter(
+  serverOrApp: ConstructorParameters<
+    typeof import("@microsoft/teams.apps/dist/http/express-adapter.js").ExpressAdapter
+  >[0],
+): Promise<MSTeamsHttpServerAdapter> {
+  const { ExpressAdapter } = await loadSdkModules();
+  return new ExpressAdapter(serverOrApp);
 }
 
-/**
- * Create a no-op HTTP server adapter that satisfies the Teams SDK's
- * IHttpServerAdapter interface without spinning up an Express server.
- *
- * OpenClaw manages its own Express server for the Teams webhook endpoint, so
- * the SDK's built-in HTTP server is unnecessary.  Passing this adapter via the
- * `httpServerAdapter` option prevents the SDK from creating the default
- * HttpPlugin (which uses the deprecated `plugins` array and registers an
- * Express middleware with the pattern `/api*` — invalid in Express 5).
- *
- * See: https://github.com/openclaw/openclaw/issues/55161
- * See: https://github.com/openclaw/openclaw/issues/60732
- */
-function createNoOpHttpServerAdapter(): IHttpServerAdapter {
-  return {
-    registerRoute() {},
-  };
-}
+type CreateMSTeamsAppOptions = {
+  /** The SDK registers routes and JWT validation on this adapter without starting a listener. */
+  httpServerAdapter?: MSTeamsHttpServerAdapter;
+  /** Defaults to /api/messages. */
+  messagingEndpoint?: `/${string}`;
+  /** Defaults to graph. */
+  oauthDefaultConnectionName?: string;
+  /** Teams SDK cloud environment. Defaults to Public. */
+  cloud?: MSTeamsCloudName;
+  /** Bot Connector service URL for SDK app-level proactive operations. */
+  serviceUrl?: string;
+  /** Injectable SDK HTTP client. Used by focused tests; production uses SDK defaults. */
+  httpClient?: unknown;
+};
 
-/**
- * Create a Teams SDK App instance from credentials. The App manages token
- * acquisition, JWT validation, and the HTTP server lifecycle.
- *
- * This replaces the previous CloudAdapter + MsalTokenProvider + authorizeJWT
- * from @microsoft/agents-hosting.
- */
-export async function createMSTeamsApp(
+async function createMSTeamsApp(
   creds: MSTeamsCredentials,
-  sdk: MSTeamsTeamsSdk,
+  options?: CreateMSTeamsAppOptions,
 ): Promise<MSTeamsApp> {
-  return new sdk.App({
+  const { App, cloudFromName } = await loadSdkModules();
+  const privateQaRuntime = resolveMSTeamsPrivateQaRuntime();
+  // SDK 2.0.11+ merges plain client headers with its own User-Agent identity.
+  const cloud = options?.cloud ?? "Public";
+  const serviceUrl = options?.serviceUrl
+    ? normalizeBotFrameworkServiceUrl(options.serviceUrl)
+    : undefined;
+  const appOptions: Record<string, unknown> = {
+    client: privateQaRuntime?.client ??
+      options?.httpClient ?? {
+        headers: { "User-Agent": buildOpenClawUserAgentFragment() },
+        timeout: MSTEAMS_REQUEST_TIMEOUT_MS,
+        interceptors: [msteamsConnectorHandoffInterceptor],
+      },
+    ...(privateQaRuntime
+      ? {
+          // Teams SDK prefers clientSecret over token and falls back to CLIENT_SECRET.
+          // Clear it explicitly so private QA cannot escape to real Azure auth.
+          clientSecret: "",
+          skipAuth: privateQaRuntime.skipAuth,
+          token: privateQaRuntime.token,
+        }
+      : {}),
+    ...(options?.httpServerAdapter ? { httpServerAdapter: options.httpServerAdapter } : {}),
+    ...(options?.messagingEndpoint ? { messagingEndpoint: options.messagingEndpoint } : {}),
+    cloud: cloudFromName(cloud),
+    ...(serviceUrl ? { serviceUrl } : {}),
+    ...(options?.oauthDefaultConnectionName
+      ? { oauth: { defaultConnectionName: options.oauthDefaultConnectionName } }
+      : {}),
+  };
+
+  if (creds.type === "federated") {
+    // Teams SDK otherwise lets ambient CLIENT_SECRET override both federated modes.
+    return await createFederatedApp(creds, App, { clientSecret: "", ...appOptions });
+  }
+  return new App({
     clientId: creds.appId,
     clientSecret: creds.appPassword,
     tenantId: creds.tenantId,
-    httpServerAdapter: createNoOpHttpServerAdapter(),
-  } as ConstructorParameters<MSTeamsTeamsSdk["App"]>[0]);
+    ...appOptions,
+  } as ConstructorParameters<typeof App>[0]) as unknown as MSTeamsApp;
 }
 
-/**
- * Build a token provider that uses the Teams SDK App for token acquisition.
- */
-export function createMSTeamsTokenProvider(app: MSTeamsApp): MSTeamsTokenProvider {
+async function createFederatedApp(
+  creds: MSTeamsFederatedCredentials,
+  App: typeof import("@microsoft/teams.apps").App,
+  appOptions: Record<string, unknown>,
+): Promise<MSTeamsApp> {
+  if (creds.useManagedIdentity) {
+    // The SDK handles managed identity natively — pass managedIdentityClientId
+    // and it selects the right credential flow (system MI, user MI, or FIC).
+    return new App({
+      clientId: creds.appId,
+      tenantId: creds.tenantId,
+      managedIdentityClientId: creds.managedIdentityClientId ?? "system",
+      ...appOptions,
+    } as unknown as ConstructorParameters<typeof App>[0]) as unknown as MSTeamsApp;
+  }
+
+  // Certificate-based auth — the SDK doesn't have built-in cert support,
+  // so we use AppOptions.token with @azure/identity's ClientCertificateCredential.
+  if (!creds.certificatePath) {
+    throw new Error("Federated credentials require either a certificate path or managed identity.");
+  }
+
+  let privateKey: string;
+  try {
+    privateKey = await readSecretFile(creds.certificatePath, "Microsoft Teams certificate");
+  } catch {
+    throw new Error("Failed to read certificate file: the configured credential is unavailable.");
+  }
+
+  return createCertificateApp(creds, privateKey, App, appOptions);
+}
+
+function createCertificateApp(
+  creds: MSTeamsFederatedCredentials,
+  privateKey: string,
+  App: typeof import("@microsoft/teams.apps").App,
+  appOptions: Record<string, unknown>,
+): MSTeamsApp {
+  let credentialPromise: Promise<AzureTokenCredential> | null = null;
+
+  const tokenProvider = async (scope: string | string[]): Promise<string> => {
+    const credential = await (credentialPromise ??= loadAzureIdentity().then(
+      (az) =>
+        new az.ClientCertificateCredential(creds.tenantId, creds.appId, {
+          certificate: privateKey,
+        }),
+    ));
+    const token = await credential.getToken(scope);
+
+    if (!token?.token) {
+      throw new Error("Failed to acquire token via certificate credential.");
+    }
+
+    return token.token;
+  };
+
+  return new App({
+    clientId: creds.appId,
+    tenantId: creds.tenantId,
+    token: tokenProvider,
+    ...appOptions,
+  } as unknown as ConstructorParameters<typeof App>[0]) as unknown as MSTeamsApp;
+}
+
+export function createMSTeamsTokenProvider(
+  app: Pick<MSTeamsApp, "tokenProvider" | "credentials" | "cloud">,
+): MSTeamsAccessTokenProvider {
   return {
     async getAccessToken(scope: string): Promise<string> {
-      if (scope.includes("graph.microsoft.com")) {
-        const token = await (
-          app as unknown as { getAppGraphToken(): Promise<{ toString(): string } | null> }
-        ).getAppGraphToken();
-        return token ? String(token) : "";
+      if (
+        scope.includes("graph.microsoft.com") ||
+        scope.includes("graph.microsoft.us") ||
+        scope.includes("microsoftgraph.chinacloudapi.cn")
+      ) {
+        if (app.cloud?.graphScope?.includes("microsoftgraph.chinacloudapi.cn")) {
+          throw new Error(
+            "Microsoft Teams Graph operations are not supported for channels.msteams.cloud=China until Graph requests are routed through the Azure China Graph endpoint.",
+          );
+        }
+        const token = await app.tokenProvider.getAppToken(
+          app.cloud?.graphScope ?? "https://graph.microsoft.com/.default",
+          app.credentials?.tenantId || "common",
+        );
+        return token?.toString() ?? "";
       }
-      const token = await (
-        app as unknown as { getBotToken(): Promise<{ toString(): string } | null> }
-      ).getBotToken();
-      return token ? String(token) : "";
+      const token = await app.tokenProvider.getAppToken(
+        app.cloud?.botScope ?? "https://api.botframework.com/.default",
+      );
+      return token?.toString() ?? "";
     },
   };
 }
 
-function createBotTokenGetter(app: MSTeamsApp): () => Promise<string | undefined> {
-  return async () => {
-    const token = await (
-      app as unknown as { getBotToken(): Promise<{ toString(): string } | null> }
-    ).getBotToken();
-    return token ? String(token) : undefined;
-  };
-}
-
-function createApiClient(
-  sdk: MSTeamsTeamsSdk,
-  serviceUrl: string,
-  getToken: () => Promise<string | undefined>,
+export async function loadMSTeamsSdkWithAuth(
+  creds: MSTeamsCredentials,
+  options?: CreateMSTeamsAppOptions,
 ) {
-  return new sdk.Client(serviceUrl, {
-    token: async () => (await getToken()) || undefined,
-    headers: { "User-Agent": buildUserAgent() },
-  } as Record<string, unknown>);
-}
-
-function normalizeOutboundActivity(textOrActivity: string | object): Record<string, unknown> {
-  return typeof textOrActivity === "string"
-    ? ({ type: "message", text: textOrActivity } as Record<string, unknown>)
-    : (textOrActivity as Record<string, unknown>);
-}
-
-function createSendContext(params: {
-  sdk: MSTeamsTeamsSdk;
-  serviceUrl?: string;
-  conversationId?: string;
-  conversationType?: string;
-  bot?: MSTeamsBotIdentity;
-  replyToActivityId?: string;
-  getToken: () => Promise<string | undefined>;
-  treatInvokeResponseAsNoop?: boolean;
-}): MSTeamsSendContext {
-  const apiClient =
-    params.serviceUrl && params.conversationId
-      ? createApiClient(params.sdk, params.serviceUrl, params.getToken)
-      : undefined;
-
-  return {
-    async sendActivity(textOrActivity: string | object): Promise<unknown> {
-      const msg = normalizeOutboundActivity(textOrActivity);
-      if (params.treatInvokeResponseAsNoop && msg.type === "invokeResponse") {
-        return { id: "invokeResponse" };
-      }
-      if (!apiClient || !params.conversationId) {
-        return { id: "unknown" };
-      }
-
-      return await apiClient.conversations.activities(params.conversationId).create({
-        type: "message",
-        ...msg,
-        from: params.bot?.id
-          ? { id: params.bot.id, name: params.bot.name ?? "", role: "bot" }
-          : undefined,
-        conversation: {
-          id: params.conversationId,
-          conversationType: params.conversationType ?? "personal",
-        },
-        ...(params.replyToActivityId && !msg.replyToId
-          ? { replyToId: params.replyToActivityId }
-          : {}),
-      } as Parameters<
-        typeof apiClient.conversations.activities extends (id: string) => {
-          create: (a: infer T) => unknown;
-        }
-          ? never
-          : never
-      >[0]);
-    },
-
-    async updateActivity(activityUpdate: object): Promise<{ id?: string } | void> {
-      const nextActivity = activityUpdate as { id?: string } & Record<string, unknown>;
-      const activityId = nextActivity.id;
-      if (!activityId) {
-        throw new Error("updateActivity requires an activity id");
-      }
-      if (!params.serviceUrl || !params.conversationId) {
-        return { id: "unknown" };
-      }
-      return await updateActivityViaRest({
-        serviceUrl: params.serviceUrl,
-        conversationId: params.conversationId,
-        activityId,
-        activity: nextActivity,
-        token: await params.getToken(),
-      });
-    },
-
-    async deleteActivity(activityId: string): Promise<void> {
-      if (!activityId) {
-        throw new Error("deleteActivity requires an activity id");
-      }
-      if (!params.serviceUrl || !params.conversationId) {
-        return;
-      }
-      await deleteActivityViaRest({
-        serviceUrl: params.serviceUrl,
-        conversationId: params.conversationId,
-        activityId,
-        token: await params.getToken(),
-      });
-    },
-  };
-}
-
-function createProcessContext(params: {
-  sdk: MSTeamsTeamsSdk;
-  activity: Record<string, unknown> | undefined;
-  getToken: () => Promise<string | undefined>;
-}): MSTeamsProcessContext {
-  const serviceUrl = params.activity?.serviceUrl as string | undefined;
-  const conversationId = (params.activity?.conversation as Record<string, unknown>)?.id as
-    | string
-    | undefined;
-  const conversationType = (params.activity?.conversation as Record<string, unknown>)
-    ?.conversationType as string | undefined;
-  const replyToActivityId = params.activity?.id as string | undefined;
-  const bot: MSTeamsBotIdentity | undefined =
-    params.activity?.recipient && typeof params.activity.recipient === "object"
-      ? {
-          id: (params.activity.recipient as Record<string, unknown>).id as string | undefined,
-          name: (params.activity.recipient as Record<string, unknown>).name as string | undefined,
-        }
-      : undefined;
-  const sendContext = createSendContext({
-    sdk: params.sdk,
-    serviceUrl,
-    conversationId,
-    conversationType,
-    bot,
-    replyToActivityId,
-    getToken: params.getToken,
-    treatInvokeResponseAsNoop: true,
-  });
-
-  return {
-    activity: params.activity,
-    ...sendContext,
-    async sendActivities(activities: Array<{ type: string } & Record<string, unknown>>) {
-      const results = [];
-      for (const activity of activities) {
-        results.push(await sendContext.sendActivity(activity));
-      }
-      return results;
-    },
-  };
-}
-
-/**
- * Update an existing activity via the Bot Framework REST API.
- * PUT /v3/conversations/{conversationId}/activities/{activityId}
- */
-async function updateActivityViaRest(params: {
-  serviceUrl: string;
-  conversationId: string;
-  activityId: string;
-  activity: Record<string, unknown>;
-  token?: string;
-}): Promise<{ id?: string }> {
-  const { serviceUrl, conversationId, activityId, activity, token } = params;
-  const baseUrl = serviceUrl.replace(/\/+$/, "");
-  const url = `${baseUrl}/v3/conversations/${encodeURIComponent(conversationId)}/activities/${encodeURIComponent(activityId)}`;
-
-  const headers: Record<string, string> = {
-    "Content-Type": "application/json",
-    "User-Agent": buildUserAgent(),
-  };
-  if (token) {
-    headers.Authorization = `Bearer ${token}`;
-  }
-
-  const response = await fetch(url, {
-    method: "PUT",
-    headers,
-    body: JSON.stringify({
-      type: "message",
-      ...activity,
-      id: activityId,
-    }),
-  });
-
-  if (!response.ok) {
-    const body = await response.text().catch(() => "");
-    throw Object.assign(new Error(`updateActivity failed: HTTP ${response.status} ${body}`), {
-      statusCode: response.status,
-    });
-  }
-
-  return await response.json().catch(() => ({ id: activityId }));
-}
-
-/**
- * Delete an existing activity via the Bot Framework REST API.
- * DELETE /v3/conversations/{conversationId}/activities/{activityId}
- */
-async function deleteActivityViaRest(params: {
-  serviceUrl: string;
-  conversationId: string;
-  activityId: string;
-  token?: string;
-}): Promise<void> {
-  const { serviceUrl, conversationId, activityId, token } = params;
-  const baseUrl = serviceUrl.replace(/\/+$/, "");
-  const url = `${baseUrl}/v3/conversations/${encodeURIComponent(conversationId)}/activities/${encodeURIComponent(activityId)}`;
-
-  const headers: Record<string, string> = {
-    "User-Agent": buildUserAgent(),
-  };
-  if (token) {
-    headers.Authorization = `Bearer ${token}`;
-  }
-
-  const response = await fetch(url, {
-    method: "DELETE",
-    headers,
-  });
-
-  if (!response.ok) {
-    const body = await response.text().catch(() => "");
-    throw Object.assign(new Error(`deleteActivity failed: HTTP ${response.status} ${body}`), {
-      statusCode: response.status,
-    });
-  }
-}
-
-/**
- * Build a CloudAdapter-compatible adapter using the Teams SDK REST client.
- *
- * This replaces the previous CloudAdapter from @microsoft/agents-hosting.
- * For incoming requests: the App's HTTP server handles JWT validation.
- * For proactive sends: uses the Bot Framework REST API via
- * @microsoft/teams.api Client.
- */
-export function createMSTeamsAdapter(app: MSTeamsApp, sdk: MSTeamsTeamsSdk): MSTeamsAdapter {
-  return {
-    async continueConversation(_appId, reference, logic) {
-      const serviceUrl = reference.serviceUrl;
-      if (!serviceUrl) {
-        throw new Error("Missing serviceUrl in conversation reference");
-      }
-
-      const conversationId = reference.conversation?.id;
-      if (!conversationId) {
-        throw new Error("Missing conversation.id in conversation reference");
-      }
-
-      const sendContext = createSendContext({
-        sdk,
-        serviceUrl,
-        conversationId,
-        conversationType: reference.conversation?.conversationType,
-        bot: reference.agent ?? undefined,
-        getToken: createBotTokenGetter(app),
-      });
-
-      await logic(sendContext);
-    },
-
-    async process(req, res, logic) {
-      const request = req as { body?: Record<string, unknown> };
-      const response = res as {
-        status: (code: number) => { send: (body?: unknown) => void };
-      };
-
-      const activity = request.body;
-      const isInvoke = (activity as Record<string, unknown>)?.type === "invoke";
-
-      try {
-        const context = createProcessContext({
-          sdk,
-          activity,
-          getToken: createBotTokenGetter(app),
-        });
-
-        // For invoke activities, send HTTP 200 immediately before running
-        // handler logic so slow operations (file uploads, reflections) don't
-        // hit Teams invoke timeouts ("unable to reach app").
-        if (isInvoke) {
-          response.status(200).send();
-        }
-
-        await logic(context);
-
-        if (!isInvoke) {
-          response.status(200).send();
-        }
-      } catch (err) {
-        if (!isInvoke) {
-          response.status(500).send({ error: formatUnknownError(err) });
-        }
-      }
-    },
-
-    async updateActivity(_context, activity) {
-      // No-op: updateActivity is handled via REST in streaming-message.ts
-    },
-
-    async deleteActivity(_context, _reference) {
-      // No-op: deleteActivity not yet implemented for Teams SDK adapter
-    },
-  };
-}
-
-export async function loadMSTeamsSdkWithAuth(creds: MSTeamsCredentials) {
-  const sdk = await loadMSTeamsSdk();
-  const app = await createMSTeamsApp(creds, sdk);
-  return { sdk, app };
-}
-
-/**
- * Create a Bot Framework JWT validator with strict multi-issuer support.
- *
- * During Microsoft's transition, inbound service tokens can be signed by either:
- * - Legacy Bot Framework issuer/JWKS
- * - Entra issuer/JWKS
- *
- * Security invariants are preserved for both paths:
- * - signature verification (issuer-specific JWKS)
- * - audience validation (appId)
- * - issuer validation (strict allowlist)
- * - expiration validation (Teams SDK defaults)
- */
-export async function createBotFrameworkJwtValidator(creds: MSTeamsCredentials): Promise<{
-  validate: (authHeader: string, serviceUrl?: string) => Promise<boolean>;
-}> {
-  const { JwtValidator } =
-    await import("@microsoft/teams.apps/dist/middleware/auth/jwt-validator.js");
-
-  const botFrameworkValidator = new JwtValidator({
-    clientId: creds.appId,
-    tenantId: creds.tenantId,
-    validateIssuer: { allowedIssuer: "https://api.botframework.com" },
-    jwksUriOptions: {
-      type: "uri",
-      uri: "https://login.botframework.com/v1/.well-known/keys",
-    },
-  });
-
-  const entraValidator = new JwtValidator({
-    clientId: creds.appId,
-    tenantId: creds.tenantId,
-    validateIssuer: { allowedTenantIds: [creds.tenantId] },
-    jwksUriOptions: {
-      type: "uri",
-      uri: "https://login.microsoftonline.com/common/discovery/v2.0/keys",
-    },
-  });
-
-  async function validateWithFallback(
-    token: string,
-    overrides: { validateServiceUrl: { expectedServiceUrl: string } } | undefined,
-  ): Promise<boolean> {
-    for (const validator of [botFrameworkValidator, entraValidator]) {
-      try {
-        const result = await validator.validateAccessToken(token, overrides);
-        if (result != null) {
-          return true;
-        }
-      } catch {
-        continue;
-      }
-    }
-    return false;
-  }
-
-  return {
-    async validate(authHeader: string, serviceUrl?: string): Promise<boolean> {
-      const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : authHeader;
-      if (!token) {
-        return false;
-      }
-
-      const overrides = serviceUrl
-        ? ({ validateServiceUrl: { expectedServiceUrl: serviceUrl } } as const)
-        : undefined;
-      return await validateWithFallback(token, overrides);
-    },
-  };
+  const app = await createMSTeamsApp(creds, options);
+  return { app };
 }

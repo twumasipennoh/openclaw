@@ -1,52 +1,11 @@
-import {
-  resolveChannelGroupPolicy,
-  resolveChannelGroupRequireMention,
-  loadSessionStore,
-  resolveGroupSessionKey,
-  resolveStorePath,
-} from "../config.runtime.js";
+import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
+import { getSessionEntry, resolveStorePath } from "openclaw/plugin-sdk/session-store-runtime";
+import { resolveWhatsAppInboundPolicy } from "../../inbound-policy.js";
 import { normalizeGroupActivation } from "./group-activation.runtime.js";
 
-type LoadConfigFn = typeof import("../config.runtime.js").loadConfig;
-
-export function resolveGroupPolicyFor(cfg: ReturnType<LoadConfigFn>, conversationId: string) {
-  const groupId = resolveGroupSessionKey({
-    From: conversationId,
-    ChatType: "group",
-    Provider: "whatsapp",
-  })?.id;
-  const whatsappCfg = cfg.channels?.whatsapp as
-    | { groupAllowFrom?: string[]; allowFrom?: string[] }
-    | undefined;
-  const hasGroupAllowFrom = Boolean(
-    whatsappCfg?.groupAllowFrom?.length || whatsappCfg?.allowFrom?.length,
-  );
-  return resolveChannelGroupPolicy({
-    cfg,
-    channel: "whatsapp",
-    groupId: groupId ?? conversationId,
-    hasGroupAllowFrom,
-  });
-}
-
-export function resolveGroupRequireMentionFor(
-  cfg: ReturnType<LoadConfigFn>,
-  conversationId: string,
-) {
-  const groupId = resolveGroupSessionKey({
-    From: conversationId,
-    ChatType: "group",
-    Provider: "whatsapp",
-  })?.id;
-  return resolveChannelGroupRequireMention({
-    cfg,
-    channel: "whatsapp",
-    groupId: groupId ?? conversationId,
-  });
-}
-
-export function resolveGroupActivationFor(params: {
-  cfg: ReturnType<LoadConfigFn>;
+export async function resolveGroupActivationFor(params: {
+  cfg: OpenClawConfig;
+  accountId?: string | null;
   agentId: string;
   sessionKey: string;
   conversationId: string;
@@ -54,9 +13,15 @@ export function resolveGroupActivationFor(params: {
   const storePath = resolveStorePath(params.cfg.session?.store, {
     agentId: params.agentId,
   });
-  const store = loadSessionStore(storePath);
-  const entry = store[params.sessionKey];
-  const requireMention = resolveGroupRequireMentionFor(params.cfg, params.conversationId);
+  const entry = getSessionEntry({
+    storePath,
+    agentId: params.agentId,
+    sessionKey: params.sessionKey,
+  });
+  const requireMention = resolveWhatsAppInboundPolicy({
+    cfg: params.cfg,
+    accountId: params.accountId,
+  }).resolveConversationRequireMention(params.conversationId);
   const defaultActivation = !requireMention ? "always" : "mention";
   return normalizeGroupActivation(entry?.groupActivation) ?? defaultActivation;
 }

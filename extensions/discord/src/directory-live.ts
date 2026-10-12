@@ -2,8 +2,9 @@ import type {
   ChannelDirectoryEntry,
   DirectoryConfigParams,
 } from "openclaw/plugin-sdk/directory-runtime";
+import { normalizeOptionalLowercaseString } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { resolveDiscordAccount } from "./accounts.js";
-import { fetchDiscord } from "./api.js";
+import { DISCORD_DIRECTORY_LOOKUP_TIMEOUT_MS, fetchDiscord } from "./api.js";
 import { rememberDiscordDirectoryUser } from "./directory-cache.js";
 import { normalizeDiscordSlug } from "./monitor/allow-list.js";
 import { normalizeDiscordToken } from "./token.js";
@@ -14,14 +15,6 @@ type DiscordMember = { user: DiscordUser; nick?: string | null };
 type DiscordChannel = { id: string; name?: string | null };
 type DiscordDirectoryAccess = { token: string; query: string; accountId: string };
 
-function normalizeQuery(value?: string | null): string {
-  return value?.trim().toLowerCase() ?? "";
-}
-
-function buildUserRank(user: DiscordUser): number {
-  return user.bot ? 0 : 1;
-}
-
 function resolveDiscordDirectoryAccess(
   params: DirectoryConfigParams,
 ): DiscordDirectoryAccess | null {
@@ -30,11 +23,17 @@ function resolveDiscordDirectoryAccess(
   if (!token) {
     return null;
   }
-  return { token, query: normalizeQuery(params.query), accountId: account.accountId };
+  return {
+    token,
+    query: normalizeOptionalLowercaseString(params.query) ?? "",
+    accountId: account.accountId,
+  };
 }
 
 async function listDiscordGuilds(token: string): Promise<DiscordGuild[]> {
-  const rawGuilds = await fetchDiscord<DiscordGuild[]>("/users/@me/guilds", token);
+  const rawGuilds = await fetchDiscord<DiscordGuild[]>("/users/@me/guilds", token, fetch, {
+    timeoutMs: DISCORD_DIRECTORY_LOOKUP_TIMEOUT_MS,
+  });
   return rawGuilds.filter((guild) => guild.id && guild.name);
 }
 
@@ -45,12 +44,17 @@ export async function listDiscordDirectoryGroupsLive(
   if (!access) {
     return [];
   }
-  const { token, query, accountId } = access;
+  const { token, query } = access;
   const guilds = await listDiscordGuilds(token);
   const rows: ChannelDirectoryEntry[] = [];
 
   for (const guild of guilds) {
-    const channels = await fetchDiscord<DiscordChannel[]>(`/guilds/${guild.id}/channels`, token);
+    const channels = await fetchDiscord<DiscordChannel[]>(
+      `/guilds/${guild.id}/channels`,
+      token,
+      fetch,
+      { timeoutMs: DISCORD_DIRECTORY_LOOKUP_TIMEOUT_MS },
+    );
     for (const channel of channels) {
       const name = channel.name?.trim();
       if (!name) {
@@ -89,6 +93,7 @@ export async function listDiscordDirectoryPeersLive(
 
   const guilds = await listDiscordGuilds(token);
   const rows: ChannelDirectoryEntry[] = [];
+  const seenUserIds = new Set<string>();
   const limit = typeof params.limit === "number" && params.limit > 0 ? params.limit : 25;
 
   for (const guild of guilds) {
@@ -99,6 +104,8 @@ export async function listDiscordDirectoryPeersLive(
     const members = await fetchDiscord<DiscordMember[]>(
       `/guilds/${guild.id}/members/search?${paramsObj.toString()}`,
       token,
+      fetch,
+      { timeoutMs: DISCORD_DIRECTORY_LOOKUP_TIMEOUT_MS },
     );
     for (const member of members) {
       const user = member.user;
@@ -115,13 +122,17 @@ export async function listDiscordDirectoryPeersLive(
           user.username ? `@${user.username}` : null,
         ],
       });
+      if (seenUserIds.has(user.id)) {
+        continue;
+      }
+      seenUserIds.add(user.id);
       const name = member.nick?.trim() || user.global_name?.trim() || user.username?.trim();
       rows.push({
         kind: "user",
         id: `user:${user.id}`,
         name: name || undefined,
         handle: user.username ? `@${user.username}` : undefined,
-        rank: buildUserRank(user),
+        rank: user.bot ? 0 : 1,
         raw: member,
       });
       if (rows.length >= limit) {

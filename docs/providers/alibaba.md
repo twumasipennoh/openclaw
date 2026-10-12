@@ -1,72 +1,174 @@
 ---
-title: "Alibaba Model Studio"
 summary: "Alibaba Model Studio Wan video generation in OpenClaw"
+title: "Alibaba Model Studio"
 read_when:
   - You want to use Alibaba Wan video generation in OpenClaw
   - You need Model Studio or DashScope API key setup for video generation
 ---
 
-# Alibaba Model Studio
+The bundled `alibaba` plugin registers a video-generation provider for Wan models on Alibaba Model Studio (the international name for DashScope). It is enabled by default; only an API key is needed.
 
-OpenClaw ships a bundled `alibaba` video-generation provider for Wan models on
-Alibaba Model Studio / DashScope.
+| Property         | Value                                                                           |
+| ---------------- | ------------------------------------------------------------------------------- |
+| Provider id      | `alibaba`                                                                       |
+| Plugin           | bundled, `enabledByDefault: true`                                               |
+| Auth env vars    | `MODELSTUDIO_API_KEY` → `DASHSCOPE_API_KEY` → `QWEN_API_KEY` (first match wins) |
+| Onboarding flag  | `--auth-choice alibaba-model-studio-api-key`                                    |
+| Direct CLI flag  | `--alibaba-model-studio-api-key <key>`                                          |
+| Default model    | `alibaba/wan2.6-t2v`                                                            |
+| Default base URL | `https://dashscope-intl.aliyuncs.com`                                           |
 
-- Provider: `alibaba`
-- Preferred auth: `MODELSTUDIO_API_KEY`
-- Also accepted: `DASHSCOPE_API_KEY`, `QWEN_API_KEY`
-- API: DashScope / Model Studio async video generation
+## Getting started
 
-## Quick start
+<Steps>
+  <Step title="Set an API key">
+    Store the key against the `alibaba` provider through onboarding:
 
-1. Set an API key:
+    ```bash
+    openclaw onboard --auth-choice alibaba-model-studio-api-key
+    ```
 
-```bash
-openclaw onboard --auth-choice qwen-standard-api-key
-```
+    Or pass the key directly:
 
-2. Set a default video model:
+    ```bash
+    openclaw onboard --alibaba-model-studio-api-key <your-key>
+    ```
 
-```json5
-{
-  agents: {
-    defaults: {
-      videoGenerationModel: {
-        primary: "alibaba/wan2.6-t2v",
+    Or export one of the accepted env vars before starting the Gateway:
+
+    ```bash
+    export MODELSTUDIO_API_KEY=sk-...
+    # or DASHSCOPE_API_KEY=...
+    # or QWEN_API_KEY=...
+    ```
+
+  </Step>
+  <Step title="Set a default video model">
+    ```json5
+    {
+      agents: {
+        defaults: {
+          mediaModels: {
+            video: {
+              primary: "alibaba/wan2.6-t2v",
+            },
+          },
+        },
       },
-    },
-  },
-}
-```
+    }
+    ```
+  </Step>
+  <Step title="Verify the provider is configured">
+    ```bash
+    openclaw models list --provider alibaba
+    ```
+
+    The list includes all five bundled Wan models. If `MODELSTUDIO_API_KEY` cannot be resolved, `openclaw models status --json` reports the missing credential under `auth.unusableProfiles`.
+
+  </Step>
+</Steps>
+
+<Note>
+  The Alibaba plugin and the [Qwen plugin](/providers/qwen) both authenticate against DashScope and accept overlapping env vars. Use `alibaba/...` model ids for the dedicated Wan video surface; use `qwen/...` ids for Qwen chat, embedding, or media-understanding.
+</Note>
 
 ## Built-in Wan models
 
-The bundled `alibaba` provider currently registers:
+| Model ref                  | Mode                      |
+| -------------------------- | ------------------------- |
+| `alibaba/wan2.6-t2v`       | Text-to-video (default)   |
+| `alibaba/wan2.6-i2v`       | Image-to-video            |
+| `alibaba/wan2.6-r2v`       | Reference-to-video        |
+| `alibaba/wan2.6-r2v-flash` | Reference-to-video (fast) |
+| `alibaba/wan2.7-r2v`       | Reference-to-video        |
 
-- `alibaba/wan2.6-t2v`
-- `alibaba/wan2.6-i2v`
-- `alibaba/wan2.6-r2v`
-- `alibaba/wan2.6-r2v-flash`
-- `alibaba/wan2.7-r2v`
+## Capabilities and limits
 
-## Current limits
+With exactly one reference image and no video, `wan2.6-t2v` automatically
+uses `wan2.6-i2v`; the result reports the resolved model. This routing applies
+only when a same-generation image-to-video sibling exists in the known model
+catalog. Other requests use the selected model's mode. Geometry follows the
+vendor protocol for that model family.
 
-- Up to **1** output video per request
-- Up to **1** input image
-- Up to **4** input videos
-- Up to **10 seconds** duration
-- Supports `size`, `aspectRatio`, `resolution`, `audio`, and `watermark`
-- Reference image/video mode currently requires **remote http(s) URLs**
+| Mode                         | Max output videos | Reference limits                      | Max duration | Supported controls                                                   |
+| ---------------------------- | ----------------- | ------------------------------------- | ------------ | -------------------------------------------------------------------- |
+| Text-to-video                | 1                 | n/a                                   | 15 s         | `size`, `aspectRatio`, `resolution`, `audio`, `watermark`            |
+| Image-to-video               | 1                 | 1 image                               | 15 s         | `resolution`, `audio`, `watermark`                                   |
+| Reference-to-video (Wan 2.6) | 1                 | 5 total images/videos; up to 3 videos | 10 s         | `size`, `aspectRatio`, `resolution`, `audio`, `watermark`            |
+| Reference-to-video (Wan 2.7) | 1                 | 5 total images/videos; up to 3 videos | 10 s         | `size`, `aspectRatio`, `resolution`, `watermark`; audio is always on |
 
-## Relationship to Qwen
+Wan 2.6 text/reference models translate `resolution` plus `aspectRatio` to the
+documented exact `size`. Wan 2.6 image-to-video sends the `resolution` tier and
+uses the input image's aspect ratio. Wan 2.7 reference-to-video sends the newer
+`media`, `resolution`, and `ratio` fields and always generates audio.
 
-The bundled `qwen` provider also uses Alibaba-hosted DashScope endpoints for
-Wan video generation. Use:
+A request that omits `durationSeconds` gets DashScope's accepted default of **5 seconds**.
 
-- `qwen/...` when you want the canonical Qwen provider surface
-- `alibaba/...` when you want the direct vendor-owned Wan video surface
+Image-to-video and Wan 2.7 reference images accept local files or remote
+`http(s)` URLs. OpenClaw sends local images as base64 data URIs, with a maximum
+of 20 MB per image before encoding. See the Model Studio references for
+[image-to-video](https://www.alibabacloud.com/help/en/model-studio/image-to-video-api-reference)
+and [Wan 2.7 reference-to-video](https://www.alibabacloud.com/help/en/model-studio/wan-video-to-video-api-reference).
+Reference videos and Wan 2.6 reference-to-video images still require remote
+`http(s)` URLs.
+
+## Advanced configuration
+
+<AccordionGroup>
+  <Accordion title="Override the DashScope base URL">
+    The provider defaults to the international DashScope endpoint. To target the China-region endpoint:
+
+    ```json5
+    {
+      models: {
+        providers: {
+          alibaba: {
+            baseUrl: "https://dashscope.aliyuncs.com",
+          },
+        },
+      },
+    }
+    ```
+
+    The provider strips trailing slashes before constructing AIGC task URLs.
+
+  </Accordion>
+
+  <Accordion title="Auth env priority">
+    OpenClaw resolves the Alibaba API key from environment variables in this order, taking the first non-empty value:
+
+    1. `MODELSTUDIO_API_KEY`
+    2. `DASHSCOPE_API_KEY`
+    3. `QWEN_API_KEY`
+
+    Configured `auth.profiles` entries (set via `openclaw models auth login`) override env-var resolution. See [Auth profiles in the models FAQ](/help/faq-models#auth-profiles-what-they-are-and-how-to-manage-them) for profile rotation, cooldown, and override mechanics.
+
+  </Accordion>
+
+  <Accordion title="Relationship to the Qwen plugin">
+    Both bundled plugins talk to DashScope and accept overlapping API keys. Use:
+
+    - `alibaba/wan*.*` ids for the dedicated Wan video provider documented on this page.
+    - `qwen/*` ids for Qwen chat, embedding, and media understanding (see [Qwen](/providers/qwen)).
+
+    Setting `MODELSTUDIO_API_KEY` once authenticates both plugins, since the auth env var list intentionally overlaps; onboarding each plugin separately is not required.
+
+  </Accordion>
+</AccordionGroup>
 
 ## Related
 
-- [Video Generation](/tools/video-generation)
-- [Qwen](/providers/qwen)
-- [Configuration Reference](/gateway/configuration-reference#agent-defaults)
+<CardGroup cols={2}>
+  <Card title="Video generation" href="/tools/video-generation" icon="video">
+    Shared video tool parameters and provider selection.
+  </Card>
+  <Card title="Qwen" href="/providers/qwen" icon="microchip">
+    Qwen chat, embedding, and media-understanding setup on the same DashScope auth.
+  </Card>
+  <Card title="Configuration reference" href="/gateway/config-agents#agent-defaults" icon="gear">
+    Agent defaults and model configuration.
+  </Card>
+  <Card title="Models FAQ" href="/help/faq-models" icon="circle-question">
+    Auth profiles, switching models, and resolving "no profile" errors.
+  </Card>
+</CardGroup>

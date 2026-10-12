@@ -1,12 +1,9 @@
+// Covers git root and HEAD path discovery.
 import fs from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { findGitRoot, resolveGitHeadPath } from "./git-root.js";
-
-async function makeTempDir(label: string): Promise<string> {
-  return fs.mkdtemp(path.join(os.tmpdir(), `openclaw-${label}-`));
-}
+import { withTestDir } from "../test-helpers/temp-dir.js";
+import { findGitRoot, readGitHead } from "./git-root.js";
 
 async function expectGitRootResolution(params: {
   label: string;
@@ -14,10 +11,16 @@ async function expectGitRootResolution(params: {
     temp: string,
   ) => Promise<{ startPath: string; expectedRoot: string | null; expectedHead: string | null }>;
 }): Promise<void> {
-  const temp = await makeTempDir(params.label);
-  const { startPath, expectedRoot, expectedHead } = await params.setup(temp);
-  expect(findGitRoot(startPath)).toBe(expectedRoot);
-  expect(resolveGitHeadPath(startPath)).toBe(expectedHead);
+  await withTestDir({ prefix: `openclaw-${params.label}-` }, async (temp) => {
+    const { startPath, expectedRoot, expectedHead } = await params.setup(temp);
+    if (expectedHead) {
+      await fs.writeFile(expectedHead, `${"a".repeat(40)}\n`);
+    }
+    // Include the fixture root, but never inspect host-owned ancestors above it.
+    const maxDepth = path.relative(temp, startPath).split(path.sep).filter(Boolean).length + 1;
+    expect(findGitRoot(startPath, { maxDepth })).toBe(expectedRoot);
+    expect(readGitHead(startPath, { maxDepth })?.headPath ?? null).toBe(expectedHead);
+  });
 }
 
 describe("git-root", () => {
@@ -104,13 +107,14 @@ describe("git-root", () => {
   });
 
   it("respects maxDepth traversal limit", async () => {
-    const temp = await makeTempDir("git-root-depth");
-    const repoRoot = path.join(temp, "repo");
-    const nested = path.join(repoRoot, "a", "b", "c");
-    await fs.mkdir(path.join(repoRoot, ".git"), { recursive: true });
-    await fs.mkdir(nested, { recursive: true });
+    await withTestDir({ prefix: "openclaw-git-root-depth-" }, async (temp) => {
+      const repoRoot = path.join(temp, "repo");
+      const nested = path.join(repoRoot, "a", "b", "c");
+      await fs.mkdir(path.join(repoRoot, ".git"), { recursive: true });
+      await fs.mkdir(nested, { recursive: true });
 
-    expect(findGitRoot(nested, { maxDepth: 2 })).toBeNull();
-    expect(resolveGitHeadPath(nested, { maxDepth: 2 })).toBeNull();
+      expect(findGitRoot(nested, { maxDepth: 2 })).toBeNull();
+      expect(readGitHead(nested, { maxDepth: 2 })).toBeUndefined();
+    });
   });
 });

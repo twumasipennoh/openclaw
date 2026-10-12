@@ -1,14 +1,6 @@
-export type MatrixRoomKeyBackupStatusLike = {
-  serverVersion: string | null;
-  activeVersion: string | null;
-  trusted: boolean | null;
-  matchesDecryptionKey: boolean | null;
-  decryptionKeyCached: boolean | null;
-  keyLoadAttempted: boolean;
-  keyLoadError: string | null;
-};
+import type { MatrixRoomKeyBackupStatus } from "./sdk/client-support.js";
 
-export type MatrixRoomKeyBackupIssueCode =
+type MatrixRoomKeyBackupIssueCode =
   | "missing-server-backup"
   | "key-load-failed"
   | "key-not-loaded"
@@ -18,14 +10,14 @@ export type MatrixRoomKeyBackupIssueCode =
   | "indeterminate"
   | "ok";
 
-export type MatrixRoomKeyBackupIssue = {
+type MatrixRoomKeyBackupIssue = {
   code: MatrixRoomKeyBackupIssueCode;
   summary: string;
   message: string | null;
 };
 
 export function resolveMatrixRoomKeyBackupIssue(
-  backup: MatrixRoomKeyBackupStatusLike,
+  backup: MatrixRoomKeyBackupStatus,
 ): MatrixRoomKeyBackupIssue {
   if (!backup.serverVersion) {
     return {
@@ -96,8 +88,9 @@ export function resolveMatrixRoomKeyBackupIssue(
 }
 
 export function resolveMatrixRoomKeyBackupReadinessError(
-  backup: MatrixRoomKeyBackupStatusLike,
+  backup: MatrixRoomKeyBackupStatus,
   opts: {
+    allowUntrustedMatchingKey?: boolean;
     requireServerBackup: boolean;
   },
 ): string | null {
@@ -106,6 +99,14 @@ export function resolveMatrixRoomKeyBackupReadinessError(
     return opts.requireServerBackup ? "Matrix room key backup is missing on the homeserver." : null;
   }
   if (issue.code === "ok") {
+    return null;
+  }
+  if (
+    issue.code === "untrusted-signature" &&
+    opts.allowUntrustedMatchingKey === true &&
+    backup.matchesDecryptionKey === true &&
+    backup.decryptionKeyCached === true
+  ) {
     return null;
   }
   if (issue.message) {

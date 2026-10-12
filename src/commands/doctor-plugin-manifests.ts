@@ -1,8 +1,13 @@
 import fs from "node:fs";
+import path from "node:path";
+import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
+import { normalizeTrimmedStringList } from "@openclaw/normalization-core/string-normalization";
 import { z } from "zod";
-import { loadPluginManifestRegistry } from "../plugins/manifest-registry.js";
+import { note } from "../../packages/terminal-core/src/note.js";
+import type { OpenClawConfig } from "../config/types.openclaw.js";
+import type { HealthFinding } from "../flows/health-checks.js";
+import { loadPluginManifestRegistryCore } from "../plugins/manifest-registry.js";
 import type { RuntimeEnv } from "../runtime.js";
-import { note } from "../terminal/note.js";
 import { shortenHomePath } from "../utils.js";
 import { safeParseJsonWithSchema, safeParseWithSchema } from "../utils/zod-parse.js";
 import type { DoctorPrompter } from "./doctor-prompter.js";
@@ -11,7 +16,9 @@ const LEGACY_MANIFEST_CONTRACT_KEYS = [
   "speechProviders",
   "mediaUnderstandingProviders",
   "imageGenerationProviders",
+  "tools",
 ] as const;
+const LEGACY_PLUGIN_MANIFESTS_CHECK_ID = "core/doctor/legacy-plugin-manifests";
 
 type LegacyManifestContractMigration = {
   manifestPath: string;
@@ -22,18 +29,19 @@ type LegacyManifestContractMigration = {
 
 const JsonRecordSchema = z.record(z.string(), z.unknown());
 
-function normalizeStringList(value: unknown): string[] {
-  if (!Array.isArray(value)) {
-    return [];
-  }
-  return value.map((entry) => (typeof entry === "string" ? entry.trim() : "")).filter(Boolean);
-}
-
 function readManifestJson(manifestPath: string): Record<string, unknown> | null {
   try {
     return safeParseJsonWithSchema(JsonRecordSchema, fs.readFileSync(manifestPath, "utf-8"));
   } catch {
     return null;
+  }
+}
+
+function manifestSeenKey(manifestPath: string): string {
+  try {
+    return fs.realpathSync.native(manifestPath);
+  } catch {
+    return path.resolve(manifestPath);
   }
 }
 
@@ -50,8 +58,8 @@ function buildLegacyManifestContractMigration(params: {
     if (!(key in params.raw)) {
       continue;
     }
-    const legacyValues = normalizeStringList(params.raw[key]);
-    const contractValues = normalizeStringList(nextContracts[key]);
+    const legacyValues = normalizeTrimmedStringList(params.raw[key]);
+    const contractValues = normalizeTrimmedStringList(nextContracts[key]);
     if (legacyValues.length > 0 && contractValues.length === 0) {
       nextContracts[key] = legacyValues;
       changeLines.push(
@@ -75,7 +83,7 @@ function buildLegacyManifestContractMigration(params: {
     delete nextRaw.contracts;
   }
 
-  const pluginId = typeof params.raw.id === "string" ? params.raw.id.trim() : params.manifestPath;
+  const pluginId = normalizeOptionalString(params.raw.id) ?? params.manifestPath;
   return {
     manifestPath: params.manifestPath,
     pluginId,
@@ -85,48 +93,80 @@ function buildLegacyManifestContractMigration(params: {
 }
 
 export function collectLegacyPluginManifestContractMigrations(params?: {
+  config?: OpenClawConfig;
   env?: NodeJS.ProcessEnv;
+  manifestRoots?: string[];
+  workspaceDir?: string;
 }): LegacyManifestContractMigration[] {
   const seen = new Set<string>();
   const migrations: LegacyManifestContractMigration[] = [];
-
-  for (const plugin of loadPluginManifestRegistry({
-    cache: false,
-    ...(params?.env ? { env: params.env } : {}),
-  }).plugins) {
-    if (seen.has(plugin.manifestPath)) {
-      continue;
+  const inspectManifest = (manifestPath: string) => {
+    const seenKey = manifestSeenKey(manifestPath);
+    if (seen.has(seenKey)) {
+      return;
     }
-    seen.add(plugin.manifestPath);
-    const raw = readManifestJson(plugin.manifestPath);
-    if (!raw) {
-      continue;
-    }
-    const migration = buildLegacyManifestContractMigration({
-      manifestPath: plugin.manifestPath,
-      raw,
-    });
+    seen.add(seenKey);
+    const raw = readManifestJson(manifestPath);
+    const migration = raw && buildLegacyManifestContractMigration({ manifestPath, raw });
     if (migration) {
       migrations.push(migration);
     }
+  };
+
+  for (const root of params?.manifestRoots ?? []) {
+    if (!fs.existsSync(root)) {
+      continue;
+    }
+    for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
+      if (!entry.isDirectory()) {
+        continue;
+      }
+      inspectManifest(path.join(root, entry.name, "openclaw.plugin.json"));
+    }
+  }
+
+  for (const plugin of loadPluginManifestRegistryCore({
+    ...(params?.config ? { config: params.config } : {}),
+    ...(params?.env ? { env: params.env } : {}),
+    ...(params?.workspaceDir ? { workspaceDir: params.workspaceDir } : {}),
+  }).plugins) {
+    inspectManifest(plugin.manifestPath);
   }
 
   return migrations.toSorted((left, right) => left.manifestPath.localeCompare(right.manifestPath));
 }
 
+export function legacyPluginManifestContractMigrationToHealthFinding(
+  migration: LegacyManifestContractMigration,
+): HealthFinding {
+  return {
+    checkId: LEGACY_PLUGIN_MANIFESTS_CHECK_ID,
+    severity: "warning",
+    message: `Plugin manifest ${migration.pluginId} uses legacy top-level capability keys.`,
+    path: migration.manifestPath,
+    target: migration.pluginId,
+    requirement: "contracts-capability-keys",
+    fixHint:
+      "Run `openclaw doctor --fix` to rewrite legacy plugin manifest capability keys under contracts.*.",
+  };
+}
+
 export async function maybeRepairLegacyPluginManifestContracts(params: {
+  config?: OpenClawConfig;
   env?: NodeJS.ProcessEnv;
+  manifestRoots?: string[];
+  workspaceDir?: string;
   runtime: RuntimeEnv;
   prompter: DoctorPrompter;
-}): Promise<void> {
-  const migrations = collectLegacyPluginManifestContractMigrations(
-    params.env ? { env: params.env } : undefined,
-  );
+  note?: typeof note;
+}): Promise<boolean> {
+  const migrations = collectLegacyPluginManifestContractMigrations(params);
   if (migrations.length === 0) {
-    return;
+    return false;
   }
 
-  note(
+  const emitNote = params.note ?? note;
+  emitNote(
     [
       "Legacy plugin manifest capability keys detected.",
       ...migrations.flatMap((migration) => migration.changeLines),
@@ -141,7 +181,7 @@ export async function maybeRepairLegacyPluginManifestContracts(params: {
       initialValue: true,
     }));
   if (!shouldRepair) {
-    return;
+    return false;
   }
 
   const applied: string[] = [];
@@ -161,6 +201,7 @@ export async function maybeRepairLegacyPluginManifestContracts(params: {
   }
 
   if (applied.length > 0) {
-    note(applied.join("\n"), "Doctor changes");
+    emitNote(applied.join("\n"), "Doctor changes");
   }
+  return applied.length > 0;
 }

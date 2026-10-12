@@ -1,14 +1,19 @@
+import { listAgentIds, resolveAgentConfig } from "openclaw/plugin-sdk/agent-scope-runtime";
+/**
+ * Browser setup entry. It auto-enables the Browser plugin when config or tool
+ * policies reference browser control.
+ */
 import type { OpenClawConfig } from "openclaw/plugin-sdk/plugin-entry";
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
-}
+import {
+  isRecord,
+  normalizeOptionalLowercaseString,
+} from "openclaw/plugin-sdk/string-coerce-runtime";
 
 function listContainsBrowser(value: unknown): boolean {
   return (
     Array.isArray(value) &&
-    value.some((entry) => typeof entry === "string" && entry.trim().toLowerCase() === "browser")
+    value.some((entry) => normalizeOptionalLowercaseString(entry) === "browser")
   );
 }
 
@@ -22,10 +27,9 @@ function hasBrowserToolReference(config: OpenClawConfig): boolean {
   if (toolPolicyReferencesBrowser(config.tools)) {
     return true;
   }
-  const agentList = config.agents?.list;
-  return Array.isArray(agentList)
-    ? agentList.some((entry) => isRecord(entry) && toolPolicyReferencesBrowser(entry.tools))
-    : false;
+  return listAgentIds(config).some((agentId) =>
+    toolPolicyReferencesBrowser(resolveAgentConfig(config, agentId)?.tools),
+  );
 }
 
 export default definePluginEntry({
@@ -40,13 +44,10 @@ export default definePluginEntry({
       ) {
         return null;
       }
-      if (Object.prototype.hasOwnProperty.call(config, "browser")) {
+      if (Object.hasOwn(config, "browser")) {
         return "browser configured";
       }
-      if (
-        config.plugins?.entries &&
-        Object.prototype.hasOwnProperty.call(config.plugins.entries, "browser")
-      ) {
+      if (config.plugins?.entries && Object.hasOwn(config.plugins.entries, "browser")) {
         return "browser plugin configured";
       }
       if (hasBrowserToolReference(config)) {

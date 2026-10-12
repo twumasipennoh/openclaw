@@ -1,6 +1,10 @@
+import {
+  normalizeLowercaseStringOrEmpty,
+  normalizeOptionalString,
+} from "openclaw/plugin-sdk/string-coerce-runtime";
 import type { MatrixClient } from "./sdk.js";
 
-export const MATRIX_PROFILE_AVATAR_MAX_BYTES = 10 * 1024 * 1024;
+const MATRIX_PROFILE_AVATAR_MAX_BYTES = 10 * 1024 * 1024;
 
 type MatrixProfileClient = Pick<
   MatrixClient,
@@ -22,39 +26,17 @@ export type MatrixProfileSyncResult = {
   convertedAvatarFromHttp: boolean;
 };
 
-function normalizeOptionalText(value: string | null | undefined): string | null {
-  if (typeof value !== "string") {
-    return null;
-  }
-  const trimmed = value.trim();
-  return trimmed.length > 0 ? trimmed : null;
+function isMatrixMxcUri(value: string): boolean {
+  return normalizeLowercaseStringOrEmpty(value).startsWith("mxc://");
 }
 
-export function isMatrixMxcUri(value: string): boolean {
-  return value.trim().toLowerCase().startsWith("mxc://");
-}
-
-export function isMatrixHttpAvatarUri(value: string): boolean {
-  const normalized = value.trim().toLowerCase();
+function isMatrixHttpAvatarUri(value: string): boolean {
+  const normalized = normalizeLowercaseStringOrEmpty(value);
   return normalized.startsWith("https://") || normalized.startsWith("http://");
 }
 
 export function isSupportedMatrixAvatarSource(value: string): boolean {
   return isMatrixMxcUri(value) || isMatrixHttpAvatarUri(value);
-}
-
-async function uploadAvatarMedia(params: {
-  client: MatrixProfileClient;
-  avatarSource: string;
-  avatarMaxBytes: number;
-  loadAvatar: (source: string, maxBytes: number) => Promise<MatrixProfileLoadResult>;
-}): Promise<string> {
-  const media = await params.loadAvatar(params.avatarSource, params.avatarMaxBytes);
-  return await params.client.uploadContent(
-    media.buffer,
-    media.contentType,
-    media.fileName || "avatar",
-  );
 }
 
 async function resolveAvatarUrl(params: {
@@ -69,57 +51,38 @@ async function resolveAvatarUrl(params: {
   uploadedAvatarSource: "http" | "path" | null;
   convertedAvatarFromHttp: boolean;
 }> {
-  const avatarPath = normalizeOptionalText(params.avatarPath);
-  if (avatarPath) {
-    if (!params.loadAvatarFromPath) {
-      throw new Error("Matrix avatar path upload requires a media loader.");
-    }
+  const avatarPath = normalizeOptionalString(params.avatarPath) ?? null;
+  const avatarSource = avatarPath ?? normalizeOptionalString(params.avatarUrl) ?? null;
+  if (!avatarSource || (!avatarPath && isMatrixMxcUri(avatarSource))) {
     return {
-      resolvedAvatarUrl: await uploadAvatarMedia({
-        client: params.client,
-        avatarSource: avatarPath,
-        avatarMaxBytes: params.avatarMaxBytes,
-        loadAvatar: params.loadAvatarFromPath,
-      }),
-      uploadedAvatarSource: "path",
-      convertedAvatarFromHttp: false,
-    };
-  }
-
-  const avatarUrl = normalizeOptionalText(params.avatarUrl);
-  if (!avatarUrl) {
-    return {
-      resolvedAvatarUrl: null,
+      resolvedAvatarUrl: avatarSource,
       uploadedAvatarSource: null,
       convertedAvatarFromHttp: false,
     };
   }
 
-  if (isMatrixMxcUri(avatarUrl)) {
-    return {
-      resolvedAvatarUrl: avatarUrl,
-      uploadedAvatarSource: null,
-      convertedAvatarFromHttp: false,
-    };
-  }
-
-  if (!isMatrixHttpAvatarUri(avatarUrl)) {
+  if (!avatarPath && !isMatrixHttpAvatarUri(avatarSource)) {
     throw new Error("Matrix avatar URL must be an mxc:// URI or an http(s) URL.");
   }
 
-  if (!params.loadAvatarFromUrl) {
-    throw new Error("Matrix avatar URL conversion requires a media loader.");
+  const loadAvatar = avatarPath ? params.loadAvatarFromPath : params.loadAvatarFromUrl;
+  if (!loadAvatar) {
+    throw new Error(
+      avatarPath
+        ? "Matrix avatar path upload requires a media loader."
+        : "Matrix avatar URL conversion requires a media loader.",
+    );
   }
 
+  const media = await loadAvatar(avatarSource, params.avatarMaxBytes);
   return {
-    resolvedAvatarUrl: await uploadAvatarMedia({
-      client: params.client,
-      avatarSource: avatarUrl,
-      avatarMaxBytes: params.avatarMaxBytes,
-      loadAvatar: params.loadAvatarFromUrl,
-    }),
-    uploadedAvatarSource: "http",
-    convertedAvatarFromHttp: true,
+    resolvedAvatarUrl: await params.client.uploadContent(
+      media.buffer,
+      media.contentType,
+      media.fileName || "avatar",
+    ),
+    uploadedAvatarSource: avatarPath ? "path" : "http",
+    convertedAvatarFromHttp: !avatarPath,
   };
 }
 
@@ -133,7 +96,7 @@ export async function syncMatrixOwnProfile(params: {
   loadAvatarFromUrl?: (url: string, maxBytes: number) => Promise<MatrixProfileLoadResult>;
   loadAvatarFromPath?: (path: string, maxBytes: number) => Promise<MatrixProfileLoadResult>;
 }): Promise<MatrixProfileSyncResult> {
-  const desiredDisplayName = normalizeOptionalText(params.displayName);
+  const desiredDisplayName = normalizeOptionalString(params.displayName) ?? null;
   const avatar = await resolveAvatarUrl({
     client: params.client,
     avatarUrl: params.avatarUrl ?? null,
@@ -149,9 +112,8 @@ export async function syncMatrixOwnProfile(params: {
       skipped: true,
       displayNameUpdated: false,
       avatarUpdated: false,
+      ...avatar,
       resolvedAvatarUrl: null,
-      uploadedAvatarSource: avatar.uploadedAvatarSource,
-      convertedAvatarFromHttp: avatar.convertedAvatarFromHttp,
     };
   }
 
@@ -159,8 +121,8 @@ export async function syncMatrixOwnProfile(params: {
   let currentAvatarUrl: string | undefined;
   try {
     const currentProfile = await params.client.getUserProfile(params.userId);
-    currentDisplayName = normalizeOptionalText(currentProfile.displayname) ?? undefined;
-    currentAvatarUrl = normalizeOptionalText(currentProfile.avatar_url) ?? undefined;
+    currentDisplayName = normalizeOptionalString(currentProfile.displayname);
+    currentAvatarUrl = normalizeOptionalString(currentProfile.avatar_url);
   } catch {
     // If profile fetch fails, attempt writes directly.
   }
@@ -181,8 +143,6 @@ export async function syncMatrixOwnProfile(params: {
     skipped: false,
     displayNameUpdated,
     avatarUpdated,
-    resolvedAvatarUrl: desiredAvatarUrl,
-    uploadedAvatarSource: avatar.uploadedAvatarSource,
-    convertedAvatarFromHttp: avatar.convertedAvatarFromHttp,
+    ...avatar,
   };
 }

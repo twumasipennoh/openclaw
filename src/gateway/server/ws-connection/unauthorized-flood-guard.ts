@@ -1,62 +1,36 @@
-import { ErrorCodes, type ErrorShape } from "../../protocol/index.js";
+import { ErrorCodes, type ErrorShape } from "../../../../packages/gateway-protocol/src/index.js";
 
-export type UnauthorizedFloodGuardOptions = {
-  closeAfter?: number;
-  logEvery?: number;
-};
-
-export type UnauthorizedFloodDecision = {
+/** Decision returned after recording one unauthorized role failure. */
+type UnauthorizedFloodDecision = {
   shouldClose: boolean;
   shouldLog: boolean;
   count: number;
   suppressedSinceLastLog: number;
 };
 
-const DEFAULT_CLOSE_AFTER = 10;
-const DEFAULT_LOG_EVERY = 100;
+const CLOSE_AFTER = 10;
 
+/** Counts unauthorized failures and decides when to log or close the socket. */
 export class UnauthorizedFloodGuard {
-  private readonly closeAfter: number;
-  private readonly logEvery: number;
   private count = 0;
-  private suppressedSinceLastLog = 0;
-
-  constructor(options?: UnauthorizedFloodGuardOptions) {
-    this.closeAfter = Math.max(1, Math.floor(options?.closeAfter ?? DEFAULT_CLOSE_AFTER));
-    this.logEvery = Math.max(1, Math.floor(options?.logEvery ?? DEFAULT_LOG_EVERY));
-  }
 
   registerUnauthorized(): UnauthorizedFloodDecision {
     this.count += 1;
-    const shouldClose = this.count > this.closeAfter;
-    const shouldLog = this.count === 1 || this.count % this.logEvery === 0 || shouldClose;
-
-    if (!shouldLog) {
-      this.suppressedSinceLastLog += 1;
-      return {
-        shouldClose,
-        shouldLog: false,
-        count: this.count,
-        suppressedSinceLastLog: 0,
-      };
-    }
-
-    const suppressedSinceLastLog = this.suppressedSinceLastLog;
-    this.suppressedSinceLastLog = 0;
+    const shouldClose = this.count > CLOSE_AFTER;
     return {
       shouldClose,
-      shouldLog: true,
+      shouldLog: this.count === 1 || shouldClose,
       count: this.count,
-      suppressedSinceLastLog,
+      suppressedSinceLastLog: this.count === CLOSE_AFTER + 1 ? CLOSE_AFTER - 1 : 0,
     };
   }
 
   reset(): void {
     this.count = 0;
-    this.suppressedSinceLastLog = 0;
   }
 }
 
+/** Identifies role-auth failures that should feed the flood guard. */
 export function isUnauthorizedRoleError(error?: ErrorShape): boolean {
   if (!error) {
     return false;

@@ -9,8 +9,9 @@
  */
 import http from "node:http";
 import https from "node:https";
-import { isLoopbackHost } from "../gateway/net.js";
-import { hasProxyEnvConfigured } from "../infra/net/proxy-env.js";
+import { hasProxyEnvConfigured } from "openclaw/plugin-sdk/security-runtime";
+import { isLoopbackHost } from "openclaw/plugin-sdk/ssrf-runtime";
+import { registerManagedProxyBrowserCdpBypass } from "openclaw/plugin-sdk/ssrf-runtime-internal";
 
 /** HTTP agent that never uses a proxy — for localhost CDP connections. */
 const directHttpAgent = new http.Agent();
@@ -22,52 +23,47 @@ const directHttpsAgent = new https.Agent();
  * so callers fall through to their default behaviour.
  */
 export function getDirectAgentForCdp(url: string): http.Agent | https.Agent | undefined {
-  try {
-    const parsed = new URL(url);
-    if (isLoopbackHost(parsed.hostname)) {
-      return parsed.protocol === "https:" || parsed.protocol === "wss:"
-        ? directHttpsAgent
-        : directHttpAgent;
-    }
-  } catch {
-    // not a valid URL — let caller handle it
+  const parsed = URL.parse(url);
+  if (parsed && isLoopbackHost(parsed.hostname)) {
+    return parsed.protocol === "https:" || parsed.protocol === "wss:"
+      ? directHttpsAgent
+      : directHttpAgent;
   }
   return undefined;
 }
 
-/**
- * Returns `true` when any proxy-related env var is set that could
- * interfere with loopback connections.
- */
-export function hasProxyEnv(): boolean {
-  return hasProxyEnvConfigured();
-}
-
 const LOOPBACK_ENTRIES = "localhost,127.0.0.1,[::1]";
 
+function noProxyValueCoversLocalhost(value: string | undefined): boolean {
+  const entries = new Set(
+    (value ?? "")
+      .split(",")
+      .map((entry) => entry.trim().toLowerCase())
+      .filter(Boolean),
+  );
+  return entries.has("localhost") && entries.has("127.0.0.1") && entries.has("[::1]");
+}
+
 function noProxyAlreadyCoversLocalhost(): boolean {
-  const current = process.env.NO_PROXY || process.env.no_proxy || "";
   return (
-    current.includes("localhost") && current.includes("127.0.0.1") && current.includes("[::1]")
+    noProxyValueCoversLocalhost(process.env.NO_PROXY) &&
+    noProxyValueCoversLocalhost(process.env.no_proxy)
   );
 }
 
-export async function withNoProxyForLocalhost<T>(fn: () => Promise<T>): Promise<T> {
-  return await withNoProxyForCdpUrl("http://127.0.0.1", fn);
+function appendLoopbackEntries(value: string | undefined): string {
+  return value ? `${value},${LOOPBACK_ENTRIES}` : LOOPBACK_ENTRIES;
 }
 
 function isLoopbackCdpUrl(url: string): boolean {
-  try {
-    return isLoopbackHost(new URL(url).hostname);
-  } catch {
-    return false;
-  }
+  return isLoopbackHost(URL.parse(url)?.hostname ?? "");
 }
 
 type NoProxySnapshot = {
   noProxy: string | undefined;
   noProxyLower: string | undefined;
-  applied: string;
+  appliedNoProxy: string;
+  appliedNoProxyLower: string;
 };
 
 class NoProxyLeaseManager {
@@ -75,18 +71,18 @@ class NoProxyLeaseManager {
   private snapshot: NoProxySnapshot | null = null;
 
   acquire(url: string): (() => void) | null {
-    if (!isLoopbackCdpUrl(url) || !hasProxyEnv()) {
+    if (!isLoopbackCdpUrl(url) || !hasProxyEnvConfigured()) {
       return null;
     }
 
     if (this.leaseCount === 0 && !noProxyAlreadyCoversLocalhost()) {
       const noProxy = process.env.NO_PROXY;
       const noProxyLower = process.env.no_proxy;
-      const current = noProxy || noProxyLower || "";
-      const applied = current ? `${current},${LOOPBACK_ENTRIES}` : LOOPBACK_ENTRIES;
-      process.env.NO_PROXY = applied;
-      process.env.no_proxy = applied;
-      this.snapshot = { noProxy, noProxyLower, applied };
+      const appliedNoProxy = appendLoopbackEntries(noProxy || noProxyLower);
+      const appliedNoProxyLower = appendLoopbackEntries(noProxyLower || noProxy);
+      process.env.NO_PROXY = appliedNoProxy;
+      process.env.no_proxy = appliedNoProxyLower;
+      this.snapshot = { noProxy, noProxyLower, appliedNoProxy, appliedNoProxyLower };
     }
 
     this.leaseCount += 1;
@@ -109,18 +105,17 @@ class NoProxyLeaseManager {
       return;
     }
 
-    const { noProxy, noProxyLower, applied } = this.snapshot;
+    const { noProxy, noProxyLower, appliedNoProxy, appliedNoProxyLower } = this.snapshot;
     const currentNoProxy = process.env.NO_PROXY;
     const currentNoProxyLower = process.env.no_proxy;
-    const untouched =
-      currentNoProxy === applied &&
-      (currentNoProxyLower === applied || currentNoProxyLower === undefined);
-    if (untouched) {
+    if (currentNoProxy === appliedNoProxy) {
       if (noProxy !== undefined) {
         process.env.NO_PROXY = noProxy;
       } else {
         delete process.env.NO_PROXY;
       }
+    }
+    if (currentNoProxyLower === appliedNoProxyLower) {
       if (noProxyLower !== undefined) {
         process.env.no_proxy = noProxyLower;
       } else {
@@ -148,4 +143,42 @@ export async function withNoProxyForCdpUrl<T>(url: string, fn: () => Promise<T>)
   } finally {
     release?.();
   }
+}
+
+/**
+ * Scoped managed-proxy bypass for the exact CDP URL about to be used.
+ *
+ * Proxyline dynamic bypass registrations are exact URL matches, so callers
+ * must register the concrete `/json/version` or `ws://.../devtools/...` URL
+ * rather than a CDP base URL.
+ */
+export function withManagedProxyForCdpUrl<T>(url: string, fn: () => T): T {
+  const release = registerManagedProxyBrowserCdpBypass(url);
+  let result: T;
+  try {
+    result = fn();
+  } catch (err) {
+    release?.();
+    throw err;
+  }
+
+  const maybeThenable = result as unknown;
+  if (
+    typeof maybeThenable === "object" &&
+    maybeThenable !== null &&
+    "finally" in maybeThenable &&
+    typeof maybeThenable.finally === "function"
+  ) {
+    return maybeThenable.finally(() => release?.()) as T;
+  }
+  release?.();
+  return result;
+}
+
+/**
+ * Validate managed-proxy loopback policy without keeping a long-lived bypass.
+ * Exact CDP request sites install their own scoped bypasses.
+ */
+export function assertManagedProxyAllowsCdpUrl(url: string): void {
+  withManagedProxyForCdpUrl(url, () => undefined);
 }

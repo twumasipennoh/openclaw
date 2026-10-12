@@ -1,4 +1,5 @@
 import type {
+  QaBusAttachment,
   QaBusConversation,
   QaBusEvent,
   QaBusMessage,
@@ -6,11 +7,15 @@ import type {
   QaBusPollResult,
   QaBusReadMessageInput,
   QaBusSearchMessagesInput,
+  QaBusSnapshotConversation,
   QaBusStateSnapshot,
   QaBusThread,
-} from "./runtime-api.js";
+  QaBusToolCall,
+} from "openclaw/plugin-sdk/qa-channel-protocol";
+import { normalizeOptionalLowercaseString } from "openclaw/plugin-sdk/string-coerce-runtime";
+import { parseQaTarget } from "./qa-bus-protocol.js";
 
-export const DEFAULT_ACCOUNT_ID = "default";
+const DEFAULT_ACCOUNT_ID = "default";
 
 export function normalizeAccountId(raw?: string): string {
   const trimmed = raw?.trim();
@@ -21,29 +26,10 @@ export function normalizeConversationFromTarget(target: string): {
   conversation: QaBusConversation;
   threadId?: string;
 } {
-  const trimmed = target.trim();
-  if (trimmed.startsWith("thread:")) {
-    const rest = trimmed.slice("thread:".length);
-    const slash = rest.indexOf("/");
-    if (slash > 0) {
-      return {
-        conversation: { id: rest.slice(0, slash), kind: "channel" },
-        threadId: rest.slice(slash + 1),
-      };
-    }
-  }
-  if (trimmed.startsWith("channel:")) {
-    return {
-      conversation: { id: trimmed.slice("channel:".length), kind: "channel" },
-    };
-  }
-  if (trimmed.startsWith("dm:")) {
-    return {
-      conversation: { id: trimmed.slice("dm:".length), kind: "direct" },
-    };
-  }
+  const parsed = parseQaTarget(target);
   return {
-    conversation: { id: trimmed, kind: "direct" },
+    conversation: { id: parsed.conversationId, kind: parsed.chatType },
+    ...(parsed.threadId !== undefined ? { threadId: parsed.threadId } : {}),
   };
 }
 
@@ -51,11 +37,25 @@ export function cloneMessage(message: QaBusMessage): QaBusMessage {
   return {
     ...message,
     conversation: { ...message.conversation },
+    attachments: (message.attachments ?? []).map(cloneAttachment),
+    ...(message.nativeCommand ? { nativeCommand: { ...message.nativeCommand } } : {}),
+    toolCalls: message.toolCalls?.map(cloneToolCall),
     reactions: message.reactions.map((reaction) => ({ ...reaction })),
   };
 }
 
-export function cloneEvent(event: QaBusEvent): QaBusEvent {
+function cloneAttachment(attachment: QaBusAttachment): QaBusAttachment {
+  return { ...attachment };
+}
+
+function cloneToolCall(toolCall: QaBusToolCall): QaBusToolCall {
+  return {
+    name: toolCall.name,
+    ...(toolCall.arguments ? { arguments: structuredClone(toolCall.arguments) } : {}),
+  };
+}
+
+function cloneEvent(event: QaBusEvent): QaBusEvent {
   switch (event.kind) {
     case "inbound-message":
     case "outbound-message":
@@ -66,35 +66,49 @@ export function cloneEvent(event: QaBusEvent): QaBusEvent {
     case "thread-created":
       return { ...event, thread: { ...event.thread } };
   }
+  throw new Error("Unsupported QA bus event kind");
 }
 
 export function buildQaBusSnapshot(params: {
   cursor: number;
-  conversations: Map<string, QaBusConversation>;
+  conversations: Map<string, QaBusSnapshotConversation>;
   threads: Map<string, QaBusThread>;
   messages: Map<string, QaBusMessage>;
   events: QaBusEvent[];
 }): QaBusStateSnapshot {
   return {
     cursor: params.cursor,
-    conversations: Array.from(params.conversations.values()).map((conversation) => ({
-      ...conversation,
-    })),
-    threads: Array.from(params.threads.values()).map((thread) => ({ ...thread })),
-    messages: Array.from(params.messages.values()).map((message) => cloneMessage(message)),
-    events: params.events.map((event) => cloneEvent(event)),
+    conversations: Array.from(params.conversations.values()).map((conversation) =>
+      Object.assign({}, conversation),
+    ),
+    threads: Array.from(params.threads.values()).map((thread) => Object.assign({}, thread)),
+    messages: Array.from(params.messages.values()).map(cloneMessage),
+    events: params.events.map(cloneEvent),
   };
 }
 
-export function readQaBusMessage(params: {
+export function requireQaBusMessageForAccount(params: {
   messages: Map<string, QaBusMessage>;
-  input: QaBusReadMessageInput;
-}) {
-  const message = params.messages.get(params.input.messageId);
-  if (!message) {
+  input: Pick<QaBusReadMessageInput, "accountId" | "messageId">;
+}): QaBusMessage {
+  const accountId = normalizeAccountId(params.input.accountId);
+  let match: QaBusMessage | undefined;
+  for (const message of params.messages.values()) {
+    if (message.id !== params.input.messageId || message.accountId !== accountId) {
+      continue;
+    }
+    // Reads have no conversation selector, so never guess which chat to mutate.
+    if (match) {
+      throw new Error(
+        `qa-bus message id is ambiguous for selected account: ${params.input.messageId}`,
+      );
+    }
+    match = message;
+  }
+  if (!match) {
     throw new Error(`qa-bus message not found: ${params.input.messageId}`);
   }
-  return cloneMessage(message);
+  return match;
 }
 
 export function searchQaBusMessages(params: {
@@ -103,18 +117,51 @@ export function searchQaBusMessages(params: {
 }) {
   const accountId = normalizeAccountId(params.input.accountId);
   const limit = Math.max(1, Math.min(params.input.limit ?? 20, 100));
-  const query = params.input.query?.trim().toLowerCase();
+  const query = normalizeOptionalLowercaseString(params.input.query);
   return Array.from(params.messages.values())
-    .filter((message) => message.accountId === accountId)
-    .filter((message) =>
-      params.input.conversationId ? message.conversation.id === params.input.conversationId : true,
+    .filter(
+      (message) =>
+        message.accountId === accountId &&
+        !message.deleted &&
+        (params.input.conversationId === undefined ||
+          message.conversation.id === params.input.conversationId) &&
+        (!params.input.conversationKind ||
+          message.conversation.kind === params.input.conversationKind) &&
+        (params.input.threadId === undefined ||
+          (message.threadId ?? null) === params.input.threadId),
     )
-    .filter((message) =>
-      params.input.threadId ? message.threadId === params.input.threadId : true,
-    )
-    .filter((message) => (query ? message.text.toLowerCase().includes(query) : true))
+    .filter((message) => {
+      if (!query) {
+        return true;
+      }
+      const attachmentHaystack = message.attachments ?? [];
+      const searchableAttachmentText = attachmentHaystack
+        .flatMap((attachment) => [
+          attachment.fileName,
+          attachment.altText,
+          attachment.transcript,
+          attachment.mimeType,
+        ])
+        .filter((value): value is string => Boolean(value))
+        .join(" ")
+        .toLowerCase();
+      const messageText = normalizeOptionalLowercaseString(message.text) ?? "";
+      const searchableToolText = (message.toolCalls ?? [])
+        .map((toolCall) => toolCall.name)
+        .join(" ")
+        .toLowerCase();
+      return `${messageText} ${searchableAttachmentText} ${searchableToolText}`.includes(query);
+    })
     .slice(-limit)
-    .map((message) => cloneMessage(message));
+    .map(cloneMessage);
+}
+
+export function resolveQaBusPollStartCursor(params: {
+  currentCursor: number;
+  requestedCursor?: number;
+}): number {
+  const requestedCursor = params.requestedCursor ?? 0;
+  return params.currentCursor < requestedCursor ? 0 : requestedCursor;
 }
 
 export function pollQaBusEvents(params: {
@@ -123,15 +170,20 @@ export function pollQaBusEvents(params: {
   input?: QaBusPollInput;
 }): QaBusPollResult {
   const accountId = normalizeAccountId(params.input?.accountId);
-  const startCursor = params.input?.cursor ?? 0;
-  const effectiveStartCursor = params.cursor < startCursor ? 0 : startCursor;
+  const effectiveStartCursor = resolveQaBusPollStartCursor({
+    currentCursor: params.cursor,
+    requestedCursor: params.input?.cursor,
+  });
   const limit = Math.max(1, Math.min(params.input?.limit ?? 100, 500));
-  const matches = params.events
-    .filter((event) => event.accountId === accountId && event.cursor > effectiveStartCursor)
-    .slice(0, limit)
-    .map((event) => cloneEvent(event));
+  const matchingEvents = params.events.filter(
+    (event) => event.accountId === accountId && event.cursor > effectiveStartCursor,
+  );
+  const page = matchingEvents.slice(0, limit);
+  // A limited page may advance only through events it returns. Jumping to the
+  // bus-wide cursor would make every remaining account event unreachable.
+  const nextCursor = matchingEvents.length > page.length ? page.at(-1)?.cursor : params.cursor;
   return {
-    cursor: params.cursor,
-    events: matches,
+    cursor: nextCursor ?? params.cursor,
+    events: page.map(cloneEvent),
   };
 }
