@@ -99,12 +99,37 @@ async function resolveTelegramCommandTranscriptContext(params: {
   }
 }
 
+type TelegramPluginCommandParams = TelegramCommandExecutorParams & {
+  commandName: string;
+  candidate: PluginCommandNativeCandidate;
+};
+
+type PluginCommandDispatch = ReturnType<PluginCommandNativeCandidate["prepareDispatch"]>;
+
+/** A plugin command that passed the native command gate, ready to run (fork-local: album support). */
+export type PreparedTelegramPluginCommand = {
+  params: TelegramPluginCommandParams;
+  commandBody: string;
+  pluginCommandDispatch: Exclude<PluginCommandDispatch, { kind: "non-plugin" }>;
+  dispatch: NonNullable<Awaited<ReturnType<typeof prepareTelegramCommandDispatch>>>;
+};
+
 export async function executeTelegramPluginCommand(
-  params: TelegramCommandExecutorParams & {
-    commandName: string;
-    candidate: PluginCommandNativeCandidate;
-  },
+  params: TelegramPluginCommandParams,
 ): Promise<void> {
+  const prepared = await prepareTelegramPluginCommand(params);
+  if (prepared) {
+    await runPreparedTelegramPluginCommand(prepared);
+  }
+}
+
+/**
+ * The native command gate on its own: replies "Command not found." or not-authorized as before, and returns
+ * the prepared command only when it may run. An album part runs it later with every part's media.
+ */
+export async function prepareTelegramPluginCommand(
+  params: TelegramPluginCommandParams,
+): Promise<PreparedTelegramPluginCommand | undefined> {
   const commandBody = `/${params.commandName}${params.rawText ? ` ${params.rawText}` : ""}`;
   const pluginCommandDispatch = params.candidate.prepareDispatch(params.rawText);
   if (pluginCommandDispatch.kind === "non-plugin") {
@@ -118,15 +143,24 @@ export async function executeTelegramPluginCommand(
           (await resolveTelegramNativeCommandThreadContext(params)).threadParams ?? {},
         ),
     });
-    return;
+    return undefined;
   }
   const dispatch = await prepareTelegramCommandDispatch({
     ...params,
     requireAuth: params.candidate.requireAuth,
   });
   if (!dispatch) {
-    return;
+    return undefined;
   }
+  return { params, commandBody, pluginCommandDispatch, dispatch };
+}
+
+/** Runs a prepared plugin command; `albumMessages` hands it every part of the album the command came on. */
+export async function runPreparedTelegramPluginCommand(
+  prepared: PreparedTelegramPluginCommand,
+  albumMessages?: TelegramCommandExecutorParams["msg"][],
+): Promise<void> {
+  const { params, commandBody, pluginCommandDispatch, dispatch } = prepared;
   // React on the command message so the sender sees it was picked up before a long
   // plugin run (e.g. /claude) replies.
   const ackEmoji = resolveTelegramReactionEmoji(
@@ -195,6 +229,7 @@ export async function executeTelegramPluginCommand(
   const inboundMedia = await collectPluginCommandInboundMedia({
     bot: dispatch.bot,
     msg: dispatch.msg,
+    ...(albumMessages ? { albumMessages } : {}),
     warn: (message) => dispatch.runtime.log?.(message),
   });
   const result = await pluginCommandDispatch.execute({

@@ -61,6 +61,7 @@ import { isTelegramForumServiceMessage } from "./forum-service-message.js";
 import { resolveTelegramForumTopicMetadata } from "./forum-topic-metadata.js";
 import { resolveTelegramGroupIngestEnabled } from "./group-config-helpers.js";
 import { resolveTelegramCommandIngressAuthorization } from "./ingress.js";
+import { runAlbumPluginCommand, takeAlbumPluginCommand } from "./plugin-command-album.js";
 
 type MediaAuthorization = {
   authorizationCfg: OpenClawConfig;
@@ -321,6 +322,27 @@ export function createTelegramInboundMedia({
     try {
       const finalIngressMessageId = entry.messages.at(-1)?.msg.message_id;
       entry.messages.sort((a, b) => a.msg.message_id - b.msg.message_id);
+      // Fork-local (kwaku): a plugin command captioned on one part runs once with every part's media,
+      // and the album never reaches the agent. Settled as handled even if the plugin throws, so a
+      // spooled replay can't start the command a second time.
+      const albumCommand = takeAlbumPluginCommand(
+        entry.messages[0]?.ctx.me?.id,
+        entry.messages.map(({ msg }) => msg),
+      );
+      if (albumCommand) {
+        try {
+          await runAlbumPluginCommand(
+            albumCommand.prepared,
+            entry.messages.map(({ msg }) => msg),
+          );
+        } catch (error) {
+          runtime.error?.(danger(`album plugin command failed: ${String(error)}`));
+        } finally {
+          releaseDispatchDedupeClaims(entry.dispatchDedupeClaims);
+          settleSpooledReplayParticipants(entry.spooledReplayParticipants, { kind: "completed" });
+        }
+        return;
+      }
       let primary =
         entry.messages.find((item) => item.msg.caption || item.msg.text) ?? entry.messages[0];
       if (!primary) {

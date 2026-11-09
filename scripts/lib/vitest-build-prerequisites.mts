@@ -252,6 +252,13 @@ const runtimeConsumers = [
     mode: "runtime",
     dir: "extensions",
   },
+  // fork-local (kwaku): album plugin-command test drives the real Telegram runtime.
+  {
+    file: "extensions/telegram/src/plugin-command-album.test.ts",
+    configs: ["test/vitest/vitest.extension-database-workers.config.ts"],
+    mode: "runtime",
+    dir: "extensions",
+  },
   ...[
     "src/agents/agent-command-local.test.ts",
     "src/cli/acp-cli-exit.process.test.ts",
