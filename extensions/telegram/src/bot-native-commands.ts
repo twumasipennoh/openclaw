@@ -25,6 +25,7 @@ import {
   resolveTelegramCustomCommands,
   TELEGRAM_COMMAND_NAME_PATTERN,
 } from "./command-config.js";
+import { markAlbumPluginCommand } from "./plugin-command-album.js";
 
 const loadTelegramBuiltinCommandExecutor = createLazyRuntimeModule(
   () => import("./bot-native-command-builtins.js"),
@@ -274,7 +275,29 @@ export const registerTelegramNativeCommands = ({
   }
 
   for (const pluginCommand of pluginCatalog.selectedCommands) {
-    bot.command(pluginCommand.command, async (ctx: TelegramNativeCommandContext) => {
+    bot.command(pluginCommand.command, async (ctx: TelegramNativeCommandContext, next) => {
+      // Fork-local (kwaku): a command captioned on an album part is authorized here, then passed on to
+      // the media-group buffer so it runs once with every part's media (plugin-command-album.ts). The
+      // update tracker isn't consumed first, or the pipeline would drop the part as already handled.
+      if (ctx.message?.media_group_id) {
+        const { prepareTelegramPluginCommand } = await loadTelegramPluginCommandExecutor();
+        const prepared = await prepareTelegramPluginCommand({
+          ...buildExecutorParams({
+            botUser: ctx.me,
+            msg: ctx.message,
+            rawText: ctx.match?.trim() ?? "",
+          }),
+          commandName: pluginCommand.command,
+          candidate: pluginCommand.spec,
+        });
+        if (!prepared) {
+          shouldSkipUpdate(ctx);
+          return;
+        }
+        markAlbumPluginCommand(ctx.me?.id, ctx.message, prepared);
+        await next();
+        return;
+      }
       if (shouldSkipUpdate(ctx) || !ctx.message) {
         return;
       }

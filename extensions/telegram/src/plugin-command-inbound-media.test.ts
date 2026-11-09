@@ -131,6 +131,61 @@ describe("collectPluginCommandInboundMedia", () => {
     expect(out.attachments.map((a) => a.mime)).toEqual(["audio/ogg"]);
   });
 
+  // Fork-local (kwaku): album support. `albumMessages` carries every part of a Telegram album
+  // (the command part included); reply-to media still comes from `msg` only.
+  it("collects every album part's media in message order, then the replied-to media", async () => {
+    const part = (id: number, extra: Partial<Message> = {}) =>
+      message({
+        message_id: id,
+        media_group_id: "G1",
+        photo: [{ file_id: `album-part-${id}`, file_unique_id: `u${id}`, width: 9, height: 9 }],
+        ...extra,
+      });
+    const commandPart = part(502, {
+      caption: "/claude all",
+      reply_to_message: message({
+        message_id: 7,
+        photo: [{ file_id: "replied-photo", file_unique_id: "r", width: 9, height: 9 }],
+      }) as Message["reply_to_message"],
+    });
+    const getFile = vi.fn(async (id: string) => ({ file_path: `photos/${id}.jpg` }));
+
+    const out = await collectPluginCommandInboundMedia({
+      bot: fakeBot(getFile),
+      msg: commandPart,
+      albumMessages: [part(503), commandPart, part(501)],
+    } as Parameters<typeof collectPluginCommandInboundMedia>[0]);
+
+    expect(getFile.mock.calls.map(([id]) => id)).toEqual([
+      "album-part-501",
+      "album-part-502",
+      "album-part-503",
+      "replied-photo",
+    ]);
+    expect(
+      out.attachments.map((a) => [a.path.match(/(part-\d+|d-photo)\./)?.[1], a.fromReply]),
+    ).toEqual([
+      ["part-501", false],
+      ["part-502", false],
+      ["part-503", false],
+      ["d-photo", true],
+    ]);
+    expect(out.replyTo).toMatchObject({ messageId: 7, hasMedia: true });
+  });
+
+  it("treats an album list holding only the command message like a single message", async () => {
+    const msg = message({
+      caption: "/claude one",
+      photo: [{ file_id: "solo", file_unique_id: "s", width: 9, height: 9 }],
+    });
+    const out = await collectPluginCommandInboundMedia({
+      bot: fakeBot(),
+      msg,
+      albumMessages: [msg],
+    } as Parameters<typeof collectPluginCommandInboundMedia>[0]);
+    expect(out.attachments.map((a) => [a.mime, a.fromReply])).toEqual([["image/jpeg", false]]);
+  });
+
   it("labels stickers by kind", async () => {
     const out = await collectPluginCommandInboundMedia({
       bot: fakeBot(),

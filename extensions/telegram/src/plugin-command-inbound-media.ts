@@ -23,6 +23,8 @@ const inboundMediaDir = () => path.join(os.homedir(), ".openclaw", "media", "inb
 export async function collectPluginCommandInboundMedia(params: {
   bot: Bot;
   msg: TelegramMessage;
+  /** Every part of the Telegram album `msg` belongs to (fork-local: album support); `msg` alone when unset. */
+  albumMessages?: TelegramMessage[];
   warn?: (message: string) => void;
 }): Promise<PluginCommandInboundMedia> {
   const { bot, msg } = params;
@@ -115,7 +117,12 @@ export async function collectPluginCommandInboundMedia(params: {
   };
 
   try {
-    await scan(msg, false);
+    const parts = params.albumMessages?.length
+      ? [...params.albumMessages].sort((a, b) => a.message_id - b.message_id)
+      : [msg];
+    for (const part of parts) {
+      await scan(part, false);
+    }
     await scan(msg.reply_to_message as TelegramMessage | undefined, true);
   } catch (err) {
     params.warn?.(`inbound-media: ${err instanceof Error ? err.message : String(err)}`);
