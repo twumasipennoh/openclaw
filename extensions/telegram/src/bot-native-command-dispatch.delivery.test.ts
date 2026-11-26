@@ -414,12 +414,19 @@ describe("Telegram registered plugin delivery", () => {
     }
   }
 
+  // Fork: the default 👀 ack reaction on plugin commands is asserted on its own below.
+  const isAckReaction = ({ method, payload }: { method: string; payload: Record<string, unknown> }) =>
+    method === "setMessageReaction" &&
+    JSON.stringify(payload.reaction) === JSON.stringify([{ type: "emoji", emoji: "👀" }]);
+
   function effects() {
     return http.requests
       .map(({ method, fields }) => ({ method, payload: fields }))
       .filter(
-        ({ method }) =>
-          !["sendChatAction", "getChat", "setMyCommands", "deleteMyCommands"].includes(method),
+        (request) =>
+          !["sendChatAction", "getChat", "setMyCommands", "deleteMyCommands"].includes(
+            request.method,
+          ) && !isAckReaction(request),
       );
   }
 
@@ -432,6 +439,36 @@ describe("Telegram registered plugin delivery", () => {
       { method: "sendMessage", payload: expect.objectContaining(payload) },
     ]);
   }
+
+  // Fork patches: 👀 ack reaction on plugin command dispatch, and reply context passed
+  // through to plugin command handlers.
+  it("passes the replied-to message to the plugin handler", async () => {
+    let seen: Parameters<OpenClawPluginCommandDefinition["handler"]>[0] | undefined;
+    registerCommand(
+      async (ctx) => {
+        seen = ctx;
+        return { text: "done" };
+      },
+      { progress: false },
+    );
+    const message = {
+      ...commandMessage("/plug summarize"),
+      reply_to_message: {
+        message_id: 41,
+        date: 1736380700,
+        chat,
+        from: { id: 99, is_bot: false, first_name: "Bob" },
+        text: "the original message",
+      },
+    };
+    await (await createBot(true, true, pluginConfig())).handleUpdate({ update_id: 3302, message });
+    expect(seen?.replyTo).toMatchObject({
+      messageId: 41,
+      text: "the original message",
+      hasMedia: false,
+    });
+    expect(seen?.attachments).toEqual([]);
+  });
 
   it.each([false, true])("settles a progress edit once (rejected: %s)", async (rejected) => {
     rejectEdit = rejected;

@@ -52,6 +52,11 @@ import {
 import type { TelegramGetChat } from "./bot/types.js";
 import { resolveTelegramCommandIngressAuthorization } from "./ingress.js";
 import { emitTelegramLiveLocationMessageHook } from "./location-message-hook.js";
+import {
+  isAlbumPluginCommand,
+  runAlbumPluginCommand,
+  takeAlbumPluginCommand,
+} from "./plugin-command-album.js";
 import { isTelegramControlLaneText } from "./sequential-key.js";
 
 // The child file logger never reaches stdout, where container operators look.
@@ -163,9 +168,22 @@ export function createTelegramInboundPipeline({
         isForum,
         senderId,
         requireConfiguredGroup: isChannelPost,
-        dmAccess: "challenge",
+        // Fork-local (kwaku): an album part carrying an authorized plugin command is decided by the native
+        // command gate; this gate must not send its own pairing reply for it.
+        dmAccess: isAlbumPluginCommand(botUserId, normalizedMsg) ? "silent" : "challenge",
       });
       if (!gate.allowed) {
+        // The message gate is stricter than the command gate here: run the command on this part alone.
+        const albumCommand = takeAlbumPluginCommand(botUserId, [normalizedMsg]);
+        if (albumCommand) {
+          // Handled even if the plugin throws, so the update isn't retried into a second run.
+          try {
+            await runAlbumPluginCommand(albumCommand.prepared);
+          } catch (err) {
+            runtime.error?.(danger(`album plugin command failed: ${String(err)}`));
+          }
+          return { kind: "processed" };
+        }
         return { kind: "ignored" };
       }
       const { effectiveDmAllow } = gate;

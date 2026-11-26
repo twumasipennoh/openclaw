@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import type { ReactionTypeEmoji } from "grammy/types";
+import { resolveAckReaction } from "openclaw/plugin-sdk/channel-feedback";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import {
   pluginCommandResultContinuesAgent,
@@ -23,7 +25,9 @@ import type { TelegramInlineButtons } from "./button-types.js";
 import { shouldSuppressLocalTelegramExecApprovalPrompt } from "./exec-approvals.js";
 import { buildInlineKeyboard } from "./inline-keyboard.js";
 import { loadTelegramSendModule } from "./send-runtime.js";
+import { collectPluginCommandInboundMedia } from "./plugin-command-inbound-media.js";
 import { recordSentMessage } from "./sent-message-cache.js";
+import { resolveTelegramReactionEmoji } from "./status-reaction-variants.js";
 
 const EMPTY_RESPONSE_FALLBACK = "No response generated. Please try again.";
 
@@ -80,16 +84,41 @@ async function resolveTelegramCommandTranscriptContext(params: {
   }
 }
 
+type TelegramPluginCommandParams = TelegramCommandExecutorParams & {
+  commandName: string;
+  candidate: PluginCommandNativeCandidate;
+  /** Runs this command message as a native command turn carrying the continued dispatch. */
+  continueAgentTurn: (
+    turn: Omit<Parameters<TelegramPluginCommandContinuation>[0], "ctx">,
+  ) => Promise<void>;
+};
+
+type PluginCommandDispatch = ReturnType<PluginCommandNativeCandidate["prepareDispatch"]>;
+
+/** A plugin command that passed the native command gate, ready to run (fork-local: album support). */
+export type PreparedTelegramPluginCommand = {
+  params: TelegramPluginCommandParams;
+  commandBody: string;
+  pluginCommandDispatch: Exclude<PluginCommandDispatch, { kind: "non-plugin" }>;
+  dispatch: NonNullable<Awaited<ReturnType<typeof prepareTelegramCommandDispatch>>>;
+};
+
 export async function executeTelegramPluginCommand(
-  params: TelegramCommandExecutorParams & {
-    commandName: string;
-    candidate: PluginCommandNativeCandidate;
-    /** Runs this command message as a native command turn carrying the continued dispatch. */
-    continueAgentTurn: (
-      turn: Omit<Parameters<TelegramPluginCommandContinuation>[0], "ctx">,
-    ) => Promise<void>;
-  },
+  params: TelegramPluginCommandParams,
 ): Promise<void> {
+  const prepared = await prepareTelegramPluginCommand(params);
+  if (prepared) {
+    await runPreparedTelegramPluginCommand(prepared);
+  }
+}
+
+/**
+ * The native command gate on its own: replies "Command not found." or not-authorized as before, and returns
+ * the prepared command only when it may run. An album part runs it later with every part's media.
+ */
+export async function prepareTelegramPluginCommand(
+  params: TelegramPluginCommandParams,
+): Promise<PreparedTelegramPluginCommand | undefined> {
   const commandBody = `/${params.commandName}${params.rawText ? ` ${params.rawText}` : ""}`;
   const pluginCommandDispatch = params.candidate.prepareDispatch(params.rawText);
   if (pluginCommandDispatch.kind === "non-plugin") {
@@ -103,15 +132,24 @@ export async function executeTelegramPluginCommand(
           (await resolveTelegramNativeCommandThreadContext(params)).threadParams ?? {},
         ),
     });
-    return;
+    return undefined;
   }
   const dispatch = await prepareTelegramCommandDispatch({
     ...params,
     requireAuth: params.candidate.requireAuth,
   });
   if (!dispatch) {
-    return;
+    return undefined;
   }
+  return { params, commandBody, pluginCommandDispatch, dispatch };
+}
+
+/** Runs a prepared plugin command; `albumMessages` hands it every part of the album the command came on. */
+export async function runPreparedTelegramPluginCommand(
+  prepared: PreparedTelegramPluginCommand,
+  albumMessages?: TelegramCommandExecutorParams["msg"][],
+): Promise<void> {
+  const { params, commandBody, pluginCommandDispatch, dispatch } = prepared;
   const from = dispatch.isGroup
     ? buildTelegramGroupFrom(dispatch.chatId, dispatch.threadSpec)
     : `telegram:${dispatch.chatId}`;
@@ -158,6 +196,12 @@ export async function executeTelegramPluginCommand(
     agentId: dispatch.route.agentId,
     sessionKey: dispatch.targetSessionKey,
   });
+  const inboundMedia = await collectPluginCommandInboundMedia({
+    bot: dispatch.bot,
+    msg: dispatch.msg,
+    ...(albumMessages ? { albumMessages } : {}),
+    warn: (message) => dispatch.runtime.log?.(message),
+  });
   const result = await pluginCommandDispatch.execute({
     senderId: dispatch.senderId,
     channel: "telegram",
@@ -175,6 +219,9 @@ export async function executeTelegramPluginCommand(
     to,
     accountId: dispatch.accountId,
     messageThreadId: dispatch.threadSpec.id,
+    attachments: inboundMedia.attachments,
+    replyTo: inboundMedia.replyTo,
+    structured: inboundMedia.structured,
   });
   if (pluginCommandResultContinuesAgent(result)) {
     // The reply pipeline applies the result (reply text, rewrite) and runs the agent turn.
