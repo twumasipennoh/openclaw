@@ -442,6 +442,28 @@ describe("Telegram registered plugin delivery", () => {
 
   // Fork patches: 👀 ack reaction on plugin command dispatch, and reply context passed
   // through to plugin command handlers.
+  it("reacts with the ack emoji on the command message", async () => {
+    registerCommand(async () => ({ text: "done" }), { progress: false });
+    const message = commandMessage("/plug");
+    await (await createBot(true, true, pluginConfig())).handleUpdate({ update_id: 3300, message });
+    const reaction = http.requests.find(({ method }) => method === "setMessageReaction");
+    expect(reaction?.fields).toMatchObject({
+      message_id: message.message_id,
+      reaction: [{ type: "emoji", emoji: "👀" }],
+    });
+  });
+
+  it("uses the configured ack reaction", async () => {
+    registerCommand(async () => ({ text: "done" }), { progress: false });
+    const cfg = pluginConfig();
+    cfg.messages = { ...cfg.messages, ackReaction: "👍" };
+    await (
+      await createBot(true, true, cfg)
+    ).handleUpdate({ update_id: 3301, message: commandMessage("/plug") });
+    const reaction = http.requests.find(({ method }) => method === "setMessageReaction");
+    expect(reaction?.fields).toMatchObject({ reaction: [{ type: "emoji", emoji: "👍" }] });
+  });
+
   it("passes the replied-to message to the plugin handler", async () => {
     let seen: Parameters<OpenClawPluginCommandDefinition["handler"]>[0] | undefined;
     registerCommand(

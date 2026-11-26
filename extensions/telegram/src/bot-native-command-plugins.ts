@@ -150,6 +150,21 @@ export async function runPreparedTelegramPluginCommand(
   albumMessages?: TelegramCommandExecutorParams["msg"][],
 ): Promise<void> {
   const { params, commandBody, pluginCommandDispatch, dispatch } = prepared;
+  // React on the command message so the sender sees it was picked up before a long
+  // plugin run (e.g. /claude) replies.
+  const ackEmoji = resolveTelegramReactionEmoji(
+    resolveAckReaction(dispatch.runtimeCfg, dispatch.route.agentId, {
+      channel: "telegram",
+      accountId: dispatch.accountId,
+    }),
+  );
+  if (ackEmoji) {
+    dispatch.bot.api
+      .setMessageReaction(dispatch.chatId, dispatch.msg.message_id, [
+        { type: "emoji", emoji: ackEmoji } as ReactionTypeEmoji,
+      ])
+      .catch(() => {});
+  }
   const from = dispatch.isGroup
     ? buildTelegramGroupFrom(dispatch.chatId, dispatch.threadSpec)
     : `telegram:${dispatch.chatId}`;
