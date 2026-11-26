@@ -74,6 +74,7 @@ import {
 import type { PluginRecord } from "./registry-types.js";
 import { createPluginRegistry, type PluginRegistry } from "./registry.js";
 import { degradedPluginMatchesRoot, findActiveDegradedPlugin } from "./runtime-degraded-state.js";
+import { getActivePluginRegistry } from "./runtime.js";
 import {
   getPluginRuntimeLoadContextState,
   type PluginRuntimeLoadContextState,
@@ -181,6 +182,34 @@ function bindRuntimeLoadContext(
   );
 }
 
+// A scoped activating load replaces the active registry with one holding only the scoped
+// plugins. Carry over the other plugins' commands, or /claude and friends answer
+// "Command not found." until the next restart.
+function retainUnscopedPluginCommands(
+  registry: PluginRegistry,
+  scope: ReadonlySet<string> | null,
+): void {
+  if (!scope) {
+    return;
+  }
+  const previous = getActivePluginRegistry();
+  if (!previous || previous === registry) {
+    return;
+  }
+  for (const entry of previous.commands) {
+    if (scope.has(entry.pluginId)) {
+      continue;
+    }
+    const alreadyPresent = registry.commands.some(
+      (existing) =>
+        existing.pluginId === entry.pluginId && existing.command.name === entry.command.name,
+    );
+    if (!alreadyPresent) {
+      registry.commands.push(entry);
+    }
+  }
+}
+
 export function loadOpenClawPluginsCore(
   ...args: Parameters<typeof loadOpenClawPluginsSteps>
 ): PluginRegistry {
@@ -220,6 +249,7 @@ export function* loadOpenClawPluginsSteps(
     }
     if (options.mode !== "cli-metadata" && options.activate !== false) {
       const runtimeSubagentMode = resolveRuntimeSubagentMode(options.runtimeOptions);
+      retainUnscopedPluginCommands(emptyRegistry, requestedOnlyPluginIdSet);
       activatePluginRegistry(
         emptyRegistry,
         `empty-plugin-scope::${runtimeSubagentMode}::${options.workspaceDir ?? ""}`,
@@ -242,6 +272,7 @@ export function* loadOpenClawPluginsSteps(
     if (cached) {
       maybeThrowOnPluginLoadError(cached, options.throwOnLoadError);
       if (context.shouldActivate) {
+        retainUnscopedPluginCommands(cached, onlyPluginIdSet);
         activatePluginRegistry(
           cached,
           context.cacheKey,
@@ -707,6 +738,7 @@ export function* loadOpenClawPluginsSteps(
     // Presence of this identity also admits immutable private-registry policy caching.
     getPluginRuntimeLoadContextState(registry)!.loaderCacheIdentity = loaderCacheIdentity;
     if (context.shouldActivate) {
+      retainUnscopedPluginCommands(registry, onlyPluginIdSet);
       // Install the complete bundle before hook-runner initialization.
       activatePluginRegistry(
         registry,
