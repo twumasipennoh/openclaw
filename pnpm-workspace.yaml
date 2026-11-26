@@ -147,3 +147,4 @@ patchedDependencies:
   proper-lockfile@4.1.2: patches/proper-lockfile@4.1.2.patch
   "@clawdbot/lobster@2026.10.1": patches/@clawdbot__lobster@2026.10.1.patch
   acorn@8.19.0: patches/acorn@8.19.0.patch
+  grammy@1.46.0: patches/grammy@1.46.0.patch
