@@ -55,6 +55,13 @@ describe("exec approval reply helpers", () => {
     vi.mocked(supportsNativeExecApprovalClient).mockReset().mockReturnValue(true);
   });
 
+  it("returns null metadata for a null or non-object payload", () => {
+    // Fork Patch 7: plugins such as claude-cli return a null payload after sending
+    // their own chunks; reading channelData off it threw a TypeError per reply.
+    expect(getExecApprovalReplyMetadata(null)).toBeNull();
+    expect(getExecApprovalReplyMetadata(undefined)).toBeNull();
+  });
+
   it("only suggests exec-capable recovery surfaces without native clients", () => {
     vi.mocked(listNativeExecApprovalClientLabels).mockReturnValueOnce([]);
     const text = buildExecApprovalUnavailableReplyPayload({ reason: "no-approval-route" }).text;
