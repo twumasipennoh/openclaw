@@ -102,6 +102,15 @@ export function assertDoctorSessionSqliteTargetsNotAliased(
   );
 }
 
+/** An archive owner's paths; receipts are keyed by the database path as configured, not its realpath. */
+export function createArchiveTargetPaths(target: SessionStoreTarget, env: NodeJS.ProcessEnv) {
+  return {
+    sourceTarget: target,
+    receiptSqlitePath: resolveTargetSqlitePath(target, env),
+    target: createMigrationTargetInput(target),
+  };
+}
+
 export function createMigrationTargetInput(
   target: SessionStoreTarget,
 ): SessionSqliteMigrationTargetInput {

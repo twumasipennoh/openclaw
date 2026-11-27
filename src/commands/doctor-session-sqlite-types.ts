@@ -13,6 +13,8 @@ import type { LegacySessionRecord } from "./doctor-session-sqlite-discovery.js";
 
 export type LegacyArchiveTarget = {
   sourceTarget: SessionStoreTarget & { sqlitePath?: string };
+  /** The agent database path as the import resolved it; receipt keys hash this exact text. */
+  receiptSqlitePath: string;
   target: SessionSqliteMigrationTargetInput;
   report: DoctorSessionSqliteTargetReport;
   validated: boolean;
