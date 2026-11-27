@@ -90,6 +90,7 @@ import {
 import { settleDuplicateSessionSqliteArchives } from "./doctor-session-sqlite-retirement.js";
 import {
   assertDoctorSessionSqliteTargetsNotAliased,
+  createArchiveTargetPaths,
   createMigrationTargetInput,
   filterLegacySessionStoreTargets,
   prepareDoctorSessionSqliteTargets,
@@ -356,7 +357,7 @@ export async function runDoctorSessionSqlite(
                   recordDeferredPluginSessionImport({
                     cfg,
                     target: owner.sourceTarget,
-                    sqlitePath: owner.target.sqlitePath,
+                    sqlitePath: owner.receiptSqlitePath,
                     env,
                     pluginIds: pending.map((plugin) => plugin.pluginId),
                     sources: owner.verifiedSources,
@@ -425,7 +426,7 @@ export async function runDoctorSessionSqlite(
             cfg,
             env,
             target: owner.sourceTarget,
-            sqlitePath: owner.target.sqlitePath,
+            sqlitePath: owner.receiptSqlitePath,
           });
         } catch (error) {
           owner.report.issues.push({
@@ -463,7 +464,7 @@ export async function runDoctorSessionSqlite(
         const receipt = readDeferredPluginSessionImport({
           cfg,
           target: owner.sourceTarget,
-          sqlitePath: owner.target.sqlitePath,
+          sqlitePath: owner.receiptSqlitePath,
           env,
         });
         if (!receipt) {
@@ -537,7 +538,7 @@ export async function settleRetainedDoctorSessionSources(
       const current = readDeferredPluginSessionImport({
         cfg: plan.cfg,
         target: owner.sourceTarget,
-        sqlitePath: owner.target.sqlitePath,
+        sqlitePath: owner.receiptSqlitePath,
         env: plan.env,
       });
       if (!current || !isDeepStrictEqual(current, receipt)) {
@@ -612,7 +613,7 @@ export async function settleRetainedDoctorSessionSources(
         cfg: plan.cfg,
         env: plan.env,
         target: owner.sourceTarget,
-        sqlitePath: owner.target.sqlitePath,
+        sqlitePath: owner.receiptSqlitePath,
         completedPluginIds,
         assertCurrent,
       });
@@ -796,8 +797,7 @@ async function inspectOrMigrateTarget(params: {
       await archiveLegacyArtifacts(
         [
           {
-            sourceTarget: params.target,
-            target,
+            ...createArchiveTargetPaths(params.target, params.env),
             report,
             validated: true,
             deferredPluginIds: [],
@@ -1004,8 +1004,7 @@ async function inspectOrMigrateTarget(params: {
     }
     // Retain importer outcomes, not entry or transcript payloads, until every owner finishes.
     params.archiveTargets?.push({
-      sourceTarget: params.target,
-      target: createMigrationTargetInput(params.target),
+      ...createArchiveTargetPaths(params.target, params.env),
       report,
       validated: validationPassed,
       deferredPluginIds,
